@@ -98,41 +98,6 @@ services:
      - **Download Wait Timeout:** Maximum time in seconds to wait for Shelfmark to finish downloading before timing out (default: `180`).
    - Click **Test** to verify connection, then click **Save**.
 
-## Testing & Verification
-
-The repository includes an offline test harness validating connectivity, search transformations, download resolution, and update signature integrity:
-
-```bash
-npm test
-# or: node verify.mjs
-```
-
-## Updates & Release Signing
-
-This plugin supports BookOrbit's **Signed Plugin Updates** system:
-- BookOrbit checks `updates/shelfmark.json` for newer versions.
-- Updates can be applied with one click in the BookOrbit UI (**Settings > System > Requests > Sources**), or automatically by toggling **Auto-update**.
-- Updates are verified using Ed25519 digital signatures before installation.
-
-### Publishing a New Release
-
-To publish an updated version:
-
-1. Bump version and generate the signed manifest:
-   ```bash
-   node scripts/sign-release.mjs 1.0.1
-   # or: npm run release -- 1.0.1
-   ```
-   > [!NOTE]
-   > Signing requires the repository publisher's private key (`.secrets/ed25519_private.pem` or `SHELFMARK_SIGNING_KEY` environment variable). If you maintain your own fork, generate a new Ed25519 keypair and update `ed25519PublicKey` in `index.mjs`.
-2. Commit and push the changes:
-   ```bash
-   git add index.mjs updates/shelfmark.json
-   git commit -m "chore(release): 1.0.1"
-   git push
-   ```
-3. BookOrbit will detect the new version on its next update check (or when clicking **Check for updates** in the UI) and prompt to install it.
-
 
 ## How It Works
 
