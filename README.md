@@ -1,6 +1,6 @@
 # BookOrbit Shelfmark Indexer Plugin
 
-An indexer plugin for [BookOrbit](https://github.com/bookorbit/bookorbit) that integrates with a self-hosted [Shelfmark](https://github.com/calibrain/shelfmark) instance.
+An indexer plugin for [BookOrbit](https://github.com/bookorbit/bookorbit) that integrates with a self-hosted [Shelfmark](https://github.com/calibrain/shelfmark) instance. Yep, fully vibecoded.
 
 It enables BookOrbit to search book releases across sources configured in Shelfmark (Anna's Archive, Libgen, etc.) and routes downloads through Shelfmark's download pipeline.
 

@@ -21,7 +21,7 @@ const FORMAT_PREFERENCE = ['epub', 'mobi', 'azw3', 'pdf', 'm4b', 'mp3'];
 
 export default {
   apiVersion: 1,
-  version: '1.0.0',
+  version: '1.0.1',
   update: {
     manifestUrl: 'https://raw.githubusercontent.com/hateitwtf/bookorbit-plugin-shelfmark/main/updates/shelfmark.json',
     ed25519PublicKey: 'CZDs4fE6KQAYxn_xkPUAfITp-n0vVECZ-WjVCu7h-e4',
