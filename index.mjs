@@ -52,8 +52,8 @@ export default {
       key: 'releaseSource',
       type: 'string',
       label: 'Release Source',
-      hint: 'Release source to query: libgen, direct_download, or all. Default is libgen (fastest, avoids Cloudflare timeouts).',
-      default: 'libgen',
+      hint: 'Release source to query: all (both Libgen and Anna\'s Archive), libgen, or direct_download.',
+      default: 'all',
     },
     {
       key: 'downloadViaShelfmark',
@@ -178,7 +178,7 @@ export default {
     }
 
     const preferredFormat = (config.settings?.preferFormat || 'epub').toLowerCase();
-    const source = (config.settings?.releaseSource || 'libgen').toLowerCase();
+    const source = (config.settings?.releaseSource || 'all').toLowerCase();
     const releases = [];
 
     // Step 2: Search available download releases
