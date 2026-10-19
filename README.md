@@ -7,10 +7,12 @@ It enables BookOrbit to search book releases across sources configured in Shelfm
 ## Features
 
 - **Native BookOrbit Integration:** Fully compliant with BookOrbit's indexer plugin specification (`apiVersion: 1`).
-- **Configurable via Web UI:** Set the Shelfmark URL, API Key, and format preferences directly inside BookOrbit's settings panel.
+- **E-Book & Audiobook Support:** Seamlessly queries Shelfmark for both books (`ebook`) and audiobooks (`audiobook`), matching format priorities (`epub`, `mobi`, `azw3`, `pdf`, `m4b`, `mp3`).
+- **Configurable via Web UI:** Set the Shelfmark URL, API Key, format preferences, and download timeouts directly inside BookOrbit's settings panel.
 - **Dual Download Modes:**
   - **Shelfmark Managed (Recommended):** Queues download inside Shelfmark so any configured Tor/WireGuard/Cloudflare bypass runs inside Shelfmark, then serves the completed book to BookOrbit via `/api/localdownload`.
   - **Direct Download:** For sources that provide direct HTTP download links, BookOrbit can fetch the file directly.
+- **Signed Auto-Updates:** Built-in Ed25519 cryptographic update channel for one-click and automatic updates directly from the BookOrbit UI.
 - **Dependency-Free:** Single-file ECMAScript module (`index.mjs`) with zero third-party dependencies, running safely in BookOrbit's Node.js runtime.
 
 ## Prerequisites & Configuration Tweaks
@@ -26,8 +28,9 @@ A fresh Shelfmark installation requires a few settings before searches can work:
   *(Without this, Shelfmark will return `HTTP 503: No metadata provider configured`).*
 
 * **Configure Release Sources & Mirrors:**
-  - **Libgen (Fastest, ~1s):** Go to **Settings > Libgen Search** and check **Enable Libgen Search**. In **Settings > Mirrors**, set **LibGen** mirrors to `https://libgen.li` and `https://libgen.gs` (mirrors like `.is` or `.rs` may be blocked by regional ISPs).
+  - **Libgen (Fastest, ~1s):** Go to **Settings > Libgen Search** and check **Enable Libgen Search**. In **Settings > Mirrors**, set **LibGen** mirrors to `https://libgen.li` and `https://libgen.gs` (mirrors like `.is` or `.rs` may be blocked by regional ISPs). *(Note: Libgen provides e-books only).*
   - **Anna's Archive (Direct Download):** In **Settings > Mirrors**, pin **Primary Mirror** (`AA_BASE_URL`) to `https://annas-archive.pk` instead of `auto` to avoid losing 15 seconds on failing mirrors like `.gl`.
+  - **Audiobooks (AudiobookBay / Prowlarr):** For audiobook requests, enable **Settings > AudiobookBay** (`ABB_ENABLED=true`, `ABB_HOSTNAME=audiobookbay.lu`) or configure Prowlarr indexers under the Audiobook category (`3030`).
   - **Keep Challenge Solver Warm:** In **Settings > Cloudflare Bypass**, set **Bypasser Idle Timeout** (`BYPASS_BROWSER_IDLE_TIMEOUT`) to `1800` (30 minutes). This prevents Shelfmark from terminating its headless browser helper after 3 minutes of inactivity.
 
 * **API Key:**
@@ -84,14 +87,15 @@ services:
    ```
 
 3. Configure the indexer in the BookOrbit Web UI:
-   - Go to **Settings > System > Requests > Indexers**.
+   - Go to **Settings > System > Requests > Sources**.
    - Click **Add Indexer** and select **Shelfmark**.
    - Enter your configuration:
      - **Base URL:** The URL of your Shelfmark server (e.g. `http://shelfmark:8084` or `http://192.168.1.100:8084`).
-     - **Shelfmark API Key:** The key configured in Shelfmark (`SHELFMARK_API_KEY`).
-     - **Preferred Format:** Priority book format (`epub`, `mobi`, `pdf`, `azw3`).
-     - **Release Source:** `all` (searches both Libgen and Anna's Archive), `libgen`, or `direct_download`.
-     - **Download via Shelfmark:** Enabled by default.
+     - **Shelfmark API Key:** The key configured in Shelfmark (`SHELFMARK_API_KEY`). Optional if Shelfmark authentication is disabled.
+     - **Preferred Format:** Priority book format (`epub`, `mobi`, `pdf`, `azw3`, `m4b`, etc.).
+     - **Release Source:** `all` (searches all configured sources), `libgen`, or `direct_download`.
+     - **Download via Shelfmark:** Enabled by default (routes downloads through Shelfmark's queue).
+     - **Download Wait Timeout:** Maximum time in seconds to wait for Shelfmark to finish downloading before timing out (default: `180`).
    - Click **Test** to verify connection, then click **Save**.
 
 ## Testing & Verification
@@ -119,6 +123,8 @@ To publish an updated version:
    node scripts/sign-release.mjs 1.0.1
    # or: npm run release -- 1.0.1
    ```
+   > [!NOTE]
+   > Signing requires the repository publisher's private key (`.secrets/ed25519_private.pem` or `SHELFMARK_SIGNING_KEY` environment variable). If you maintain your own fork, generate a new Ed25519 keypair and update `ed25519PublicKey` in `index.mjs`.
 2. Commit and push the changes:
    ```bash
    git add index.mjs updates/shelfmark.json
