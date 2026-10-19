@@ -49,6 +49,13 @@ export default {
       default: 'epub',
     },
     {
+      key: 'releaseSource',
+      type: 'string',
+      label: 'Release Source',
+      hint: 'Release source to query: libgen, direct_download, or all. Default is libgen (fastest, avoids Cloudflare timeouts).',
+      default: 'libgen',
+    },
+    {
       key: 'downloadViaShelfmark',
       type: 'boolean',
       label: 'Download via Shelfmark',
@@ -171,10 +178,11 @@ export default {
     }
 
     const preferredFormat = (config.settings?.preferFormat || 'epub').toLowerCase();
+    const source = (config.settings?.releaseSource || 'libgen').toLowerCase();
     const releases = [];
 
-    // Step 2: For top matching books, search available download releases
-    for (const book of books.slice(0, 3)) {
+    // Step 2: Search available download releases
+    for (const book of books.slice(0, 2)) {
       if (signal.aborted) break;
 
       const releasesUrl = new URL(`${baseUrl}/api/releases`);
@@ -183,6 +191,9 @@ export default {
       releasesUrl.searchParams.set('title', book.title || query.title || '');
       releasesUrl.searchParams.set('author', (book.authors && book.authors[0]) || query.author || '');
       releasesUrl.searchParams.set('content_type', contentType);
+      if (source && source !== 'all') {
+        releasesUrl.searchParams.set('source', source);
+      }
 
       let relRes;
       try {
@@ -230,7 +241,7 @@ export default {
         if (releases.length >= (query.limit || MAX_RESULTS)) break;
       }
 
-      if (releases.length >= (query.limit || MAX_RESULTS)) break;
+      if (releases.length > 0) break;
     }
 
     // Rank results based on preferred format and availability
