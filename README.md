@@ -96,11 +96,37 @@ services:
 
 ## Testing & Verification
 
-The repository includes an offline test harness validating connectivity, search transformations, and download resolution:
+The repository includes an offline test harness validating connectivity, search transformations, download resolution, and update signature integrity:
 
 ```bash
-node verify.mjs
+npm test
+# or: node verify.mjs
 ```
+
+## Updates & Release Signing
+
+This plugin supports BookOrbit's **Signed Plugin Updates** system:
+- BookOrbit checks `updates/shelfmark.json` for newer versions.
+- Updates can be applied with one click in the BookOrbit UI (**Settings > System > Requests > Sources**), or automatically by toggling **Auto-update**.
+- Updates are verified using Ed25519 digital signatures before installation.
+
+### Publishing a New Release
+
+To publish an updated version:
+
+1. Bump version and generate the signed manifest:
+   ```bash
+   node scripts/sign-release.mjs 1.0.1
+   # or: npm run release -- 1.0.1
+   ```
+2. Commit and push the changes:
+   ```bash
+   git add index.mjs updates/shelfmark.json
+   git commit -m "chore(release): 1.0.1"
+   git push
+   ```
+3. BookOrbit will detect the new version on its next update check (or when clicking **Check for updates** in the UI) and prompt to install it.
+
 
 ## How It Works
 

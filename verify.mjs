@@ -10,6 +10,7 @@
 import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import crypto from 'node:crypto';
 
 import plugin from './index.mjs';
 
@@ -85,6 +86,31 @@ async function runTests() {
   ok('defines apiKey in settingsFields', plugin.settingsFields.some((f) => f.key === 'apiKey' && f.type === 'string'));
   ok('defines preferFormat in settingsFields', plugin.settingsFields.some((f) => f.key === 'preferFormat'));
   ok('defines downloadViaShelfmark toggle', plugin.settingsFields.some((f) => f.key === 'downloadViaShelfmark'));
+  ok('declares semantic version', typeof plugin.version === 'string' && /^\d+\.\d+\.\d+/.test(plugin.version));
+  ok('declares update channel', typeof plugin.update === 'object' && plugin.update !== null);
+  ok('update manifestUrl is HTTPS', typeof plugin.update?.manifestUrl === 'string' && plugin.update.manifestUrl.startsWith('https://'));
+  ok('update ed25519PublicKey is 43-char base64url', /^[A-Za-z0-9_-]{43}$/.test(plugin.update?.ed25519PublicKey ?? ''));
+
+  // Verify that updates/shelfmark.json matches index.mjs
+  {
+    const manifestFile = join(here, 'updates', 'shelfmark.json');
+    const manifest = JSON.parse(readFileSync(manifestFile, 'utf8'));
+    const indexSrc = readFileSync(join(here, 'index.mjs'), 'utf8');
+
+    ok('manifest schemaVersion is 1', manifest.schemaVersion === 1);
+    ok('manifest type matches plugin', manifest.type === plugin.type);
+    ok('manifest version matches plugin', manifest.version === plugin.version);
+
+    const calculatedSha = crypto.createHash('sha256').update(indexSrc).digest('hex');
+    ok('manifest sha256 matches index.mjs', manifest.sha256 === calculatedSha);
+
+    const verifierKey = crypto.createPublicKey({
+      key: { kty: 'OKP', crv: 'Ed25519', x: plugin.update.ed25519PublicKey },
+      format: 'jwk',
+    });
+    const validSig = crypto.verify(null, Buffer.from(indexSrc), verifierKey, Buffer.from(manifest.signature, 'base64'));
+    ok('manifest Ed25519 signature verifies against plugin public key', validSig === true);
+  }
 
   console.log('\n--- 2. Connectivity Test (test) ---');
   {
