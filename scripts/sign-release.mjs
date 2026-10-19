@@ -92,7 +92,7 @@ const manifest = {
   schemaVersion: 1,
   type,
   version,
-  sourceUrl: 'https://raw.githubusercontent.com/hateitwtf/bookorbit-plugin-shelfmark/main/index.mjs',
+  sourceUrl: `https://github.com/hateitwtf/bookorbit-plugin-shelfmark/releases/download/v${version}/index.mjs`,
   sha256,
   signature,
 };

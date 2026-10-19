@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "type": "shelfmark",
   "version": "1.0.3",
-  "sourceUrl": "https://raw.githubusercontent.com/hateitwtf/bookorbit-plugin-shelfmark/main/index.mjs",
+  "sourceUrl": "https://github.com/hateitwtf/bookorbit-plugin-shelfmark/releases/download/v1.0.3/index.mjs",
   "sha256": "666b9f1ea71eb9a7e9002c776a770476378b0aa796544223aa5fe3fd5775c4b2",
   "signature": "Nk+M+tT2NK0THZ7JeOsCab1pUDZSHyX3CylxAdVIl5ken/QyLb07A2MPNohe+hv8PW+lmStS4/RksCoqeuBBAw=="
 }
