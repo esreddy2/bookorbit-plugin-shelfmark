@@ -11,7 +11,7 @@
  * Single-file and dependency-free following BookOrbit's indexer plugin specification.
  */
 
-const USER_AGENT = 'BookOrbit-Shelfmark-Plugin/1.0.0';
+const USER_AGENT = 'BookOrbit-Shelfmark-Plugin/1.0.3';
 
 /** Fallback maximum number of releases to return per search. */
 const MAX_RESULTS = 25;
@@ -21,7 +21,7 @@ const FORMAT_PREFERENCE = ['epub', 'mobi', 'azw3', 'pdf', 'm4b', 'mp3'];
 
 export default {
   apiVersion: 1,
-  version: '1.0.2',
+  version: '1.0.3',
   update: {
     manifestUrl: 'https://raw.githubusercontent.com/hateitwtf/bookorbit-plugin-shelfmark/main/updates/shelfmark.json',
     ed25519PublicKey: 'CZDs4fE6KQAYxn_xkPUAfITp-n0vVECZ-WjVCu7h-e4',
@@ -340,7 +340,8 @@ export default {
     const queuedTaskId = queueData.task_id || queueData.taskId || queueData.id || null;
 
     // Step 2: Poll status until task is completed
-    const sourceId = String(payload.source_id || payload.id);
+    const rawSourceId = payload.source_id || payload.id;
+    const sourceId = rawSourceId ? String(rawSourceId) : null;
     const timeoutSec = toNumber(config.settings?.pollTimeoutSeconds) || 180;
     const startTime = Date.now();
     let completedTaskId = null;
@@ -350,7 +351,7 @@ export default {
         throw host.fail('cancelled', 'Download resolution was aborted.');
       }
 
-      await sleep(2500);
+      await sleep(2500, signal);
 
       if (signal?.aborted) {
         throw host.fail('cancelled', 'Download resolution was aborted.');
@@ -381,7 +382,8 @@ export default {
           ) {
             return true;
           }
-          if (!sourceId && !queuedTaskId && task.title && task.title === payload.title) {
+          // Fallback if Shelfmark task object lacks source_id and queue didn't return task_id
+          if (!queuedTaskId && !task.source_id && task.title && task.title === payload.title) {
             const taskFormat = (task.format || '').toLowerCase();
             return !taskFormat || !payload.format || taskFormat === payload.format.toLowerCase();
           }
@@ -422,7 +424,7 @@ export default {
       }
       return {
         url: downloadUrl,
-        headers,
+        headers: { ...headers, Accept: '*/*' },
         fileName,
         sizeBytes: release.sizeBytes,
         format: resolvedFormat,
@@ -480,6 +482,18 @@ function toNumber(val) {
   return Number.isFinite(num) ? num : null;
 }
 
-function sleep(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
+function sleep(ms, signal) {
+  return new Promise((resolve) => {
+    if (signal?.aborted) return resolve();
+    let timer;
+    const onAbort = () => {
+      clearTimeout(timer);
+      resolve();
+    };
+    timer = setTimeout(() => {
+      signal?.removeEventListener?.('abort', onAbort);
+      resolve();
+    }, ms);
+    signal?.addEventListener?.('abort', onAbort, { once: true });
+  });
 }

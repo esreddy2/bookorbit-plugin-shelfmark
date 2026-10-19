@@ -182,6 +182,7 @@ async function runTests() {
     ok('resolves local download URL from Shelfmark proxy', resolved.url.includes('/api/localdownload?id=md5-abcdef123456'));
     ok('includes api_key query param when apiKey is configured', resolved.url.includes('api_key=test-secret-key-12345'));
     ok('forwards headers with auth', resolved.headers?.['X-Api-Key'] === 'test-secret-key-12345');
+    ok('sets Accept to */* for binary download', resolved.headers?.['Accept'] === '*/*');
     ok('resolves valid fileName', resolved.fileName === 'Dune Frank Herbert.epub');
     ok('preserves format', resolved.format === 'epub');
   }

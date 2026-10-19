@@ -1,8 +1,8 @@
 {
   "schemaVersion": 1,
   "type": "shelfmark",
-  "version": "1.0.2",
+  "version": "1.0.3",
   "sourceUrl": "https://raw.githubusercontent.com/hateitwtf/bookorbit-plugin-shelfmark/main/index.mjs",
-  "sha256": "3098c9b2baf41f11a52baa95a89c02a2fa53caec866d90dda74699c6d8e21ba0",
-  "signature": "NZrFmzdA/o6Rg5vW5HHYKT4Du3zPF2+M+h8ZjrhsWL73L3WmQxtPrxprZmmbTa9fgA9m/0n8rLnQIFXjpIcADA=="
+  "sha256": "666b9f1ea71eb9a7e9002c776a770476378b0aa796544223aa5fe3fd5775c4b2",
+  "signature": "Nk+M+tT2NK0THZ7JeOsCab1pUDZSHyX3CylxAdVIl5ken/QyLb07A2MPNohe+hv8PW+lmStS4/RksCoqeuBBAw=="
 }
