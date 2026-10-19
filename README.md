@@ -123,3 +123,7 @@ services:
 ## License
 
 MIT License. See [LICENSE](LICENSE) for details.
+
+---
+
+[![GitHub Downloads](https://img.shields.io/github/downloads/hateitwtf/bookorbit-plugin-shelfmark/total?style=flat-square&logo=github)](https://github.com/hateitwtf/bookorbit-plugin-shelfmark/releases)
