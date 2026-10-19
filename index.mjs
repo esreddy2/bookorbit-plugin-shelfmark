@@ -216,9 +216,17 @@ export default {
         const rawFormat = (rel.format || rel.extension || '').toLowerCase().replace(/^\./, '');
         const sizeBytes = toNumber(rel.size_bytes || rel.sizeBytes || rel.size);
 
-        // Standard BookOrbit release record
+        const payload = {
+          source: rel.source,
+          source_id: rel.source_id || rel.id,
+          title: rel.title || book.title || query.title,
+          format: rawFormat || 'epub',
+        };
+
+        // Standard BookOrbit release record.
+        // We pack the payload into guid so BookOrbit's candidate sanitizer preserves it.
         releases.push({
-          guid: String(rel.source_id || rel.id || rel.guid || `${book.provider_id}-${releases.length}`),
+          guid: JSON.stringify(payload),
           title: rel.title || book.title || query.title,
           bookTitle: book.title || query.title,
           author: (book.authors && book.authors.join(', ')) || query.author || null,
@@ -226,12 +234,11 @@ export default {
           sizeBytes,
           seeders: null,
           leechers: null,
-          // If direct URL is present and user does not force local routing
-          downloadUrl: rel.download_url || rel.url || null,
+          downloadUrl: null,
           freeleech: true,
           primaryFileCount: 1,
           extra: {
-            releasePayload: rel,
+            releasePayload: payload,
             bookMetadata: book,
             source: rel.source,
             sourceId: rel.source_id || rel.id,
@@ -276,9 +283,18 @@ export default {
       };
     }
 
-    const payload = release.extra?.releasePayload;
-    if (!payload) {
-      if (directUrl) {
+    // Reconstruct payload: first check extra, then try parsing guid (which we packed in search)
+    let payload = release.extra?.releasePayload;
+    if (!payload && release.guid) {
+      try {
+        payload = JSON.parse(release.guid);
+      } catch (_) {
+        // Guid was not JSON
+      }
+    }
+
+    if (!payload || !payload.source || !payload.source_id) {
+      if (directUrl && directUrl.startsWith('http')) {
         return {
           url: directUrl,
           fileName: `${sanitizeFilename(release.title)}.${release.format || 'epub'}`,
@@ -310,7 +326,7 @@ export default {
     }
 
     // Step 2: Poll status until task is completed
-    const sourceId = payload.source_id || payload.id;
+    const sourceId = String(payload.source_id || payload.id);
     const timeoutSec = toNumber(config.settings?.pollTimeoutSeconds) || 180;
     const startTime = Date.now();
     let completedTaskId = null;
@@ -323,16 +339,17 @@ export default {
         if (!statusRes.ok) continue;
 
         const statusData = await statusRes.json().catch(() => ({}));
-        const completed = statusData.completed || {};
-        const failed = statusData.failed || {};
+        // Shelfmark uses "complete" and "error" in its status response
+        const completed = statusData.complete || statusData.completed || {};
+        const failed = statusData.error || statusData.failed || {};
 
         // Look for matching task in completed list
         for (const [taskId, task] of Object.entries(completed)) {
           if (
             taskId === sourceId ||
-            task.source_id === sourceId ||
-            (task.title && task.title === payload.title) ||
-            task.book_id === sourceId
+            String(task.source_id) === sourceId ||
+            String(task.id) === sourceId ||
+            (task.title && task.title === payload.title)
           ) {
             completedTaskId = taskId;
             break;
@@ -345,7 +362,8 @@ export default {
         for (const [taskId, task] of Object.entries(failed)) {
           if (
             taskId === sourceId ||
-            task.source_id === sourceId ||
+            String(task.source_id) === sourceId ||
+            String(task.id) === sourceId ||
             (task.title && task.title === payload.title)
           ) {
             const reason = task.error || task.status || 'unknown error';
@@ -363,16 +381,6 @@ export default {
       const downloadUrl = `${baseUrl}/api/localdownload?id=${encodeURIComponent(completedTaskId)}`;
       return {
         url: downloadUrl,
-        fileName: `${sanitizeFilename(release.title)}.${release.format || 'epub'}`,
-        sizeBytes: release.sizeBytes,
-        format: release.format || 'epub',
-      };
-    }
-
-    // Fallback: if timeout exceeded, check if a direct URL exists
-    if (directUrl && directUrl.startsWith('http')) {
-      return {
-        url: directUrl,
         fileName: `${sanitizeFilename(release.title)}.${release.format || 'epub'}`,
         sizeBytes: release.sizeBytes,
         format: release.format || 'epub',

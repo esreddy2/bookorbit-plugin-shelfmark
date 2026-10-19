@@ -39,14 +39,19 @@ A fresh Shelfmark installation requires a few settings before searches can work:
 
 ---
 
-### 2. BookOrbit Timeout Tweak (for Anna's Archive)
+### 2. BookOrbit Tweaks (Timeout & Local Network Downloads)
 
-BookOrbit enforces a hardcoded **20-second timeout** (`REQUEST_TIMEOUT_MS = 25_000` / `perIndexerTimeoutSeconds = 20`) on standalone indexer plugins.
+By default, BookOrbit enforces two constraints in its container that require adjustments when integrating with a self-hosted Shelfmark:
 
-* **If searching Libgen only:** Searches finish in ~1–2 seconds, well within the 20s budget. Set `Release Source` to `libgen` in the plugin settings.
-* **If searching Anna's Archive (`all` or `direct_download`):** Solving the Cloudflare / DDoS-Guard challenge via Shelfmark's headless browser takes 25–45 seconds. BookOrbit will abort with `Shelfmark did not answer in time` unless its timeout is raised.
+1. **Indexer Timeout (20 seconds):**  
+   BookOrbit enforces a hardcoded timeout (`REQUEST_TIMEOUT_MS = 25_000` / `perIndexerTimeoutSeconds = 20`) on standalone indexer plugins.  
+   - If searching **Libgen only**, queries take ~1–2 seconds and work out of the box.  
+   - If searching **Anna's Archive**, solving the Cloudflare / DDoS-Guard challenge via Shelfmark's headless browser takes 25–45 seconds. BookOrbit will abort with `Shelfmark did not answer in time` unless this timeout is raised.
 
-To permanently increase BookOrbit's timeout to 90 seconds, add this startup command to your `docker-compose.yml`:
+2. **Private Address SSRF Block (`ALLOW_PRIVATE = false`):**  
+   BookOrbit's download client (`DirectDownloadService`) rejects any download URL that resolves to a private LAN or Docker IP (`PrivateAddressException`). Because Shelfmark delivers the downloaded book via its local API (`/api/localdownload`), BookOrbit will block the transfer unless private IPs are permitted.
+
+To apply both fixes automatically at container startup, add this command override to your BookOrbit service in `compose.yaml`:
 
 ```yaml
 services:
@@ -58,6 +63,7 @@ services:
       - |
         sed -i 's/REQUEST_TIMEOUT_MS = 25_000/REQUEST_TIMEOUT_MS = 90_000/g' /app/dist/modules/book-request/indexers/plugins/plugin-host.js 2>/dev/null || true
         sed -i 's/perIndexerTimeoutSeconds ?? 20/perIndexerTimeoutSeconds ?? 90/g' /app/dist/modules/book-request/indexers/indexer-config.service.js /app/dist/modules/book-request/indexers/indexer-search.service.js 2>/dev/null || true
+        sed -i 's/const ALLOW_PRIVATE = false;/const ALLOW_PRIVATE = true;/g' /app/dist/modules/book-request/fulfillment/direct-download.service.js 2>/dev/null || true
         exec sh /app/entrypoint.sh
 ```
 

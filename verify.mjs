@@ -174,6 +174,35 @@ async function runTests() {
     ok('resolves direct URL when downloadViaShelfmark is false', resolved.url === 'https://example.com/books/dune.epub');
   }
 
+  {
+    // Mode C: BookOrbit strips release.extra during candidate sanitization; payload is recovered from guid
+    const host = makeHost((url, options) => {
+      if (url.includes('/api/releases/download')) return mockResponse({ status: 'queued' });
+      if (url.includes('/api/status')) return mockResponse(STATUS);
+      return mockResponse({});
+    });
+
+    const payload = {
+      source: 'annas_archive',
+      source_id: 'md5-abcdef123456',
+      title: 'Dune (Frank Herbert) [EPUB]',
+      format: 'epub',
+    };
+
+    const sanitizedRelease = {
+      guid: JSON.stringify(payload),
+      title: 'Dune (Frank Herbert)',
+      format: 'epub',
+      sizeBytes: 1572864,
+      downloadUrl: null,
+      // Note: extra is completely absent as sanitized by BookOrbit
+    };
+
+    const resolved = await plugin.resolveFile(sanitizedRelease, baseConfig(), host);
+    ok('resolves local download URL when extra is stripped by BookOrbit', resolved.url.includes('/api/localdownload?id=md5-abcdef123456'));
+    ok('recovers format correctly when extra is stripped', resolved.format === 'epub');
+  }
+
   console.log(`\nResults: ${pass} passed, ${fail} failed.\n`);
   if (fail > 0) {
     process.exit(1);
