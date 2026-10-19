@@ -82,7 +82,7 @@ async function runTests() {
   ok('targets BookOrbit API version 1', plugin.apiVersion === 1);
   ok('type is shelfmark', plugin.type === 'shelfmark');
   ok('supports ebook and audiobook', plugin.mediaKinds.includes('ebook') && plugin.mediaKinds.includes('audiobook'));
-  ok('defines apiKey in settingsFields', plugin.settingsFields.some((f) => f.key === 'apiKey' && f.type === 'password'));
+  ok('defines apiKey in settingsFields', plugin.settingsFields.some((f) => f.key === 'apiKey' && f.type === 'string'));
   ok('defines preferFormat in settingsFields', plugin.settingsFields.some((f) => f.key === 'preferFormat'));
   ok('defines downloadViaShelfmark toggle', plugin.settingsFields.some((f) => f.key === 'downloadViaShelfmark'));
 

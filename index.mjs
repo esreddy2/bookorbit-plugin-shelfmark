@@ -36,17 +36,16 @@ export default {
   settingsFields: [
     {
       key: 'apiKey',
-      type: 'password',
+      type: 'string',
       label: 'Shelfmark API Key',
       hint: 'The SHELFMARK_API_KEY value configured in your Shelfmark environment (optional if auth is disabled).',
       default: '',
     },
     {
       key: 'preferFormat',
-      type: 'select',
+      type: 'string',
       label: 'Preferred Format',
-      hint: 'File format given priority in search ranking.',
-      options: ['epub', 'mobi', 'azw3', 'pdf', 'any'],
+      hint: 'File format given priority in search ranking: epub, mobi, azw3, pdf, or any.',
       default: 'epub',
     },
     {
