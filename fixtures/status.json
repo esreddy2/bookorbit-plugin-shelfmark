@@ -1,0 +1,13 @@
+{
+  "active": {},
+  "completed": {
+    "md5-abcdef123456": {
+      "book_id": "md5-abcdef123456",
+      "source_id": "md5-abcdef123456",
+      "title": "Dune (Frank Herbert) [EPUB]",
+      "status": "completed",
+      "download_path": "/downloads/Dune.epub"
+    }
+  },
+  "failed": {}
+}

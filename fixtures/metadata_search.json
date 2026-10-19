@@ -1,0 +1,15 @@
+{
+  "books": [
+    {
+      "provider": "openlibrary",
+      "provider_id": "OL12345M",
+      "title": "Dune",
+      "authors": ["Frank Herbert"],
+      "publish_year": 1965,
+      "description": "Set on the desert planet Arrakis...",
+      "cover_url": "https://covers.openlibrary.org/b/id/12345-M.jpg"
+    }
+  ],
+  "total": 1,
+  "provider": "openlibrary"
+}

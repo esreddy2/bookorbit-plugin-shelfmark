@@ -1,0 +1,20 @@
+[
+  {
+    "id": "rel-001",
+    "source_id": "md5-abcdef123456",
+    "source": "annas_archive",
+    "title": "Dune (Frank Herbert) [EPUB]",
+    "format": "epub",
+    "size_bytes": 1572864,
+    "download_url": "http://localhost:8084/api/localdownload?id=md5-abcdef123456"
+  },
+  {
+    "id": "rel-002",
+    "source_id": "md5-789012345678",
+    "source": "libgen",
+    "title": "Dune (Frank Herbert) [PDF]",
+    "format": "pdf",
+    "size_bytes": 3145728,
+    "download_url": "http://localhost:8084/api/localdownload?id=md5-789012345678"
+  }
+]
