@@ -148,6 +148,7 @@ async function runTests() {
     ok('release has format', first.format === 'epub');
     ok('release preferred format ranked first', first.format === 'epub');
     ok('release has valid sizeBytes', typeof first.sizeBytes === 'number');
+    ok('release has direct downloadUrl if provided', typeof first.downloadUrl === 'string');
     ok('freeleech marked true', first.freeleech === true);
     ok('extra payload preserved for resolveFile', first.extra?.releasePayload?.source_id === 'md5-abcdef123456');
   }
@@ -156,7 +157,7 @@ async function runTests() {
   {
     // Mode A: Download via Shelfmark queue
     const host = makeHost((url, options) => {
-      if (url.includes('/api/releases/download')) return mockResponse({ status: 'queued' });
+      if (url.includes('/api/releases/download')) return mockResponse({ status: 'queued', task_id: 'task-999' });
       if (url.includes('/api/status')) return mockResponse(STATUS);
       return mockResponse({});
     });
@@ -179,6 +180,8 @@ async function runTests() {
 
     const resolved = await plugin.resolveFile(release, baseConfig(), host);
     ok('resolves local download URL from Shelfmark proxy', resolved.url.includes('/api/localdownload?id=md5-abcdef123456'));
+    ok('includes api_key query param when apiKey is configured', resolved.url.includes('api_key=test-secret-key-12345'));
+    ok('forwards headers with auth', resolved.headers?.['X-Api-Key'] === 'test-secret-key-12345');
     ok('resolves valid fileName', resolved.fileName === 'Dune Frank Herbert.epub');
     ok('preserves format', resolved.format === 'epub');
   }
@@ -218,7 +221,7 @@ async function runTests() {
     const sanitizedRelease = {
       guid: JSON.stringify(payload),
       title: 'Dune (Frank Herbert)',
-      format: 'epub',
+      format: null, // Test format recovery when top-level format is null
       sizeBytes: 1572864,
       downloadUrl: null,
       // Note: extra is completely absent as sanitized by BookOrbit
@@ -226,7 +229,26 @@ async function runTests() {
 
     const resolved = await plugin.resolveFile(sanitizedRelease, baseConfig(), host);
     ok('resolves local download URL when extra is stripped by BookOrbit', resolved.url.includes('/api/localdownload?id=md5-abcdef123456'));
-    ok('recovers format correctly when extra is stripped', resolved.format === 'epub');
+    ok('recovers format correctly from payload when extra and top-level format are stripped', resolved.format === 'epub');
+  }
+
+  {
+    // Mode D: AbortSignal cancellation
+    const host = makeHost((url) => mockResponse({}));
+    const release = {
+      guid: JSON.stringify({ source: 'libgen', source_id: '123' }),
+      title: 'Test Book',
+    };
+
+    const abortController = new AbortController();
+    abortController.abort();
+    let abortedHandled = false;
+    try {
+      await plugin.resolveFile(release, baseConfig(), host, abortController.signal);
+    } catch (err) {
+      if (err.code === 'cancelled') abortedHandled = true;
+    }
+    ok('aborts resolution when AbortSignal is cancelled', abortedHandled === true);
   }
 
   console.log(`\nResults: ${pass} passed, ${fail} failed.\n`);

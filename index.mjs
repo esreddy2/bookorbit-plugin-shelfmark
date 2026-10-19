@@ -21,7 +21,7 @@ const FORMAT_PREFERENCE = ['epub', 'mobi', 'azw3', 'pdf', 'm4b', 'mp3'];
 
 export default {
   apiVersion: 1,
-  version: '1.0.1',
+  version: '1.0.2',
   update: {
     manifestUrl: 'https://raw.githubusercontent.com/hateitwtf/bookorbit-plugin-shelfmark/main/updates/shelfmark.json',
     ed25519PublicKey: 'CZDs4fE6KQAYxn_xkPUAfITp-n0vVECZ-WjVCu7h-e4',
@@ -82,7 +82,7 @@ export default {
    * @param {object} host - BookOrbit host helper (host.fetch, host.fail, host.logger).
    * @returns {Promise<{success: boolean, indexerName?: string, error?: string}>}
    */
-  async test(config, host) {
+  async test(config, host, signal) {
     try {
       const baseUrl = cleanUrl(config.baseUrl);
       const headers = makeHeaders(config);
@@ -90,6 +90,7 @@ export default {
       // Verify basic connectivity and health endpoint
       const response = await host.fetch(`${baseUrl}/api/health`, {
         headers,
+        signal,
       });
 
       if (response.status === 401 || response.status === 403) {
@@ -109,9 +110,10 @@ export default {
       // Check if config or status endpoint is accessible
       const statusRes = await host.fetch(`${baseUrl}/api/status`, {
         headers,
+        signal,
       });
 
-      if (!statusRes.ok && statusRes.status !== 200) {
+      if (!statusRes.ok) {
         return {
           success: false,
           error: `Connected to health endpoint, but status query returned HTTP ${statusRes.status}. Check permissions.`,
@@ -136,7 +138,7 @@ export default {
    * @param {object} query - Search query object from BookOrbit (title, author, mediaKind, limit, etc.).
    * @param {object} config - Indexer configuration (baseUrl, settings).
    * @param {object} host - BookOrbit host helper.
-   * @param {AbortSignal} signal - Cancellation signal.
+   * @param {AbortSignal} [signal] - Cancellation signal.
    * @returns {Promise<Array<object>>} - List of BookOrbit release objects.
    */
   async search(query, config, host, signal) {
@@ -163,7 +165,7 @@ export default {
     try {
       metaRes = await host.fetch(metadataUrl.href, { headers, signal });
     } catch (err) {
-      if (signal.aborted) return [];
+      if (signal?.aborted) return [];
       throw host.fail('unreachable', `Failed to connect to Shelfmark: ${err.message}`);
     }
 
@@ -184,10 +186,11 @@ export default {
     const preferredFormat = (config.settings?.preferFormat || 'epub').toLowerCase();
     const source = (config.settings?.releaseSource || 'all').toLowerCase();
     const releases = [];
+    const maxResults = query.limit || MAX_RESULTS;
 
-    // Step 2: Search available download releases
+    // Step 2: Search available download releases across top book metadata matches
     for (const book of books.slice(0, 2)) {
-      if (signal.aborted) break;
+      if (signal?.aborted) break;
 
       const releasesUrl = new URL(`${baseUrl}/api/releases`);
       releasesUrl.searchParams.set('provider', book.provider);
@@ -203,7 +206,7 @@ export default {
       try {
         relRes = await host.fetch(releasesUrl.href, { headers, signal });
       } catch (err) {
-        if (signal.aborted) break;
+        if (signal?.aborted) break;
         continue;
       }
 
@@ -219,6 +222,7 @@ export default {
       for (const rel of foundReleases) {
         const rawFormat = (rel.format || rel.extension || '').toLowerCase().replace(/^\./, '');
         const sizeBytes = toNumber(rel.size_bytes || rel.sizeBytes || rel.size);
+        const directUrl = rel.download_url || rel.downloadUrl || rel.url || null;
 
         const payload = {
           source: rel.source,
@@ -238,7 +242,7 @@ export default {
           sizeBytes,
           seeders: null,
           leechers: null,
-          downloadUrl: null,
+          downloadUrl: directUrl,
           freeleech: true,
           primaryFileCount: 1,
           extra: {
@@ -248,19 +252,13 @@ export default {
             sourceId: rel.source_id || rel.id,
           },
         });
-
-        if (releases.length >= (query.limit || MAX_RESULTS)) break;
       }
-
-      if (releases.length > 0) break;
     }
 
-    // Rank results based on preferred format and availability
-    return releases.sort((a, b) => {
-      const aRank = rankFormat(a.format, preferredFormat);
-      const bRank = rankFormat(b.format, preferredFormat);
-      return aRank - bRank;
-    });
+    // Rank results based on preferred format and availability, then limit
+    return releases
+      .sort((a, b) => rankFormat(a.format, preferredFormat) - rankFormat(b.format, preferredFormat))
+      .slice(0, maxResults);
   },
 
   /**
@@ -269,23 +267,15 @@ export default {
    * @param {object} release - Chosen BookOrbit release.
    * @param {object} config - Indexer configuration.
    * @param {object} host - BookOrbit host helper.
-   * @returns {Promise<{url: string, fileName: string, sizeBytes?: number, format?: string}>}
+   * @param {AbortSignal} [signal] - Cancellation signal.
+   * @returns {Promise<{url: string, fileName: string, sizeBytes?: number, format?: string, headers?: object}>}
    */
-  async resolveFile(release, config, host) {
+  async resolveFile(release, config, host, signal) {
     const baseUrl = cleanUrl(config.baseUrl);
     const headers = makeHeaders(config);
+    const apiKey = config.settings?.apiKey;
     const downloadViaShelfmark = config.settings?.downloadViaShelfmark !== false;
     const directUrl = release.downloadUrl;
-
-    // Fast path: if not downloading via Shelfmark and direct URL exists
-    if (!downloadViaShelfmark && directUrl && directUrl.startsWith('http')) {
-      return {
-        url: directUrl,
-        fileName: `${sanitizeFilename(release.title)}.${release.format || 'epub'}`,
-        sizeBytes: release.sizeBytes,
-        format: release.format || 'epub',
-      };
-    }
 
     // Reconstruct payload: first check extra, then try parsing guid (which we packed in search)
     let payload = release.extra?.releasePayload;
@@ -297,13 +287,26 @@ export default {
       }
     }
 
+    const resolvedFormat = (release.format || payload?.format || 'epub').toLowerCase();
+    const fileName = `${sanitizeFilename(release.title)}.${resolvedFormat}`;
+
+    // Fast path: if not downloading via Shelfmark and direct URL exists
+    if (!downloadViaShelfmark && directUrl && directUrl.startsWith('http')) {
+      return {
+        url: directUrl,
+        fileName,
+        sizeBytes: release.sizeBytes,
+        format: resolvedFormat,
+      };
+    }
+
     if (!payload || !payload.source || !payload.source_id) {
       if (directUrl && directUrl.startsWith('http')) {
         return {
           url: directUrl,
-          fileName: `${sanitizeFilename(release.title)}.${release.format || 'epub'}`,
+          fileName,
           sizeBytes: release.sizeBytes,
-          format: release.format || 'epub',
+          format: resolvedFormat,
         };
       }
       throw host.fail('error', `Release data for "${release.title}" is missing download information.`);
@@ -319,8 +322,12 @@ export default {
           'Content-Type': 'application/json',
         },
         body: JSON.stringify(payload),
+        signal,
       });
     } catch (err) {
+      if (signal?.aborted) {
+        throw host.fail('cancelled', 'Download request was cancelled.');
+      }
       throw host.fail('unreachable', `Could not trigger download in Shelfmark: ${err.message}`);
     }
 
@@ -329,6 +336,9 @@ export default {
       throw host.fail('error', `Shelfmark download request failed (${queueRes.status}): ${errBody}`);
     }
 
+    const queueData = await queueRes.json().catch(() => ({}));
+    const queuedTaskId = queueData.task_id || queueData.taskId || queueData.id || null;
+
     // Step 2: Poll status until task is completed
     const sourceId = String(payload.source_id || payload.id);
     const timeoutSec = toNumber(config.settings?.pollTimeoutSeconds) || 180;
@@ -336,10 +346,18 @@ export default {
     let completedTaskId = null;
 
     while (Date.now() - startTime < timeoutSec * 1000) {
+      if (signal?.aborted) {
+        throw host.fail('cancelled', 'Download resolution was aborted.');
+      }
+
       await sleep(2500);
 
+      if (signal?.aborted) {
+        throw host.fail('cancelled', 'Download resolution was aborted.');
+      }
+
       try {
-        const statusRes = await host.fetch(`${baseUrl}/api/status`, { headers });
+        const statusRes = await host.fetch(`${baseUrl}/api/status`, { headers, signal });
         if (!statusRes.ok) continue;
 
         const statusData = await statusRes.json().catch(() => ({}));
@@ -347,14 +365,32 @@ export default {
         const completed = statusData.complete || statusData.completed || {};
         const failed = statusData.error || statusData.failed || {};
 
+        // Helper to match a task entry against our queued task or payload
+        const isTargetTask = (taskId, task) => {
+          if (
+            queuedTaskId &&
+            (taskId === String(queuedTaskId) ||
+              String(task.id) === String(queuedTaskId) ||
+              String(task.task_id) === String(queuedTaskId))
+          ) {
+            return true;
+          }
+          if (
+            sourceId &&
+            (taskId === sourceId || String(task.source_id) === sourceId || String(task.id) === sourceId)
+          ) {
+            return true;
+          }
+          if (!sourceId && !queuedTaskId && task.title && task.title === payload.title) {
+            const taskFormat = (task.format || '').toLowerCase();
+            return !taskFormat || !payload.format || taskFormat === payload.format.toLowerCase();
+          }
+          return false;
+        };
+
         // Look for matching task in completed list
         for (const [taskId, task] of Object.entries(completed)) {
-          if (
-            taskId === sourceId ||
-            String(task.source_id) === sourceId ||
-            String(task.id) === sourceId ||
-            (task.title && task.title === payload.title)
-          ) {
+          if (isTargetTask(taskId, task)) {
             completedTaskId = taskId;
             break;
           }
@@ -364,30 +400,32 @@ export default {
 
         // Check if task failed
         for (const [taskId, task] of Object.entries(failed)) {
-          if (
-            taskId === sourceId ||
-            String(task.source_id) === sourceId ||
-            String(task.id) === sourceId ||
-            (task.title && task.title === payload.title)
-          ) {
+          if (isTargetTask(taskId, task)) {
             const reason = task.error || task.status || 'unknown error';
             throw host.fail('error', `Shelfmark reported download failed: ${reason}`);
           }
         }
       } catch (pollErr) {
         if (pollErr.code) throw pollErr; // Re-throw host.fail
+        if (signal?.aborted) {
+          throw host.fail('cancelled', 'Download resolution was aborted.');
+        }
         // Transient network issue while polling, retry
       }
     }
 
     // If completed in Shelfmark, return local download proxy URL
     if (completedTaskId) {
-      const downloadUrl = `${baseUrl}/api/localdownload?id=${encodeURIComponent(completedTaskId)}`;
+      let downloadUrl = `${baseUrl}/api/localdownload?id=${encodeURIComponent(completedTaskId)}`;
+      if (apiKey) {
+        downloadUrl += `&api_key=${encodeURIComponent(apiKey)}`;
+      }
       return {
         url: downloadUrl,
-        fileName: `${sanitizeFilename(release.title)}.${release.format || 'epub'}`,
+        headers,
+        fileName,
         sizeBytes: release.sizeBytes,
-        format: release.format || 'epub',
+        format: resolvedFormat,
       };
     }
 
