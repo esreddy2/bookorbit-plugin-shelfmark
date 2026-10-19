@@ -234,22 +234,59 @@ async function runTests() {
   }
 
   {
-    // Mode D: AbortSignal cancellation
-    const host = makeHost((url) => mockResponse({}));
+    // Mode D: Matches by queuedTaskId returned from POST /api/releases/download and sets headers/api_key
+    const host = makeHost((url) => {
+      if (url.includes('/api/releases/download')) return mockResponse({ task_id: 'custom-queue-999' });
+      if (url.includes('/api/status')) {
+        return mockResponse({
+          complete: {
+            'custom-queue-999': { id: 'custom-queue-999', title: 'Some Other Title' },
+          },
+        });
+      }
+      return mockResponse({});
+    });
+
     const release = {
-      guid: JSON.stringify({ source: 'libgen', source_id: '123' }),
-      title: 'Test Book',
+      guid: JSON.stringify({ source: 'libgen', source_id: 'lg-111', title: 'Dune', format: 'mobi' }),
+      title: 'Dune',
+      format: null,
+      sizeBytes: 500000,
     };
 
-    const abortController = new AbortController();
-    abortController.abort();
-    let abortedHandled = false;
+    const resolved = await plugin.resolveFile(release, baseConfig(), host);
+    ok('matches task by queuedTaskId', resolved.url.includes('id=custom-queue-999'));
+    ok('appends api_key query param to localdownload URL', resolved.url.includes('api_key=test-secret-key-12345'));
+    ok('sets wildcard Accept header for binary download', resolved.headers?.Accept === '*/*');
+    ok('recovers format from guid when release.format is null', resolved.format === 'mobi' && resolved.fileName === 'Dune.mobi');
+  }
+
+  {
+    // Mode E: Instant cancellation via AbortSignal during polling sleep
+    const host = makeHost((url) => {
+      if (url.includes('/api/releases/download')) return mockResponse({ status: 'queued' });
+      if (url.includes('/api/status')) return mockResponse({ complete: {}, error: {} });
+      return mockResponse({});
+    });
+
+    const release = {
+      guid: JSON.stringify({ source: 'annas_archive', source_id: 'md5-pending', title: 'Dune', format: 'epub' }),
+      title: 'Dune',
+    };
+
+    const controller = new AbortController();
+    const start = Date.now();
+    setTimeout(() => controller.abort(), 150);
+
+    let caughtErr = null;
     try {
-      await plugin.resolveFile(release, baseConfig(), host, abortController.signal);
+      await plugin.resolveFile(release, baseConfig({ settings: { pollTimeoutSeconds: 30 } }), host, controller.signal);
     } catch (err) {
-      if (err.code === 'cancelled') abortedHandled = true;
+      caughtErr = err;
     }
-    ok('aborts resolution when AbortSignal is cancelled', abortedHandled === true);
+
+    const elapsed = Date.now() - start;
+    ok('aborts polling immediately on signal abort', caughtErr?.code === 'cancelled' && elapsed < 1000);
   }
 
   console.log(`\nResults: ${pass} passed, ${fail} failed.\n`);
