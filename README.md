@@ -64,8 +64,8 @@ services:
       - sh
       - -c
       - |
-        sed -i 's/REQUEST_TIMEOUT_MS = 25_000/REQUEST_TIMEOUT_MS = 90_000/g' /app/dist/modules/book-request/indexers/plugins/plugin-host.js 2>/dev/null || true
-        sed -i 's/perIndexerTimeoutSeconds ?? 20/perIndexerTimeoutSeconds ?? 90/g' /app/dist/modules/book-request/indexers/indexer-config.service.js /app/dist/modules/book-request/indexers/indexer-search.service.js 2>/dev/null || true
+        sed -i 's/REQUEST_TIMEOUT_MS = 25_000/REQUEST_TIMEOUT_MS = 180_000/g' /app/dist/modules/book-request/indexers/plugins/plugin-host.js 2>/dev/null || true
+        sed -i 's/perIndexerTimeoutSeconds ?? 20/perIndexerTimeoutSeconds ?? 180/g' /app/dist/modules/book-request/indexers/indexer-config.service.js /app/dist/modules/book-request/indexers/indexer-search.service.js 2>/dev/null || true
         sed -i 's/const ALLOW_PRIVATE = false;/const ALLOW_PRIVATE = true;/g' /app/dist/modules/book-request/fulfillment/direct-download.service.js 2>/dev/null || true
         exec sh /app/entrypoint.sh
 ```
