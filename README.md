@@ -42,19 +42,30 @@ A fresh Shelfmark installation requires a few settings before searches can work:
 
 ---
 
-### 2. BookOrbit Tweaks (Timeout & Local Network Downloads)
+### 2. BookOrbit Configuration (Timeouts & Local Network Downloads)
 
-By default, BookOrbit enforces two constraints in its container that require adjustments when integrating with a self-hosted Shelfmark:
+Integrating a self-hosted Shelfmark instance involves two distinct timeout stages: **Search Timeout** (finding book releases) and **Download Timeout** (fetching the book file). Understanding how each is controlled makes troubleshooting straightforward.
 
-1. **Indexer Timeout (20 seconds):**  
-   BookOrbit enforces a hardcoded timeout (`REQUEST_TIMEOUT_MS = 25_000` / `perIndexerTimeoutSeconds = 20`) on standalone indexer plugins.  
-   - If searching **Libgen only**, queries take ~1–2 seconds and work out of the box.  
-   - If searching **Anna's Archive**, solving the Cloudflare / DDoS-Guard challenge via Shelfmark's headless browser takes 25–45 seconds. BookOrbit will abort with `Shelfmark did not answer in time` unless this timeout is raised.
+#### Understanding the Timeouts
 
-2. **Private Address SSRF Block (`ALLOW_PRIVATE = false`):**  
-   BookOrbit's download client (`DirectDownloadService`) rejects any download URL that resolves to a private LAN or Docker IP (`PrivateAddressException`). Because Shelfmark delivers the downloaded book via its local API (`/api/localdownload`), BookOrbit will block the transfer unless private IPs are permitted.
+| Timeout | What It Controls | Default | Where Configured | How to Increase |
+| :--- | :--- | :--- | :--- | :--- |
+| **Search / Query Timeout** | Maximum time BookOrbit waits for Shelfmark to search metadata and solve Cloudflare/mirrors | 20–25s *(BookOrbit hardcoded)* | `compose.yaml` command override | Change `180_000` / `180` in the `sed` script *(see below)* |
+| **Download Wait Timeout** | Maximum time the plugin polls Shelfmark until the book download finishes | **180s (3 min)** | **BookOrbit Web UI** | Edit **Download Wait Timeout** in UI settings *(no restart needed)* |
 
-To apply both fixes automatically at container startup, add this command override to your BookOrbit service in `compose.yaml`:
+#### Symptoms of Insufficient Timeouts
+* **Search Timeout too short:** BookOrbit displays `Shelfmark did not answer in time` during search, or Anna's Archive results never appear while Libgen works.
+* **Download Timeout too short:** Book request approval fails after 3 minutes with `Timed out waiting for Shelfmark to finish downloading "..." after 180 seconds`.
+
+---
+
+#### Step 1: Adjusting Search Timeout & Private IP Downloads (`compose.yaml`)
+
+BookOrbit enforces two hardcoded constraints in its container image:
+1. **Search Timeout:** Hardcoded to 20 seconds (`perIndexerTimeoutSeconds ?? 20`) and 25 seconds (`REQUEST_TIMEOUT_MS = 25_000`). While Libgen queries take ~1–2 seconds, Anna's Archive queries solve Cloudflare / DDoS-Guard challenges via Shelfmark's headless browser, taking 25–45 seconds (or longer during peak hours).
+2. **Private Address SSRF Block (`ALLOW_PRIVATE = false`):** BookOrbit's `DirectDownloadService` rejects URLs resolving to private LAN or Docker IPs (`PrivateAddressException`). Because Shelfmark delivers the downloaded book via its local API (`/api/localdownload`), private IPs must be permitted.
+
+To raise the search timeout to **3 minutes (180s)** (recommended) and allow local downloads automatically at container startup, add this command override to your BookOrbit service in `compose.yaml`:
 
 ```yaml
 services:
@@ -64,11 +75,28 @@ services:
       - sh
       - -c
       - |
+        # Raise search timeout from 20-25s to 180s (adjust 180_000 / 180 as needed):
         sed -i 's/REQUEST_TIMEOUT_MS = 25_000/REQUEST_TIMEOUT_MS = 180_000/g' /app/dist/modules/book-request/indexers/plugins/plugin-host.js 2>/dev/null || true
         sed -i 's/perIndexerTimeoutSeconds ?? 20/perIndexerTimeoutSeconds ?? 180/g' /app/dist/modules/book-request/indexers/indexer-config.service.js /app/dist/modules/book-request/indexers/indexer-search.service.js 2>/dev/null || true
+        # Allow downloading from internal Docker / LAN IPs (Shelfmark proxy):
         sed -i 's/const ALLOW_PRIVATE = false;/const ALLOW_PRIVATE = true;/g' /app/dist/modules/book-request/fulfillment/direct-download.service.js 2>/dev/null || true
         exec sh /app/entrypoint.sh
 ```
+
+> [!TIP]
+> **Need even more search time?**  
+> If your upstream mirrors or Tor connections are slow, replace `180_000` with `300_000` (5 minutes) and `180` with `300` in the `sed` commands above, then restart the container: `docker compose up -d bookorbit`.
+
+---
+
+#### Step 2: Adjusting Download Wait Timeout (BookOrbit Web UI)
+
+The download timeout is configured directly in BookOrbit's settings without needing to edit compose files or restart containers:
+1. Open BookOrbit and navigate to **Settings > System > Requests > Sources > Shelfmark**.
+2. Change **Download Wait Timeout (seconds)** from the default `180` to your desired duration:
+   - **`300` (5 minutes):** Good for standard e-books over slower VPNs.
+   - **`600`–`1200` (10–20 minutes):** Recommended if downloading multi-hundred-megabyte **audiobooks** or using Tor routing in Shelfmark.
+3. Click **Save**. Changes take effect immediately.
 
 ---
 
