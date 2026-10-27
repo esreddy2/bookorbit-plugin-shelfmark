@@ -1,157 +1,202 @@
 # BookOrbit Shelfmark Indexer Plugin
 
-An indexer plugin for [BookOrbit](https://github.com/bookorbit/bookorbit) that integrates with a self-hosted [Shelfmark](https://github.com/calibrain/shelfmark) instance. Yep, fully vibecoded.
+An indexer plugin for [BookOrbit](https://github.com/bookorbit/bookorbit) that integrates natively with a self-hosted [Shelfmark](https://github.com/calibrain/shelfmark) instance.
 
-It enables BookOrbit to search book releases across sources configured in Shelfmark (Anna's Archive, Libgen, etc.) and routes downloads through Shelfmark's download pipeline.
+This plugin enables BookOrbit to search book releases across sources configured in Shelfmark (Anna's Archive, Libgen, etc.) and routes downloads through Shelfmark's download pipeline.
+
+> [!NOTE]
+> This is a maintained fork (`esreddy2/bookorbit-plugin-shelfmark`) with cryptographic ownership transferred away from the upstream author to prevent automated overwrites, along with improvements for title-only Open Library metadata queries, strict author validation, safe missing task ID resolution, bounded polling with backoff, and focused EPUB/PDF support.
+
+---
 
 ## Features
 
-- **Native BookOrbit Integration:** Fully compliant with BookOrbit's indexer plugin specification (`apiVersion: 1`).
-- **E-Book & Audiobook Support:** Seamlessly queries Shelfmark for both books (`ebook`) and audiobooks (`audiobook`), matching format priorities (`epub`, `mobi`, `azw3`, `pdf`, `m4b`, `mp3`).
-- **Configurable via Web UI:** Set the Shelfmark URL, API Key, format preferences, and download timeouts directly inside BookOrbit's settings panel.
-- **Dual Download Modes:**
-  - **Shelfmark Managed (Recommended):** Queues download inside Shelfmark so any configured Tor/WireGuard/Cloudflare bypass runs inside Shelfmark, then serves the completed book to BookOrbit via `/api/localdownload`.
-  - **Direct Download:** For sources that provide direct HTTP download links, BookOrbit can fetch the file directly.
-- **Signed Auto-Updates:** Built-in Ed25519 cryptographic update channel for one-click and automatic updates directly from the BookOrbit UI.
-- **Dependency-Free:** Single-file ECMAScript module (`index.mjs`) with zero third-party dependencies, running safely in BookOrbit's Node.js runtime.
-
-## Prerequisites & Configuration Tweaks
-
-### 1. Shelfmark Configuration
-A fresh Shelfmark installation requires a few settings before searches can work:
-
-* **Enable a Metadata Provider:**  
-  Shelfmark has no internal catalog; it resolves book metadata externally. By default, no free provider is enabled.  
-  1. Open Shelfmark Web UI (`http://shelfmark:8084`).
-  2. Go to **Settings > Open Library** and check **Enable Open Library**.
-  3. Go to **Settings > Search Mode** and ensure **Book Metadata Provider** is set to **Open Library**.  
-  *(Without this, Shelfmark will return `HTTP 503: No metadata provider configured`).*
-
-* **Configure Release Sources & Mirrors:**
-  - **Libgen (Fastest, ~1s):** Go to **Settings > Libgen Search** and check **Enable Libgen Search**. In **Settings > Mirrors**, set **LibGen** mirrors to `https://libgen.li` and `https://libgen.gs` (mirrors like `.is` or `.rs` may be blocked by regional ISPs). *(Note: Libgen provides e-books only).*
-  - **Anna's Archive (Direct Download):** In **Settings > Mirrors**, pin **Primary Mirror** (`AA_BASE_URL`) to `https://annas-archive.pk` instead of `auto` to avoid losing 15 seconds on failing mirrors like `.gl`.
-  - **Audiobooks (AudiobookBay / Prowlarr):** For audiobook requests, enable **Settings > AudiobookBay** (`ABB_ENABLED=true`, `ABB_HOSTNAME=audiobookbay.lu`) or configure Prowlarr indexers under the Audiobook category (`3030`).
-  - **Keep Challenge Solver Warm:** In **Settings > Cloudflare Bypass**, set **Bypasser Idle Timeout** (`BYPASS_BROWSER_IDLE_TIMEOUT`) to `1800` (30 minutes). This prevents Shelfmark from terminating its headless browser helper after 3 minutes of inactivity.
-
-* **API Key:**
-  Generate a key (`openssl rand -base64 32`) and pass it to your Shelfmark container environment:
-  ```yaml
-  environment:
-    - SHELFMARK_API_KEY=your_generated_secret_key
-  ```
+- **Native BookOrbit Request Integration:** Fully compliant with BookOrbit's indexer plugin specification (`apiVersion: 1`). Searches and downloads are triggered through BookOrbit Requests on demand—no standalone background daemons and no continuous polling.
+- **Robust Metadata Search & Author Validation:** Queries Shelfmark's Open Library metadata endpoint by title only (resolving the Open Library bug where combined title and author queries return zero results), then validates both title and author before fetching releases to prevent incorrect book selection.
+- **EPUB and PDF Support:** Prioritizes EPUB by default while fully supporting PDF downloads. (Audiobook support has been removed to streamline deployment).
+- **Safe Download Handling:** Accurately handles Shelfmark tasks even when Shelfmark accepts downloads without returning a task ID. Pre-existing completed tasks from earlier downloads are safely ignored, and ambiguous multi-task matches fail safely to avoid associating with the wrong book.
+- **Bounded Polling with Backoff:** Replaces fixed sleep polling with responsive, bounded polling featuring exponential backoff (1s up to 5s) and immediate AbortSignal cancellation.
+- **Fork Update Ownership:** Cryptographically detached from upstream update channels. Auto-updates check this fork's repository and verify against an independent Ed25519 keypair.
+- **Zero Dependencies:** Single-file ECMAScript module (`index.mjs`) compatible with BookOrbit's Node.js plugin sandbox.
 
 ---
 
-### 2. BookOrbit Configuration (Timeouts & Local Network Downloads)
+## Prerequisites & Shelfmark Configuration
 
-Integrating a self-hosted Shelfmark instance involves two distinct timeout stages: **Search Timeout** (finding book releases) and **Download Timeout** (fetching the book file). Understanding how each is controlled makes troubleshooting straightforward.
+Before configuring BookOrbit, verify the following settings inside your Shelfmark instance (`http://shelfmark:8084`):
 
-#### Understanding the Timeouts
+1. **Enable Open Library Metadata Provider:**  
+   - Go to **Settings > Open Library** and check **Enable Open Library**.  
+   - In **Settings > Search Mode**, ensure **Book Metadata Provider** is set to **Open Library**.  
+   *(If not configured, Shelfmark returns `HTTP 503: No metadata provider configured`).*
 
-| Timeout | What It Controls | Default | Where Configured | How to Increase |
-| :--- | :--- | :--- | :--- | :--- |
-| **Search / Query Timeout** | Maximum time BookOrbit waits for Shelfmark to search metadata and solve Cloudflare/mirrors | 20–25s *(BookOrbit hardcoded)* | `compose.yaml` command override | Change `180_000` / `180` in the `sed` script *(see below)* |
-| **Download Wait Timeout** | Maximum time the plugin polls Shelfmark until the book download finishes | **180s (3 min)** | **BookOrbit Web UI** | Edit **Download Wait Timeout** in UI settings *(no restart needed)* |
+2. **Configure Release Sources & Mirrors:**
+   - **Libgen:** In **Settings > Libgen Search**, enable Libgen. In **Settings > Mirrors**, set Libgen mirrors (e.g. `https://libgen.li`, `https://libgen.gs`).
+   - **Anna's Archive:** In **Settings > Mirrors**, specify a responsive primary mirror (e.g. `https://annas-archive.pk`).
+   - **Cloudflare Bypass:** If using Cloudflare-protected mirrors, set **Bypasser Idle Timeout** (`BYPASS_BROWSER_IDLE_TIMEOUT`) to `1800` (30 minutes) to keep the solver warm.
 
-#### Symptoms of Insufficient Timeouts
-* **Search Timeout too short:** BookOrbit displays `Shelfmark did not answer in time` during search, or Anna's Archive results never appear while Libgen works.
-* **Download Timeout too short:** Book request approval fails after 3 minutes with `Timed out waiting for Shelfmark to finish downloading "..." after 180 seconds`.
+3. **API Key Authentication:**  
+   If authentication is enabled on Shelfmark, supply `SHELFMARK_API_KEY` via container environment:
+   ```yaml
+   environment:
+     - SHELFMARK_API_KEY=your_generated_secret_key
+   ```
 
 ---
 
-#### Step 1: Adjusting Search Timeout & Private IP Downloads (`compose.yaml`)
+## Architecture & How It Works
 
-BookOrbit enforces two hardcoded constraints in its container image:
-1. **Search Timeout:** Hardcoded to 20 seconds (`perIndexerTimeoutSeconds ?? 20`) and 25 seconds (`REQUEST_TIMEOUT_MS = 25_000`). While Libgen queries take ~1–2 seconds, Anna's Archive queries solve Cloudflare / DDoS-Guard challenges via Shelfmark's headless browser, taking 25–45 seconds (or longer during peak hours).
-2. **Private Address SSRF Block (`ALLOW_PRIVATE = false`):** BookOrbit's `DirectDownloadService` rejects URLs resolving to private LAN or Docker IPs (`PrivateAddressException`). Because Shelfmark delivers the downloaded book via its local API (`/api/localdownload`), private IPs must be permitted.
-
-To raise the search timeout to **3 minutes (180s)** (recommended) and allow local downloads automatically at container startup, add this command override to your BookOrbit service in `compose.yaml`:
-
-```yaml
-services:
-  bookorbit:
-    image: ghcr.io/bookorbit/bookorbit:latest
-    command:
-      - sh
-      - -c
-      - |
-        # Raise search timeout from 20-25s to 180s (adjust 180_000 / 180 as needed):
-        sed -i 's/REQUEST_TIMEOUT_MS = 25_000/REQUEST_TIMEOUT_MS = 180_000/g' /app/dist/modules/book-request/indexers/plugins/plugin-host.js 2>/dev/null || true
-        sed -i 's/perIndexerTimeoutSeconds ?? 20/perIndexerTimeoutSeconds ?? 180/g' /app/dist/modules/book-request/indexers/indexer-config.service.js /app/dist/modules/book-request/indexers/indexer-search.service.js 2>/dev/null || true
-        # Allow downloading from internal Docker / LAN IPs (Shelfmark proxy):
-        sed -i 's/const ALLOW_PRIVATE = false;/const ALLOW_PRIVATE = true;/g' /app/dist/modules/book-request/fulfillment/direct-download.service.js 2>/dev/null || true
-        exec sh /app/entrypoint.sh
+```
+┌────────────────┐          1. Search query (Title)          ┌────────────────┐
+│                │ ────────────────────────────────────────> │                │
+│   BookOrbit    │                                           │   Shelfmark    │
+│  (Requests UI) │ <──────────────────────────────────────── │ (Open Library) │
+│                │     2. Validates Title/Author & Releases  └────────────────┘
+│                │                                                   │
+│                │          3. POST /api/releases/download           │
+│                │ ─────────────────────────────────────────────────>│ 4. Downloads via
+│                │                                                   │    Tor/Bypass/VPN
+│                │          5. Bounded Polling (/api/status)         │
+│                │ ─────────────────────────────────────────────────>│
+│                │          6. GET /api/localdownload?id=...         ▼
+│                │ <═══════════════════════════════════════════ [Local File]
+└────────────────┘
 ```
 
-> [!TIP]
-> **Need even more search time?**  
-> If your upstream mirrors or Tor connections are slow, replace `180_000` with `300_000` (5 minutes) and `180` with `300` in the `sed` commands above, then restart the container: `docker compose up -d bookorbit`.
+1. **Search (`search`):** When a user searches in BookOrbit Requests, the plugin queries `/api/metadata/search` using the title only, then validates title and author matches to ensure exact catalog alignment before requesting releases from `/api/releases`.
+2. **Release Ranking:** EPUB releases are ranked first by default, followed by PDF releases. Other formats (mobi, azw3, audiobooks) are ignored.
+3. **Download Handoff (`resolveFile`):** When a request is approved, the plugin triggers `POST /api/releases/download`, snapshots existing tasks, polls `/api/status` with backoff until completed, and hands the download URL (`/api/localdownload?id=...`) to BookOrbit.
 
 ---
 
-#### Step 2: Adjusting Download Wait Timeout (BookOrbit Web UI)
+## Important System Considerations
 
-The download timeout is configured directly in BookOrbit's settings without needing to edit compose files or restart containers:
-1. Open BookOrbit and navigate to **Settings > System > Requests > Sources > Shelfmark**.
-2. Change **Download Wait Timeout (seconds)** from the default `180` to your desired duration:
-   - **`300` (5 minutes):** Good for standard e-books over slower VPNs.
-   - **`600`–`1200` (10–20 minutes):** Recommended if downloading multi-hundred-megabyte **audiobooks** or using Tor routing in Shelfmark.
-3. Click **Save**. Changes take effect immediately.
+### 1. Preventing Duplicate Imports (BookOrbit Book Dock vs Shelfmark)
+
+**The Problem:**  
+Shelfmark saves completed files into its internal download folder (e.g., `/downloads`). BookOrbit has a file watcher feature called **Book Dock** that automatically ingests any file placed into its watched directory.  
+If both containers share or mount the same directory on your host, a race condition occurs:
+1. Shelfmark downloads the book to disk.
+2. BookOrbit's Book Dock detects the file and starts importing it as an unmanaged drop-in.
+3. Simultaneously, BookOrbit's Request fulfillment downloads the file via `/api/localdownload` over HTTP.
+4. This results in duplicate books, metadata conflicts, or locked file errors.
+
+**The Solution:**  
+- **Keep directories completely separate:** Never point BookOrbit's Book Dock watch path to Shelfmark's download directory.
+- The plugin transfers book files over HTTP via `/api/localdownload`. BookOrbit **does not require filesystem access** to Shelfmark's download directory.
+- Use a dedicated, isolated directory or volume for Shelfmark's downloads (e.g., `shelfmark_downloads`), and keep BookOrbit's Book Dock directory (e.g., `bookdock_incoming`) separate and used only for manual file drop-ins.
 
 ---
 
-## Installation
+### 2. Private Network SSRF Restriction (`ALLOW_PRIVATE`) & Core Limitations
 
-1. Copy `index.mjs` to your BookOrbit data volume:
+**Upstream Limitation:**  
+BookOrbit includes SSRF (Server-Side Request Forgery) protection inside `DirectDownloadService` (`server/src/modules/book-request/fulfillment/direct-download.service.ts`).  
+Due to an upstream BookOrbit bug ([BookOrbit Issue #1381](https://github.com/bookorbit/bookorbit/issues/1381)), `DirectDownloadService` contains a hardcoded constant:
+```typescript
+const ALLOW_PRIVATE = false;
+```
+Even if an operator checks the **"Allow private address"** setting in BookOrbit's UI for the Shelfmark indexer, this setting is currently ignored by `DirectDownloadService` when fetching the completed file from internal Docker network addresses (such as `http://shelfmark:8084` or `http://192.168.x.x`), triggering a `PrivateAddressException` ("URL resolves to a private address").
+
+**Why Global `sed` Patching is Inadvisable:**  
+Previous documentation recommended running a startup `sed` script:
+```bash
+# NOT RECOMMENDED
+sed -i 's/const ALLOW_PRIVATE = false;/const ALLOW_PRIVATE = true;/g' ...
+```
+Globally setting `ALLOW_PRIVATE = true` disables SSRF protection for **all** direct downloads across the entire BookOrbit instance, exposing local services, container networks, and cloud instance metadata (`169.254.169.254`) to potential exploits.
+
+**Clean Architectural Workarounds:**
+1. **Reverse Proxy with Public Hostname:** Route Shelfmark through an internal reverse proxy using a public hostname with valid certificates (or via Cloudflare Tunnel / tailnet) that does not trigger RFC1918 raw IP rejection.
+2. **Direct Download Mode:** If your sources (e.g., certain mirrors) provide direct public HTTP download links, toggle **Download via Shelfmark** to `false` in settings so BookOrbit downloads directly from the source.
+3. **Smallest Necessary Upstream Core Fix:**  
+   The correct, secure resolution requires a minor patch in BookOrbit core:
+   - In `direct-download.service.ts`, accept the indexer configuration's `allowPrivateAddress` flag (which is already read by `plugin-host.ts`) as a parameter in `download(url, options)`.
+   - Pass `allowPrivate: options.allowPrivateAddress ?? false` into `ensureSafeUrl(...)`.
+   - This restricts private IP access exclusively to indexers where the system administrator has explicitly enabled the toggle.
+
+---
+
+### 3. Download Monitoring & Webhook Investigation
+
+We investigated whether Shelfmark provides webhook notifications, Server-Sent Events (SSE), or callbacks upon download completion.  
+Shelfmark currently only exposes internal WebSockets for its own web UI and **does not offer an outbound webhook or callback mechanism**.
+
+To provide efficient, safe monitoring without background daemons:
+- **Temporary & Bounded:** Polling is active *only* during the lifecycle of an approved download in `resolveFile()`.
+- **Sensible Backoff:** Polling starts at 1 second for fast providers (e.g. Libgen) and backs off exponentially (1.5x factor up to a 5-second ceiling) to minimize CPU and network overhead.
+- **Immediate Cancellation:** Listens to BookOrbit's `AbortSignal` to immediately terminate pending sleeps and HTTP calls when a user cancels a request.
+
+---
+
+### 4. Update Ownership & Release Signing
+
+This fork is owned and maintained by `esreddy2`. It is cryptographically configured so that BookOrbit will **never** overwrite it with releases from the original upstream repository.
+
+- **Manifest URL:** Points to `https://raw.githubusercontent.com/esreddy2/bookorbit-plugin-shelfmark/main/updates/shelfmark.json`.
+- **Signing Key:** Signed with an independent Ed25519 keypair.
+- **Disabling Updates:** If you prefer to manage plugin updates entirely manually without update notifications in the BookOrbit UI, you can set `update: null` inside `index.mjs`.
+
+To generate a new signed release after modifying `index.mjs`:
+```bash
+npm run release [optional-new-version]
+```
+
+---
+
+## Installation & Deployment Notes
+
+Follow these steps to deploy this plugin on an existing BookOrbit server:
+
+1. **Copy `index.mjs` to BookOrbit's plugins directory:**
    ```bash
+   # On the Docker host running BookOrbit:
    mkdir -p <BOOKORBIT_DATA>/plugins/indexers/shelfmark
    cp index.mjs <BOOKORBIT_DATA>/plugins/indexers/shelfmark/index.mjs
    ```
-   *(In standard Docker setups, `<BOOKORBIT_DATA>` is the host path mounted to `/data` in the BookOrbit container).*
+   *(Replace `<BOOKORBIT_DATA>` with your host mount for BookOrbit, typically `/var/lib/bookorbit` or `./bookorbit-data`).*
 
-2. Restart your BookOrbit container:
+2. **Ensure permissions:**
+   ```bash
+   chmod 644 <BOOKORBIT_DATA>/plugins/indexers/shelfmark/index.mjs
+   ```
+
+3. **Restart the BookOrbit container:**
    ```bash
    docker restart bookorbit
    ```
 
-3. Configure the indexer in the BookOrbit Web UI:
-   - Go to **Settings > System > Requests > Sources**.
+4. **Configure the Indexer in BookOrbit Web UI:**
+   - Log in to BookOrbit and navigate to **Settings > System > Requests > Sources**.
    - Click **Add Indexer** and select **Shelfmark**.
-   - Enter your configuration:
-     - **Base URL:** The URL of your Shelfmark server (e.g. `http://shelfmark:8084` or `http://192.168.1.100:8084`).
-     - **Shelfmark API Key:** The key configured in Shelfmark (`SHELFMARK_API_KEY`). Optional if Shelfmark authentication is disabled.
-     - **Preferred Format:** Priority book format (`epub`, `mobi`, `pdf`, `azw3`, `m4b`, etc.).
-     - **Release Source:** `all` (searches all configured sources), `libgen`, or `direct_download`.
-     - **Download via Shelfmark:** Enabled by default (routes downloads through Shelfmark's queue).
-     - **Download Wait Timeout:** Maximum time in seconds to wait for Shelfmark to finish downloading before timing out (default: `180`).
+   - Configure the indexer settings:
+     - **Base URL:** Shelfmark's base URL (e.g. `http://shelfmark:8084`).
+     - **Shelfmark API Key:** The key configured in Shelfmark (`SHELFMARK_API_KEY`).
+     - **Preferred Format:** `epub` (prioritizes EPUB over PDF).
+     - **Release Source:** `all`, `libgen`, or `direct_download`.
+     - **Download via Shelfmark:** `true` (recommended for bypass/VPN handling).
+     - **Download Wait Timeout (seconds):** Default is `180` (3 minutes). Set to `300` if using slower VPN/Tor links.
    - Click **Test** to verify connection, then click **Save**.
 
+---
 
-## How It Works
+## Verification & Testing
 
-```
-┌──────────────┐         1. Search query          ┌──────────────┐
-│              │ ───────────────────────────────> │              │
-│  BookOrbit   │                                  │  Shelfmark   │
-│              │ <─────────────────────────────── │  (FastAPI /  │
-│              │    2. Releases (format, size)    │    Flask)    │
-│              │                                  └──────────────┘
-│              │         3. POST /download               │
-│              │ ───────────────────────────────────────>│ 4. Downloads via
-│              │                                         │    Tor/Bypass/VPN
-│              │         5. GET /api/localdownload       ▼
-│              │ <════════════════════════════════ [Local File]
-└──────────────┘
+The repository includes a comprehensive, dependency-free local test suite with mocked BookOrbit host helpers and Shelfmark API fixtures:
+
+```bash
+npm test
 ```
 
-1. **Search (`search`):** BookOrbit sends title and author. The plugin queries `/api/metadata/search` and `/api/releases` on Shelfmark.
-2. **Release Selection:** Matching releases are sorted by format preference and returned to BookOrbit's book request picker.
-3. **Download (`resolveFile`):** When approved, the plugin triggers `POST /api/releases/download` in Shelfmark, polls `/api/status` until completed, and hands the streaming URL `/api/localdownload?id=...` to BookOrbit.
+### Test Coverage Highlights:
+- **Declaration & Security:** Contract validation (`apiVersion: 1`), Ed25519 manifest signature verification, and update channel ownership.
+- **Metadata Searching:** Title-only metadata search, author validation against single, multiple, and transposed authors, and rejection of mismatched books.
+- **Format Handling:** Filtering and ranking of EPUB and PDF releases; dropping unsupported formats.
+- **Safe Task Matching:** Missing task ID recovery by title/format, pre-existing task isolation, and safe abortion on ambiguous matches.
+- **Resilience:** AbortSignal cancellation, status polling timeouts, authentication rejections (401/403), and transient network failure tolerance.
+
+---
 
 ## License
 
 MIT License. See [LICENSE](LICENSE) for details.
-
----
-
-[![GitHub Downloads](https://img.shields.io/github/downloads/hateitwtf/bookorbit-plugin-shelfmark/total?style=flat-square&logo=github)](https://github.com/hateitwtf/bookorbit-plugin-shelfmark/releases)

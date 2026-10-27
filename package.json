@@ -1,16 +1,16 @@
 {
   "name": "bookorbit-plugin-shelfmark",
-  "version": "1.0.3",
+  "version": "1.1.0",
   "description": "Shelfmark indexer plugin for BookOrbit",
   "type": "module",
   "scripts": {
     "test": "node verify.mjs",
     "release": "node scripts/sign-release.mjs"
   },
-  "author": "hateitwtf",
+  "author": "esreddy2",
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/hateitwtf/bookorbit-plugin-shelfmark.git"
+    "url": "https://github.com/esreddy2/bookorbit-plugin-shelfmark.git"
   }
 }
