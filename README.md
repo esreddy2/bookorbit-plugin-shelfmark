@@ -5,17 +5,35 @@ An indexer plugin for [BookOrbit](https://github.com/bookorbit/bookorbit) that i
 This plugin enables BookOrbit to search book releases across sources configured in Shelfmark (Anna's Archive, Libgen, etc.) and routes downloads through Shelfmark's download pipeline.
 
 > [!NOTE]
-> This is a maintained fork (`esreddy2/bookorbit-plugin-shelfmark`) with cryptographic ownership transferred away from the upstream author to prevent automated overwrites, along with improvements for title-only Open Library metadata queries, strict author validation, safe missing task ID resolution, bounded polling with backoff, and focused EPUB/PDF support.
+> This is a maintained fork (`esreddy2/bookorbit-plugin-shelfmark`) with cryptographic ownership transferred away from the upstream author to prevent automated overwrites. It includes comprehensive reliability fixes for duplicate queue errors, metadata searching, task adoption, file validation, accurate release metadata, and bounded polling.
 
 ---
 
 ## Features
 
 - **Native BookOrbit Request Integration:** Fully compliant with BookOrbit's indexer plugin specification (`apiVersion: 1`). Searches and downloads are triggered through BookOrbit Requests on demand—no standalone background daemons and no continuous polling.
-- **Robust Metadata Search & Author Validation:** Queries Shelfmark's Open Library metadata endpoint by title only (resolving the Open Library bug where combined title and author queries return zero results), then validates both title and author before fetching releases to prevent incorrect book selection.
+- **Duplicate Queue Protection & Task Adoption (v1.2.0):**
+  - Pre-inspects Shelfmark's active, queued, and completed tasks before queueing.
+  - Reuses completed downloads immediately after validating file presence via `/api/localdownload`, without re-downloading.
+  - If a download is already in progress, safely adopts and monitors it without submitting a duplicate job.
+  - Automatically recovers from Shelfmark's `Release is already in the download queue` (500) error by refreshing status and adopting the tracked task.
+  - Prevents concurrent requests for the same release from triggering duplicate downloads.
+- **Robust Metadata Search & Equivalence:**
+  - Queries Shelfmark metadata by title only to circumvent Open Library's 0-result bug on combined queries.
+  - Handles numeric titles safely (e.g., `1984`, `2001`, `451`) whether supplied as strings or numbers.
+  - Supports confident bidirectional title equivalents (e.g., `"1984"` ↔ `"Nineteen Eighty-Four"`).
+  - Cleans edition and subtitle noise (e.g. `"Animal Farm: A Fairy Story"`) when querying release indexers.
+  - Implements bounded fallback searches: alternate titles, ISBN search, and direct `/api/releases` keyword queries when metadata providers return zero results.
+  - Enforces strict author validation to reject unrelated works and study guides.
+- **Accurate Release Metadata (No Fabrications):**
+  - Reports actual formats (`epub`, `pdf`), sizes, seeders, leechers, and language.
+  - Never fabricates `freeleech: true` or artificial file counts.
+  - Deduplicates identical releases across providers without collapsing distinct editions.
 - **EPUB and PDF Support:** Prioritizes EPUB by default while fully supporting PDF downloads. (Audiobook support has been removed to streamline deployment).
-- **Safe Download Handling:** Accurately handles Shelfmark tasks even when Shelfmark accepts downloads without returning a task ID. Pre-existing completed tasks from earlier downloads are safely ignored, and ambiguous multi-task matches fail safely to avoid associating with the wrong book.
-- **Bounded Polling with Backoff:** Replaces fixed sleep polling with responsive, bounded polling featuring exponential backoff (1s up to 5s) and immediate AbortSignal cancellation.
+- **Bounded Polling & Prompt Cancellation:**
+  - Polling occurs *only* while an individual download is active, bounded by a 240-second timeout.
+  - Uses sensible exponential backoff (1s scaling up to 5s) and immediately aborts on BookOrbit `AbortSignal`.
+- **Credential Protection:** Error messages and logs strictly redact API keys and sensitive query parameters.
 - **Fork Update Ownership:** Cryptographically detached from upstream update channels. Auto-updates check this fork's repository and verify against an independent Ed25519 keypair.
 - **Zero Dependencies:** Single-file ECMAScript module (`index.mjs`) compatible with BookOrbit's Node.js plugin sandbox.
 
@@ -53,25 +71,51 @@ Before configuring BookOrbit, verify the following settings inside your Shelfmar
 │  (Requests UI) │ <──────────────────────────────────────── │ (Open Library) │
 │                │     2. Validates Title/Author & Releases  └────────────────┘
 │                │                                                   │
-│                │          3. POST /api/releases/download           │
-│                │ ─────────────────────────────────────────────────>│ 4. Downloads via
-│                │                                                   │    Tor/Bypass/VPN
-│                │          5. Bounded Polling (/api/status)         │
+│                │          3. Pre-check /api/status                 │
 │                │ ─────────────────────────────────────────────────>│
-│                │          6. GET /api/localdownload?id=...         ▼
+│                │             (Adopt or Reuse if present)           │
+│                │                                                   │
+│                │          4. POST /api/releases/download           │
+│                │ ─────────────────────────────────────────────────>│ 5. Downloads via
+│                │                                                   │    Tor/Bypass/VPN
+│                │          6. Bounded Polling (/api/status)         │
+│                │ ─────────────────────────────────────────────────>│
+│                │          7. GET /api/localdownload?id=...         ▼
 │                │ <═══════════════════════════════════════════ [Local File]
 └────────────────┘
 ```
 
-1. **Search (`search`):** When a user searches in BookOrbit Requests, the plugin queries `/api/metadata/search` using the title only, then validates title and author matches to ensure exact catalog alignment before requesting releases from `/api/releases`.
-2. **Release Ranking:** EPUB releases are ranked first by default, followed by PDF releases. Other formats (mobi, azw3, audiobooks) are ignored.
-3. **Download Handoff (`resolveFile`):** When a request is approved, the plugin triggers `POST /api/releases/download`, snapshots existing tasks, polls `/api/status` with backoff until completed, and hands the download URL (`/api/localdownload?id=...`) to BookOrbit.
+1. **Search (`search`):** When a user searches in BookOrbit Requests:
+   - Queries `/api/metadata/search` using the title only to avoid Open Library provider query drops.
+   - Evaluates confident equivalents (`1984` ↔ `Nineteen Eighty-Four`) and ISBN fallback if empty.
+   - Validates candidate title and author matches, rejecting unrelated works, derivative study guides, and summaries (`CliffsNotes`, `Summary of...`).
+   - Normalizes inverted author names with life dates (`"Orwell, George, 1903-1950"` → `"George Orwell"`) to prevent search failures on direct providers.
+   - Extracts ISBN (10 or 13 digits) and passes it to `/api/releases` for providers like Anna's Archive with direct ISBN indexes.
+   - Fans out release queries across both core numeric titles and known equivalent text representations (capturing releases from both Anna's Archive and OceanofPDF).
+   - Formats, deduplicates, and ranks releases (EPUB prioritized, then PDF; multi-format releases like `epub, pdf` recognized without dropping).
+2. **Download Resolution (`resolveFile`):** When approved:
+   - Inspects `/api/status` for matching active or completed tasks using strong release identifiers.
+   - If an active task exists: adopts it and enters the polling loop without calling POST.
+   - If a completed task exists: verifies that `/api/localdownload` can serve the file, then returns the URL immediately.
+   - If no task exists: queues the download (`POST /api/releases/download`).
+   - If POST returns `Release is already in the download queue` (500): refreshes status and adopts the matching task.
+   - Polls `/api/status` with exponential backoff until complete, confirms file availability, and returns the URL to BookOrbit.
 
 ---
 
-## Important System Considerations
+## Important System Considerations & Remaining Limitations
 
-### 1. Preventing Duplicate Imports (BookOrbit Book Dock vs Shelfmark)
+### 1. Duplicate Queue Retention in Shelfmark
+
+**Shelfmark Architecture:**  
+Shelfmark v1.5.1 tracks download tasks in an internal SQLite database (`app.db`). If a release has been queued, Shelfmark retains that release hash/ID across its active and completed history.  
+- **If the file is intact:** The plugin detects the completed task, validates it, and reuses it immediately.
+- **If the completed file was manually deleted from disk:** Shelfmark does not automatically notice the file deletion and will continue refusing new `POST` requests for that specific release with `{"error":"Release is already in the download queue"}`.
+- **Remaining Limitation:** Shelfmark does not expose a selective API endpoint to purge single records from history. If a completed file was manually deleted from disk, the operator must clear the completed item from Shelfmark's Web UI (Queue/History) or choose an alternative release mirror/edition in BookOrbit.
+
+---
+
+### 2. Preventing Duplicate Imports (BookOrbit Book Dock vs Shelfmark)
 
 **The Problem:**  
 Shelfmark saves completed files into its internal download folder (e.g., `/downloads`). BookOrbit has a file watcher feature called **Book Dock** that automatically ingests any file placed into its watched directory.  
@@ -88,7 +132,7 @@ If both containers share or mount the same directory on your host, a race condit
 
 ---
 
-### 2. Private Network SSRF Restriction (`ALLOW_PRIVATE`) & Core Limitations
+### 3. Private Network SSRF Restriction (`ALLOW_PRIVATE`) & Core Limitations
 
 **Upstream Limitation:**  
 BookOrbit includes SSRF (Server-Side Request Forgery) protection inside `DirectDownloadService` (`server/src/modules/book-request/fulfillment/direct-download.service.ts`).  
@@ -117,19 +161,16 @@ Globally setting `ALLOW_PRIVATE = true` disables SSRF protection for **all** dir
 
 ---
 
-### 3. Download Monitoring & Webhook Investigation
+### 4. Release Scoring
 
-We investigated whether Shelfmark provides webhook notifications, Server-Sent Events (SSE), or callbacks upon download completion.  
-Shelfmark currently only exposes internal WebSockets for its own web UI and **does not offer an outbound webhook or callback mechanism**.
-
-To provide efficient, safe monitoring without background daemons:
-- **Temporary & Bounded:** Polling is active *only* during the lifecycle of an approved download in `resolveFile()`.
-- **Sensible Backoff:** Polling starts at 1 second for fast providers (e.g. Libgen) and backs off exponentially (1.5x factor up to a 5-second ceiling) to minimize CPU and network overhead.
-- **Immediate Cancellation:** Listens to BookOrbit's `AbortSignal` to immediately terminate pending sleeps and HTTP calls when a user cancels a request.
+BookOrbit computes release scores using its internal scoring matrix (title match, author match, format priority, etc.).  
+- The plugin reports factual release properties: exact format, title, author, size, seeders, leechers, and language.
+- The plugin **does not** fabricate `freeleech: true` or false file counts to artificially inflate scores.
+- BookOrbit owns the final scoring algorithm.
 
 ---
 
-### 4. Update Ownership & Release Signing
+### 5. Update Ownership & Release Signing
 
 This fork is owned and maintained by `esreddy2`. It is cryptographically configured so that BookOrbit will **never** overwrite it with releases from the original upstream repository.
 
@@ -175,7 +216,7 @@ Follow these steps to deploy this plugin on an existing BookOrbit server:
      - **Preferred Format:** `epub` (prioritizes EPUB over PDF).
      - **Release Source:** `all`, `libgen`, or `direct_download`.
      - **Download via Shelfmark:** `true` (recommended for bypass/VPN handling).
-     - **Download Wait Timeout (seconds):** Default is `180` (3 minutes). Set to `300` if using slower VPN/Tor links.
+     - **Download Wait Timeout (seconds):** Default is `240` (4 minutes).
    - Click **Test** to verify connection, then click **Save**.
 
 ---
@@ -189,11 +230,10 @@ npm test
 ```
 
 ### Test Coverage Highlights:
-- **Declaration & Security:** Contract validation (`apiVersion: 1`), Ed25519 manifest signature verification, and update channel ownership.
-- **Metadata Searching:** Title-only metadata search, author validation against single, multiple, and transposed authors, and rejection of mismatched books.
-- **Format Handling:** Filtering and ranking of EPUB and PDF releases; dropping unsupported formats.
-- **Safe Task Matching:** Missing task ID recovery by title/format, pre-existing task isolation, and safe abortion on ambiguous matches.
-- **Resilience:** AbortSignal cancellation, status polling timeouts, authentication rejections (401/403), and transient network failure tolerance.
+- **Contract & Metadata:** `apiVersion: 1`, Ed25519 signature verification against public key, and settings fields validation.
+- **Search Robustness:** Exact matching, numeric titles (`1984`), digit-to-word equivalents (`1984` ↔ `Nineteen Eighty-Four`), numeric primitive safety, edition and subtitle handling (`Animal Farm`), direct release fallback, ISBN search, and author validation.
+- **Queue Management & Adoption:** Existing active task adoption, completed task file validation and reuse, duplicate queue HTTP 500 recovery, missing disk file detection, in-flight concurrent deduplication, and retry adoption after abort.
+- **Safety & Error Handling:** Ambiguous task rejection, missing task ID matching, timeout handling, error redaction of API keys, and AbortSignal cancellation.
 
 ---
 
