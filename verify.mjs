@@ -89,7 +89,7 @@ async function runTests() {
   ok('preferFormat defaults to epub', plugin.settingsFields.find((f) => f.key === 'preferFormat')?.default === 'epub');
   ok('defines downloadViaShelfmark toggle', plugin.settingsFields.some((f) => f.key === 'downloadViaShelfmark'));
   ok('defines pollTimeoutSeconds defaulting to 240', plugin.settingsFields.find((f) => f.key === 'pollTimeoutSeconds')?.default === 240);
-  ok('declares semantic version 1.2.0', plugin.version === '1.2.0');
+  ok('declares semantic version 1.3.0', plugin.version === '1.3.0');
   ok('declares update channel', typeof plugin.update === 'object' && plugin.update !== null);
   ok('update manifestUrl is HTTPS and points to fork repo', typeof plugin.update?.manifestUrl === 'string' && plugin.update.manifestUrl.includes('esreddy2/bookorbit-plugin-shelfmark'));
   ok('update ed25519PublicKey is 43-char base64url', /^[A-Za-z0-9_-]{43}$/.test(plugin.update?.ed25519PublicKey ?? ''));
@@ -375,6 +375,110 @@ async function runTests() {
 
     const res = await plugin.search({ title: '1984', author: 'George Orwell', mediaKind: 'ebook' }, baseConfig(), host);
     ok('rejects study guides, summaries, and CliffsNotes noise for 1984', res.length === 1 && res[0].extra?.sourceId === 'b-1');
+  }
+
+  {
+    // Test 5D: BookOrbit v3.5.0 PluginReleaseQuery contract (isbn13 and isbn13s)
+    let queriedIsbn = null;
+    let releasesIsbn = null;
+    const host = makeHost((url) => {
+      if (url.includes('/api/metadata/search')) {
+        queriedIsbn = new URL(url).searchParams.get('query');
+        return mockResponse({ books: [] }); // Fallback to direct release query
+      }
+      if (url.includes('/api/releases')) {
+        releasesIsbn = new URL(url).searchParams.get('isbn');
+        return mockResponse([
+          { id: 'rel-isbn', source_id: 'src-isbn', source: 'annas', title: '1984', author: 'George Orwell', format: 'epub', size_bytes: 500000 },
+        ]);
+      }
+      return mockResponse([]);
+    });
+
+    const query = {
+      isbn13: '9780451524935',
+      isbn13s: ['9780451524935'],
+      mediaKind: 'ebook',
+    };
+    const res = await plugin.search(query, baseConfig(), host);
+    ok('PluginReleaseQuery supports isbn13 and isbn13s without requiring legacy isbn', queriedIsbn === '9780451524935' && releasesIsbn === '9780451524935');
+    ok('PluginReleaseCandidate reports authentic isbn', res.length === 1 && res[0].isbn === '9780451524935');
+  }
+
+  {
+    // Test 5E: Author mismatch rejection (reject Michael Dean adaptation when user requests George Orwell)
+    const host = makeHost((url) => {
+      if (url.includes('/api/metadata/search')) {
+        return mockResponse({
+          books: [{ provider: 'openlibrary', provider_id: 'OL-1984', title: '1984', authors: ['George Orwell'] }],
+        });
+      }
+      if (url.includes('/api/releases')) {
+        return mockResponse([
+          {
+            id: 'rel-dean',
+            source_id: 'src-dean',
+            source: 'direct_download',
+            title: '1984 (Adapted for ESL Learners)',
+            author: 'Michael Dean', // Conflicting author adaptation!
+            format: 'epub',
+            size_bytes: 300000,
+          },
+          {
+            id: 'rel-orwell',
+            source_id: 'src-orwell',
+            source: 'direct_download',
+            title: '1984 (Signet Classic Edition)',
+            author: 'George Orwell',
+            format: 'epub',
+            size_bytes: 550000,
+          },
+        ]);
+      }
+      return mockResponse([]);
+    });
+
+    const res = await plugin.search({ title: '1984', author: 'George Orwell', mediaKind: 'ebook' }, baseConfig(), host);
+    ok('rejects releases where reported author conflicts with requested author (Michael Dean adaptation)', !res.some((r) => r.author?.includes('Michael Dean')));
+    ok('preserves authentic release by requested author', res.some((r) => r.extra?.sourceId === 'src-orwell' && r.author === 'George Orwell'));
+  }
+
+  {
+    // Test 5F: Release scoring data integrity (bookTitle matches searchTitle, authentic metadata)
+    const host = makeHost((url) => {
+      if (url.includes('/api/metadata/search')) {
+        return mockResponse({
+          books: [
+            {
+              provider: 'openlibrary',
+              provider_id: 'OL-NEF',
+              title: 'Nineteen Eighty-Four', // Open Library catalog title
+              authors: ['George Orwell'],
+              isbn: ['9780451524935'],
+            },
+          ],
+        });
+      }
+      if (url.includes('/api/releases')) {
+        return mockResponse([
+          {
+            id: 'rel-score',
+            source_id: 'src-score',
+            source: 'annas',
+            title: '1984 (Signet Classics)',
+            author: 'George Orwell',
+            format: 'epub',
+            size_bytes: 450000,
+            language: 'English',
+          },
+        ]);
+      }
+      return mockResponse([]);
+    });
+
+    const res = await plugin.search({ title: '1984', author: 'George Orwell', mediaKind: 'ebook' }, baseConfig(), host);
+    ok('aligns candidate bookTitle with requested searchTitle to ensure BookOrbit title match score', res.length === 1 && res[0].bookTitle === '1984');
+    ok('preserves authentic sizeBytes, language, format, and isbn without fabrication', res[0].sizeBytes === 450000 && res[0].language === 'English' && res[0].isbn === '9780451524935' && res[0].freeleech === null);
   }
 
   {
@@ -823,6 +927,135 @@ async function runTests() {
     const retryResolved = await plugin.resolveFile(release, baseConfig(), host);
     ok('aborted download followed by a safe retry does not trigger duplicate POST', postCalls === 1);
     ok('retry successfully adopts and finishes task', retryResolved.url.includes('id=retry-task-1'));
+  }
+
+  {
+    // Test 18B: Historical failed tasks sharing title do not contaminate new downloads (BUG 1)
+    let postMade = false;
+    let pollCount = 0;
+    const host = makeHost((url, options) => {
+      if (options.method === 'POST') {
+        postMade = true;
+        return mockResponse({ task_id: 'new-1984-task' });
+      }
+      if (url.includes('/api/status')) {
+        pollCount++;
+        return mockResponse({
+          active: pollCount === 1 ? {
+            'new-1984-task': { id: 'new-1984-task', source: 'libgen', source_id: 'src-1984-new', title: '1984', format: 'epub', status: 'downloading' },
+          } : {},
+          completed: pollCount > 1 ? {
+            'new-1984-task': { id: 'new-1984-task', source: 'libgen', source_id: 'src-1984-new', title: '1984', format: 'epub', status: 'completed' },
+          } : {},
+          // Multiple old historical failed tasks with same title "1984" from previous attempts
+          error: {
+            'ancient-fail-1': { id: 'ancient-fail-1', title: '1984', format: 'epub', error: 'Mirror 1 down' },
+            'ancient-fail-2': { id: 'ancient-fail-2', title: '1984', format: 'epub', error: 'Cloudflare timeout' },
+          },
+        });
+      }
+      if (url.includes('/api/localdownload')) return mockResponse('epub-binary', 200);
+      return mockResponse({});
+    });
+
+    const release = {
+      guid: JSON.stringify({ source: 'libgen', source_id: 'src-1984-new', format: 'epub' }),
+      title: '1984',
+      format: 'epub',
+    };
+
+    const resolved = await plugin.resolveFile(release, baseConfig(), host);
+    ok('historical failed tasks sharing title do not fail new download', resolved.url.includes('id=new-1984-task'));
+    ok('exact task ID determines outcome over historical failures', pollCount >= 2);
+  }
+
+  {
+    // Test 18C: Pre-existing completed job reused even when old failed tasks exist
+    let postAttempted = false;
+    const host = makeHost((url, options) => {
+      if (options.method === 'POST') {
+        postAttempted = true;
+        return mockResponse({ error: 'Should not POST' }, 500);
+      }
+      if (url.includes('/api/status')) {
+        return mockResponse({
+          completed: {
+            'completed-f451': { id: 'completed-f451', source: 'annas', source_id: 'src-f451', title: 'Fahrenheit 451', format: 'epub', status: 'completed' },
+          },
+          error: {
+            'old-f451-fail': { id: 'old-f451-fail', title: 'Fahrenheit 451', format: 'epub', error: 'Ancient failure' },
+          },
+        });
+      }
+      if (url.includes('/api/localdownload')) return mockResponse('epub-data', 200);
+      return mockResponse({});
+    });
+
+    const release = {
+      guid: JSON.stringify({ source: 'annas', source_id: 'src-f451', format: 'epub' }),
+      title: 'Fahrenheit 451',
+      format: 'epub',
+    };
+
+    const resolved = await plugin.resolveFile(release, baseConfig(), host);
+    ok('valid completed download reused without POST despite old failed tasks', resolved.url.includes('id=completed-f451') && !postAttempted);
+  }
+
+  {
+    // Test 18D: Concurrent callers where one caller cancels while other caller succeeds (Area 2)
+    let postCount = 0;
+    let pollCount = 0;
+    const host = makeHost((url, options) => {
+      if (options.method === 'POST') {
+        postCount++;
+        return mockResponse({ task_id: 'shared-task-xyz' });
+      }
+      if (url.includes('/api/status')) {
+        pollCount++;
+        if (pollCount === 1) {
+          return mockResponse({ active: {}, completed: {} }); // pre-check
+        }
+        if (pollCount === 2) {
+          return mockResponse({
+            active: {
+              'shared-task-xyz': { id: 'shared-task-xyz', source: 'libgen', source_id: 'shared-src', format: 'epub', status: 'downloading' },
+            },
+          });
+        }
+        return mockResponse({
+          completed: {
+            'shared-task-xyz': { id: 'shared-task-xyz', source: 'libgen', source_id: 'shared-src', format: 'epub', status: 'completed' },
+          },
+        });
+      }
+      if (url.includes('/api/localdownload')) return mockResponse('file-content', 200);
+      return mockResponse({});
+    });
+
+    const release = {
+      guid: JSON.stringify({ source: 'libgen', source_id: 'shared-src', format: 'epub' }),
+      title: 'Shared Download Book',
+      format: 'epub',
+    };
+
+    const controllerA = new AbortController();
+    const promiseA = plugin.resolveFile(release, baseConfig({ settings: { pollIntervalMs: 15 } }), host, controllerA.signal);
+    const promiseB = plugin.resolveFile(release, baseConfig({ settings: { pollIntervalMs: 15 } }), host);
+
+    // Cancel caller A after 5ms
+    setTimeout(() => controllerA.abort(), 5);
+
+    let errA = null;
+    try {
+      await promiseA;
+    } catch (err) {
+      errA = err;
+    }
+
+    const resB = await promiseB;
+    ok('cancelled concurrent caller rejects immediately with cancelled error', errA?.code === 'cancelled');
+    ok('uncancelled concurrent caller succeeds and receives download URL', resB?.url?.includes('id=shared-task-xyz'));
+    ok('concurrent requests only submitted a single download job to Shelfmark', postCount === 1);
   }
 
   {

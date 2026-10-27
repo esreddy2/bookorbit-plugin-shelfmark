@@ -12,7 +12,7 @@
  * Single-file and dependency-free following BookOrbit's indexer plugin specification.
  */
 
-const USER_AGENT = 'BookOrbit-Shelfmark-Plugin/1.2.0';
+const USER_AGENT = 'BookOrbit-Shelfmark-Plugin/1.3.0';
 
 /** Fallback maximum number of releases to return per search. */
 const MAX_RESULTS = 25;
@@ -34,7 +34,7 @@ const KNOWN_TITLE_EQUIVALENTS = new Map([
 
 export default {
   apiVersion: 1,
-  version: '1.2.0',
+  version: '1.3.0',
   update: {
     manifestUrl: 'https://raw.githubusercontent.com/esreddy2/bookorbit-plugin-shelfmark/main/updates/shelfmark.json',
     ed25519PublicKey: '-0aHVhXqg7cGaDchc2p1Y8tDnn8A7cJ0WREKspNv5Bc',
@@ -170,7 +170,8 @@ export default {
     // Convert inputs to strings safely to prevent type errors on numbers (e.g. 1984)
     const searchTitle = String(query?.title ?? '').trim();
     const searchAuthor = String(query?.author ?? '').trim();
-    const searchIsbn = query?.isbn ? String(query.isbn).trim() : null;
+    // Support BookOrbit v3.5.0 PluginReleaseQuery contract (isbn13, isbn13s, isbn)
+    const searchIsbn = extractIsbn(null, query);
     const metadataQuery = searchTitle || searchIsbn || searchAuthor;
 
     if (!metadataQuery) {
@@ -208,19 +209,27 @@ export default {
         format: detectedFormat,
       };
 
-      const authorList = Array.isArray(book?.authors)
-        ? book.authors.map(toNaturalAuthor).filter(Boolean)
-        : [toNaturalAuthor(book?.author)].filter(Boolean);
-      const displayAuthor =
-        authorList.length > 0
-          ? authorList.join(', ')
-          : toNaturalAuthor(rel.author) || toNaturalAuthor(searchAuthor) || null;
+      // Authentic author attribution:
+      // Prefer authentic author reported by the release if present.
+      // Otherwise fall back to validated book metadata author or searchAuthor.
+      const releaseAuthor = toNaturalAuthor(rel.author);
+      const metadataAuthor = Array.isArray(book?.authors)
+        ? book.authors.map(toNaturalAuthor).filter(Boolean).join(', ')
+        : toNaturalAuthor(book?.author);
+      const displayAuthor = releaseAuthor || metadataAuthor || toNaturalAuthor(searchAuthor) || null;
+
+      // Extract authentic ISBN
+      const authenticIsbn = extractIsbn(book, query) || (rel.isbn ? String(rel.isbn).trim() : null);
+
+      // Book title: align with requested searchTitle to ensure BookOrbit title similarity scoring succeeds
+      const bookTitle = searchTitle || book?.title || rel.title;
 
       releases.push({
         guid: JSON.stringify(payload),
         title: rel.title || book?.title || searchTitle,
-        bookTitle: book?.title || searchTitle,
+        bookTitle,
         author: displayAuthor,
+        isbn: authenticIsbn,
         format: detectedFormat,
         sizeBytes,
         language: rel.language || book?.language || null,
@@ -397,21 +406,36 @@ export default {
             if (relTitle && !isTitleMatch(relTitle, searchTitle) && !isTitleMatch(relTitle, book.title)) {
               continue;
             }
-            if (relAuthor && searchAuthor && !isAuthorMatch(relAuthor, searchAuthor)) {
-              continue;
+            // Strict author validation:
+            // When release metadata specifies an author, it must match the requested author.
+            // Never silently accept a release by a conflicting author (e.g. Michael Dean adaptation of Orwell).
+            if (relAuthor) {
+              const matchesReq = searchAuthor ? isAuthorMatch(relAuthor, searchAuthor) : true;
+              const matchesBook = book?.authors || book?.author ? isAuthorMatch(relAuthor, book.authors || book.author) : true;
+              if (!matchesReq || !matchesBook) {
+                continue;
+              }
+            }
+            if (searchAuthor && !relAuthor) {
+              const byMatch = relTitle.split(/\s+by\s+/i);
+              if (byMatch.length > 1 && !isAuthorMatch(byMatch[1], searchAuthor)) {
+                continue;
+              }
             }
             addRelease(rel, book);
           }
         }
       }
-    } else if (searchTitle) {
+    } else if (searchTitle || searchIsbn) {
       // Step 2 Fallback: Direct search via /api/releases if metadata returned zero matches or failed
-      const directTitles = [extractCoreTitle(searchTitle)];
-      const normSearch = normalizeString(searchTitle);
-      const eqSet = KNOWN_TITLE_EQUIVALENTS.get(normSearch) || [];
-      for (const eq of eqSet) {
-        if (!directTitles.some((t) => normalizeString(t) === normalizeString(eq))) {
-          directTitles.push(eq);
+      const directTitles = searchTitle ? [extractCoreTitle(searchTitle)] : [''];
+      if (searchTitle) {
+        const normSearch = normalizeString(searchTitle);
+        const eqSet = KNOWN_TITLE_EQUIVALENTS.get(normSearch) || [];
+        for (const eq of eqSet) {
+          if (!directTitles.some((t) => normalizeString(t) === normalizeString(eq))) {
+            directTitles.push(eq);
+          }
         }
       }
 
@@ -422,7 +446,9 @@ export default {
         if (signal?.aborted) break;
 
         const directRelUrl = new URL(`${baseUrl}/api/releases`);
-        directRelUrl.searchParams.set('title', queryTitle);
+        if (queryTitle) {
+          directRelUrl.searchParams.set('title', queryTitle);
+        }
         if (naturalSearchAuthor) {
           directRelUrl.searchParams.set('author', naturalSearchAuthor);
         }
@@ -448,8 +474,15 @@ export default {
               const relTitle = rel.title || '';
               const relAuthor = rel.author || '';
               // Strictly validate title and author on direct releases
-              if (!isTitleMatch(relTitle, searchTitle)) continue;
-              if (searchAuthor && !isAuthorMatch(relAuthor || relTitle, searchAuthor)) continue;
+              if (searchTitle && !isTitleMatch(relTitle, searchTitle)) continue;
+              if (searchAuthor && relAuthor && !isAuthorMatch(relAuthor, searchAuthor)) continue;
+              if (searchAuthor && !relAuthor && !isAuthorMatch(relTitle, searchAuthor)) {
+                // If release has no author and title has "by <Someone Else>", reject
+                const byMatch = relTitle.split(/\s+by\s+/i);
+                if (byMatch.length > 1 && !isAuthorMatch(byMatch[1], searchAuthor)) {
+                  continue;
+                }
+              }
               addRelease(rel, null);
             }
           }
@@ -528,37 +561,72 @@ export default {
     // Release key for deduplicating concurrent in-flight requests in the same process
     const releaseKey = `${payload.source}:${payload.source_id}:${resolvedFormat}`;
 
-    // If an identical release resolution is already in-flight, await it safely
-    const inFlight = inFlightResolutions.get(releaseKey);
-    if (inFlight) {
-      try {
-        return await raceWithSignal(inFlight, signal, host);
-      } catch (_) {
-        // If prior in-flight failed or aborted, continue to try fresh
-      }
-    }
-
-    const executionPromise = doResolveFile(
-      release,
-      payload,
-      resolvedFormat,
-      fileName,
-      baseUrl,
-      headers,
-      apiKey,
-      config,
-      host,
-      signal
-    );
-    // Attach noop catch listener to prevent unhandled rejection warnings/exits
-    executionPromise.catch(() => {});
-    inFlightResolutions.set(releaseKey, executionPromise);
-
-    try {
-      return await executionPromise;
-    } finally {
+    // Single-flight with independent caller cancellation:
+    // Multiple concurrent callers for the same release subscribe to a single background worker.
+    // If one caller cancels, other callers continue uninterrupted.
+    let entry = inFlightResolutions.get(releaseKey);
+    if (entry && entry.controller.signal.aborted) {
       inFlightResolutions.delete(releaseKey);
+      entry = null;
     }
+
+    if (!entry) {
+      const controller = new AbortController();
+      const subscribers = new Set();
+      entry = { controller, subscribers };
+      inFlightResolutions.set(releaseKey, entry);
+
+      doResolveFile(
+        release,
+        payload,
+        resolvedFormat,
+        fileName,
+        baseUrl,
+        headers,
+        apiKey,
+        config,
+        host,
+        controller.signal
+      )
+        .then((result) => {
+          for (const sub of entry.subscribers) {
+            try { sub.resolve(result); } catch (_) {}
+          }
+        })
+        .catch((err) => {
+          for (const sub of entry.subscribers) {
+            try { sub.reject(err); } catch (_) {}
+          }
+        })
+        .finally(() => {
+          if (inFlightResolutions.get(releaseKey) === entry) {
+            inFlightResolutions.delete(releaseKey);
+          }
+        });
+    }
+
+    return new Promise((resolve, reject) => {
+      const sub = { resolve, reject, signal };
+      entry.subscribers.add(sub);
+
+      const onAbort = () => {
+        entry.subscribers.delete(sub);
+        signal?.removeEventListener?.('abort', onAbort);
+        reject(host.fail('cancelled', 'Download resolution was cancelled.'));
+        if (entry.subscribers.size === 0) {
+          entry.controller.abort();
+          if (inFlightResolutions.get(releaseKey) === entry) {
+            inFlightResolutions.delete(releaseKey);
+          }
+        }
+      };
+
+      if (signal?.aborted) {
+        onAbort();
+        return;
+      }
+      signal?.addEventListener?.('abort', onAbort, { once: true });
+    });
   },
 };
 
@@ -566,7 +634,12 @@ export default {
  * Internal worker for resolveFile logic.
  */
 async function doResolveFile(release, payload, resolvedFormat, fileName, baseUrl, headers, apiKey, config, host, signal) {
-  const timeoutSec = toNumber(config.settings?.pollTimeoutSeconds) || 240;
+  const configuredTimeout = toNumber(config.settings?.pollTimeoutSeconds) || 240;
+  // Reserve a 15-second safety margin below host deadline (when deadline >= 30s) so plugin
+  // can return cleanly before BookOrbit's host deadline aborts the request.
+  const timeoutSec = configuredTimeout >= 30
+    ? configuredTimeout - 15
+    : configuredTimeout;
   const initialDelay = toNumber(config.settings?.pollIntervalMs) || 1000;
   const maxDelay = 5000;
   const backoffFactor = 1.5;
@@ -574,6 +647,8 @@ async function doResolveFile(release, payload, resolvedFormat, fileName, baseUrl
 
   let queuedTaskId = null;
   let preExistingCompletedIds = new Set();
+  let preExistingActiveIds = new Set();
+  let preExistingFailedIds = new Set();
 
   // Helper to validate whether /api/localdownload can actually serve the file on disk
   const isFileServable = async (taskId) => {
@@ -604,7 +679,7 @@ async function doResolveFile(release, payload, resolvedFormat, fileName, baseUrl
   });
 
   // Step 1: Pre-queue inspection of /api/status.
-  // Inspect existing tasks across active, queued, and completed queues.
+  // Snapshot existing tasks across active, queued, completed, and failed queues.
   try {
     const statusRes = await host.fetch(`${baseUrl}/api/status`, { headers, signal });
     if (statusRes.ok) {
@@ -619,8 +694,14 @@ async function doResolveFile(release, payload, resolvedFormat, fileName, baseUrl
         ...(statusData.completed || {}),
         ...(statusData.complete || {}),
       };
+      const failedTasks = {
+        ...(statusData.error || {}),
+        ...(statusData.failed || {}),
+      };
 
+      preExistingActiveIds = new Set(Object.keys(activeTasks));
       preExistingCompletedIds = new Set(Object.keys(completedTasks));
+      preExistingFailedIds = new Set(Object.keys(failedTasks));
 
       // 1A. Check if an exact matching task is already active/queued -> adopt it!
       const matchingActive = Object.entries(activeTasks).filter(([id, task]) =>
@@ -659,7 +740,7 @@ async function doResolveFile(release, payload, resolvedFormat, fileName, baseUrl
     }
   } catch (statusErr) {
     if (signal?.aborted) {
-      throw host.fail('cancelled', 'Download resolution was aborted.');
+      throw host.fail('cancelled', 'Download resolution was cancelled.');
     }
     if (statusErr.code) throw statusErr;
   }
@@ -709,6 +790,10 @@ async function doResolveFile(release, payload, resolvedFormat, fileName, baseUrl
             ...(refData.completed || {}),
             ...(refData.complete || {}),
           };
+          const failedTasks = {
+            ...(refData.error || {}),
+            ...(refData.failed || {}),
+          };
 
           const matchedActive = Object.entries(activeTasks).filter(([id, task]) =>
             matchStrongTask(id, task, payload, resolvedFormat)
@@ -727,8 +812,20 @@ async function doResolveFile(release, payload, resolvedFormat, fileName, baseUrl
               }
               throw host.fail(
                 'error',
-                `Shelfmark completed task file is missing on disk, but Shelfmark refused to re-download because the release is still tracked in its queue (${compId}). The completed task must be cleared in Shelfmark.`
+                `Shelfmark completed task file is missing on disk, but Shelfmark refused to re-download because the release is still tracked in its queue (${compId}). The completed task must be cleared in Shelfmark or container restarted.`
               );
+            } else {
+              // Check if a failed task is tracked by Shelfmark for this release
+              const matchedFailed = Object.entries(failedTasks).filter(([id, task]) =>
+                matchStrongTask(id, task, payload, resolvedFormat)
+              );
+              if (matchedFailed.length === 1) {
+                const [failedId, failedTask] = matchedFailed[0];
+                throw host.fail(
+                  'error',
+                  `Shelfmark refused to queue download because a previous attempt failed (${failedId}: ${failedTask.error || failedTask.status || 'failed'}). The failed task must be cleared in Shelfmark or container restarted, or choose another release in BookOrbit.`
+                );
+              }
             }
           }
         }
@@ -749,20 +846,18 @@ async function doResolveFile(release, payload, resolvedFormat, fileName, baseUrl
   }
 
   // Step 3: Bounded polling with sensible backoff while this specific download is active
-  const rawSourceId = payload.source_id || payload.id;
-  const sourceId = rawSourceId ? String(rawSourceId) : null;
   let pollDelay = initialDelay;
   let completedTaskId = null;
 
   while (Date.now() - startTime < timeoutSec * 1000) {
     if (signal?.aborted) {
-      throw host.fail('cancelled', 'Download resolution was aborted.');
+      throw host.fail('cancelled', 'Download resolution was cancelled.');
     }
 
     await sleep(pollDelay, signal);
 
     if (signal?.aborted) {
-      throw host.fail('cancelled', 'Download resolution was aborted.');
+      throw host.fail('cancelled', 'Download resolution was cancelled.');
     }
 
     pollDelay = Math.min(Math.round(pollDelay * backoffFactor), maxDelay);
@@ -772,7 +867,7 @@ async function doResolveFile(release, payload, resolvedFormat, fileName, baseUrl
       statusRes = await host.fetch(`${baseUrl}/api/status`, { headers, signal });
     } catch (pollErr) {
       if (signal?.aborted) {
-        throw host.fail('cancelled', 'Download resolution was aborted.');
+        throw host.fail('cancelled', 'Download resolution was cancelled.');
       }
       continue;
     }
@@ -789,88 +884,99 @@ async function doResolveFile(release, payload, resolvedFormat, fileName, baseUrl
     const failed = { ...(statusData.error || {}), ...(statusData.failed || {}) };
     const active = { ...(statusData.active || {}), ...(statusData.queued || {}), ...(statusData.downloading || {}) };
 
-    const isTargetTask = (taskId, task, checkPreExisting = true) => {
-      // 1. Exact queuedTaskId match
-      if (queuedTaskId) {
-        if (
-          taskId === String(queuedTaskId) ||
-          String(task.id || '') === String(queuedTaskId) ||
-          String(task.task_id || '') === String(queuedTaskId)
-        ) {
-          return true;
-        }
+    // --- CASE A: EXACT TASK ID IS KNOWN ---
+    if (queuedTaskId) {
+      const qIdStr = String(queuedTaskId);
+      const isExactMatch = (id, task) =>
+        id === qIdStr ||
+        String(task?.id || '') === qIdStr ||
+        String(task?.task_id || '') === qIdStr;
+
+      // 1. Check if our exact task completed
+      const exactCompletedEntry = Object.entries(completed).find(([id, task]) => isExactMatch(id, task));
+      if (exactCompletedEntry) {
+        completedTaskId = exactCompletedEntry[0];
+        break;
       }
 
-      // 2. Exact source_id match
-      if (sourceId) {
-        if (
-          taskId === sourceId ||
-          String(task.source_id || '') === sourceId ||
-          String(task.book_id || '') === sourceId ||
-          String(task.id || '') === sourceId
-        ) {
-          return true;
-        }
+      // 2. Check if our exact task failed
+      const exactFailedEntry = Object.entries(failed).find(([id, task]) => isExactMatch(id, task));
+      if (exactFailedEntry) {
+        const failedTask = exactFailedEntry[1];
+        throw host.fail('error', `Shelfmark reported download failed: ${failedTask.error || failedTask.status || 'unknown error'}`);
       }
 
-      // 3. Fallback title and format match when task ID and source ID are omitted
-      if (checkPreExisting && preExistingCompletedIds.has(taskId)) {
-        return false;
+      // 3. If exact task is in active, it is still downloading -> continue polling
+      const exactActiveEntry = Object.entries(active).find(([id, task]) => isExactMatch(id, task));
+      if (exactActiveEntry) {
+        continue;
       }
 
+      // If exact task is not in any map yet, it might be in transition -> continue polling
+      continue;
+    }
+
+    // --- CASE B: TASK ID WAS NOT RETURNED (CORRELATE NEWLY OBSERVED TASKS) ---
+    // Ignore all historical pre-existing tasks to avoid contamination from past attempts
+    const isNew = (id) => !preExistingActiveIds.has(id) && !preExistingCompletedIds.has(id) && !preExistingFailedIds.has(id);
+
+    const newActive = Object.entries(active).filter(([id]) => isNew(id));
+    const newCompleted = Object.entries(completed).filter(([id]) => isNew(id));
+    const newFailed = Object.entries(failed).filter(([id]) => isNew(id));
+
+    // B1. Try matching newly observed tasks using strong identifiers (source + source_id)
+    const strongActive = newActive.filter(([id, task]) => matchStrongTask(id, task, payload, resolvedFormat));
+    const strongCompleted = newCompleted.filter(([id, task]) => matchStrongTask(id, task, payload, resolvedFormat));
+    const strongFailed = newFailed.filter(([id, task]) => matchStrongTask(id, task, payload, resolvedFormat));
+    const totalStrong = strongActive.length + strongCompleted.length + strongFailed.length;
+
+    if (totalStrong === 1) {
+      if (strongCompleted.length === 1) {
+        completedTaskId = strongCompleted[0][0];
+        break;
+      }
+      if (strongFailed.length === 1) {
+        throw host.fail('error', `Shelfmark reported download failed: ${strongFailed[0][1].error || 'unknown error'}`);
+      }
+      if (strongActive.length === 1) {
+        queuedTaskId = strongActive[0][0];
+        continue;
+      }
+    } else if (totalStrong > 1) {
+      throw host.fail('error', `Ambiguous download match: multiple new tasks match "${release.title}".`);
+    }
+
+    // B2. If strong matching found nothing, evaluate newly observed tasks by title and format
+    const isTitleFmtMatch = (task) => {
       const taskTitle = task.title || task.book_title || '';
       const targetTitle = payload.title || release.title || '';
-      if (taskTitle && targetTitle && isTitleMatch(taskTitle, targetTitle)) {
-        const taskFmt = (task.format || '').toLowerCase().replace(/^\./, '');
-        return !taskFmt || !resolvedFormat || taskFmt === resolvedFormat;
-      }
-
-      return false;
+      if (!taskTitle || !targetTitle || !isTitleMatch(taskTitle, targetTitle)) return false;
+      const taskFmt = (task.format || '').toLowerCase().replace(/^\./, '');
+      return !taskFmt || !resolvedFormat || taskFmt === resolvedFormat;
     };
 
-    // If queuedTaskId was omitted by Shelfmark, inspect active queue to lock in the taskId
-    if (!queuedTaskId) {
-      const activeMatches = [];
-      for (const [taskId, task] of Object.entries(active)) {
-        if (isTargetTask(taskId, task, false)) {
-          activeMatches.push(taskId);
-        }
+    const titleActive = newActive.filter(([id, task]) => isTitleFmtMatch(task));
+    const titleCompleted = newCompleted.filter(([id, task]) => isTitleFmtMatch(task));
+    const titleFailed = newFailed.filter(([id, task]) => isTitleFmtMatch(task));
+    const totalTitleMatches = titleActive.length + titleCompleted.length + titleFailed.length;
+
+    if (totalTitleMatches === 1) {
+      if (titleCompleted.length === 1) {
+        completedTaskId = titleCompleted[0][0];
+        break;
       }
-      if (activeMatches.length === 1) {
-        queuedTaskId = activeMatches[0];
+      if (titleFailed.length === 1) {
+        throw host.fail('error', `Shelfmark reported download failed: ${titleFailed[0][1].error || 'unknown error'}`);
       }
+      if (titleActive.length === 1) {
+        queuedTaskId = titleActive[0][0];
+        continue;
+      }
+    } else if (totalTitleMatches > 1) {
+      throw host.fail('error', `Ambiguous download match: multiple new tasks match "${release.title}".`);
     }
 
-    // Check failed tasks
-    const matchingFailed = [];
-    for (const [taskId, task] of Object.entries(failed)) {
-      if (isTargetTask(taskId, task, true)) {
-        matchingFailed.push(task.error || task.status || 'unknown error');
-      }
-    }
-    if (matchingFailed.length === 1) {
-      throw host.fail('error', `Shelfmark reported download failed: ${matchingFailed[0]}`);
-    } else if (matchingFailed.length > 1) {
-      throw host.fail('error', `Ambiguous download failure: multiple failed tasks match "${release.title}".`);
-    }
-
-    // Check completed tasks
-    const matchingCompleted = [];
-    for (const [taskId, task] of Object.entries(completed)) {
-      if (isTargetTask(taskId, task, true)) {
-        matchingCompleted.push(taskId);
-      }
-    }
-
-    if (matchingCompleted.length === 1) {
-      completedTaskId = matchingCompleted[0];
-      break;
-    } else if (matchingCompleted.length > 1) {
-      throw host.fail(
-        'error',
-        `Ambiguous download match: multiple completed tasks match "${release.title}". Download aborted to prevent incorrect book association.`
-      );
-    }
+    // If no new tasks observed yet, continue polling
   }
 
   if (completedTaskId) {
@@ -886,7 +992,7 @@ async function doResolveFile(release, payload, resolvedFormat, fileName, baseUrl
 
   throw host.fail(
     'timeout',
-    `Timed out waiting for Shelfmark to finish downloading "${release.title}" after ${timeoutSec} seconds.`
+    `Timed out waiting for Shelfmark to finish downloading "${release.title}" after ${timeoutSec} seconds${queuedTaskId ? ` (task: ${queuedTaskId})` : ''}. The download may still be running in Shelfmark and can be adopted on retry.`
   );
 }
 
@@ -974,13 +1080,16 @@ function toNaturalAuthor(author) {
 
 /**
  * Extracts a clean 10 or 13 digit ISBN from metadata or search query.
+ * Supports BookOrbit v3.5.0 PluginReleaseQuery (isbn13, isbn13s, legacy isbn).
  */
 function extractIsbn(book, query) {
   const candidates = [
-    ...(Array.isArray(book?.isbn) ? book.isbn : [book?.isbn]),
-    ...(Array.isArray(book?.isbn_13) ? book.isbn_13 : [book?.isbn_13]),
-    ...(Array.isArray(book?.isbn_10) ? book.isbn_10 : [book?.isbn_10]),
+    query?.isbn13,
+    ...(Array.isArray(query?.isbn13s) ? query.isbn13s : [query?.isbn13s]),
     query?.isbn,
+    ...(Array.isArray(book?.isbn_13) ? book.isbn_13 : [book?.isbn_13]),
+    ...(Array.isArray(book?.isbn) ? book.isbn : [book?.isbn]),
+    ...(Array.isArray(book?.isbn_10) ? book.isbn_10 : [book?.isbn_10]),
   ];
   for (const cand of candidates) {
     if (!cand) continue;
@@ -1002,11 +1111,18 @@ function isNoiseDerivative(candidateTitle, requestedTitle) {
     'summary of',
     'study guide',
     'cliffsnotes',
+    'sparknotes',
     'analysis of',
     'workbook for',
     'book summary',
     'companion to',
-    'sparknotes',
+    'teacher guide',
+    'teachers guide',
+    'lesson plans',
+    'activity guide',
+    'adapted by',
+    'retold by',
+    'simplified edition',
   ];
   for (const marker of noiseMarkers) {
     if (normCand.includes(marker) && !normReq.includes(marker)) {

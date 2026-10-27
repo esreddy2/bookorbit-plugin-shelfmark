@@ -12,26 +12,31 @@ This plugin enables BookOrbit to search book releases across sources configured 
 ## Features
 
 - **Native BookOrbit Request Integration:** Fully compliant with BookOrbit's indexer plugin specification (`apiVersion: 1`). Searches and downloads are triggered through BookOrbit Requests on demand—no standalone background daemons and no continuous polling.
-- **Duplicate Queue Protection & Task Adoption (v1.2.0):**
+- **Duplicate Queue Protection & Task Adoption (v1.3.0):**
   - Pre-inspects Shelfmark's active, queued, and completed tasks before queueing.
   - Reuses completed downloads immediately after validating file presence via `/api/localdownload`, without re-downloading.
   - If a download is already in progress, safely adopts and monitors it without submitting a duplicate job.
   - Automatically recovers from Shelfmark's `Release is already in the download queue` (500) error by refreshing status and adopting the tracked task.
-  - Prevents concurrent requests for the same release from triggering duplicate downloads.
+  - **Single-Flight Concurrency with Independent Cancellation:** Multiple concurrent callers for the same release share a single background download worker. If one caller aborts, remaining callers continue uninterrupted.
+  - **Historical Task Isolation:** Failed tasks from previous attempts are snapshotted and never contaminate newly observed downloads. Exact task IDs strictly override title matching.
 - **Robust Metadata Search & Equivalence:**
+  - Full compliance with BookOrbit v3.5.0's `PluginReleaseQuery` contract, supporting `isbn13` and `isbn13s` arrays.
+  - Normalizes inverted author names with life dates (`"Orwell, George, 1903-1950"` → `"George Orwell"`), preventing zero-result failures on direct download providers like OceanofPDF and Anna's Archive.
   - Queries Shelfmark metadata by title only to circumvent Open Library's 0-result bug on combined queries.
   - Handles numeric titles safely (e.g., `1984`, `2001`, `451`) whether supplied as strings or numbers.
   - Supports confident bidirectional title equivalents (e.g., `"1984"` ↔ `"Nineteen Eighty-Four"`).
   - Cleans edition and subtitle noise (e.g. `"Animal Farm: A Fairy Story"`) when querying release indexers.
   - Implements bounded fallback searches: alternate titles, ISBN search, and direct `/api/releases` keyword queries when metadata providers return zero results.
-  - Enforces strict author validation to reject unrelated works and study guides.
-- **Accurate Release Metadata (No Fabrications):**
-  - Reports actual formats (`epub`, `pdf`), sizes, seeders, leechers, and language.
+  - Enforces strict author validation: rejects derivative adaptations by conflicting authors (e.g. Michael Dean adaptation of Orwell) and derivative study guides/summaries.
+- **Accurate Release Metadata & Scoring Integrity:**
+  - Emits authentic `isbn`, `sizeBytes`, `format`, and `language` without fabrication.
+  - Aligns `bookTitle` with requested `searchTitle` so BookOrbit's title similarity scoring algorithm awards full title match score.
   - Never fabricates `freeleech: true` or artificial file counts.
   - Deduplicates identical releases across providers without collapsing distinct editions.
 - **EPUB and PDF Support:** Prioritizes EPUB by default while fully supporting PDF downloads. (Audiobook support has been removed to streamline deployment).
-- **Bounded Polling & Prompt Cancellation:**
-  - Polling occurs *only* while an individual download is active, bounded by a 240-second timeout.
+- **Bounded Polling & Host Deadline Safety Margin:**
+  - Polling occurs *only* while an individual download is active.
+  - Reserves a 15-second safety margin below BookOrbit's outer timeout so the plugin returns a clean, informative error before BookOrbit cuts the connection.
   - Uses sensible exponential backoff (1s scaling up to 5s) and immediately aborts on BookOrbit `AbortSignal`.
 - **Credential Protection:** Error messages and logs strictly redact API keys and sensitive query parameters.
 - **Fork Update Ownership:** Cryptographically detached from upstream update channels. Auto-updates check this fork's repository and verify against an independent Ed25519 keypair.
@@ -158,6 +163,23 @@ Globally setting `ALLOW_PRIVATE = true` disables SSRF protection for **all** dir
    - In `direct-download.service.ts`, accept the indexer configuration's `allowPrivateAddress` flag (which is already read by `plugin-host.ts`) as a parameter in `download(url, options)`.
    - Pass `allowPrivate: options.allowPrivateAddress ?? false` into `ensureSafeUrl(...)`.
    - This restricts private IP access exclusively to indexers where the system administrator has explicitly enabled the toggle.
+
+---
+
+### 4. Synchronous Plugin Resolution vs. Asynchronous Shelfmark Downloads
+
+**The Architectural Trade-Off:**  
+BookOrbit's plugin architecture treats `resolveFile` as a synchronous request-response call with an outer HTTP deadline (typically 240 seconds). Shelfmark, by contrast, is an asynchronous background task coordinator that queues downloads across web mirrors, Tor relays, or headless browser Cloudflare solvers that may take 5–15 minutes during peak times.
+- **Safety Margin:** The plugin polls actively during the resolution window, reserving a 15-second safety margin below BookOrbit's host deadline so it can return cleanly with an informative message rather than letting the host cut the connection abruptly.
+- **Background Persistence:** Even if BookOrbit's resolution request times out, Shelfmark continues downloading the task in the background. When the user or automatic queue re-attempts fulfillment later, the plugin detects the completed task, validates the local file via `/api/localdownload`, and adopts it instantly without re-downloading.
+
+---
+
+### 5. BookOrbit "View Files" Action & Idempotency
+
+When an operator clicks "View files" in BookOrbit to inspect an approved release, BookOrbit may invoke `resolveFile` to preview the downloadable file:
+- **Idempotent Inspection:** Because the plugin inspects `/api/status` before submitting any download, clicking "View files" will never queue duplicate downloads in Shelfmark if the file was already completed or is actively downloading.
+- **Single-Flight Protection:** If multiple UI tabs or workers invoke `resolveFile` simultaneously for the same release, all callers subscribe to a single execution worker with independent cancellation.
 
 ---
 
