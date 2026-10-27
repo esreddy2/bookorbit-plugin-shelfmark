@@ -5,7 +5,7 @@ An indexer plugin for [BookOrbit](https://github.com/bookorbit/bookorbit) that i
 This plugin enables BookOrbit to search book releases across sources configured in Shelfmark (Anna's Archive, Libgen, etc.) and routes downloads through Shelfmark's download pipeline.
 
 > [!NOTE]
-> This is a maintained fork (`esreddy2/bookorbit-plugin-shelfmark`) with cryptographic ownership transferred away from the upstream author to prevent automated overwrites. It includes comprehensive reliability fixes for duplicate queue errors, metadata searching, task adoption, file validation, accurate release metadata, and bounded polling.
+> this is just fixes to make it work with my local setup.
 
 ---
 
