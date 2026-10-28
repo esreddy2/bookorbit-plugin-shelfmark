@@ -2,65 +2,84 @@
 #
 # Shelfmark Post-Download Custom Script Hook
 #
-# Configured in Shelfmark via:
-#   CUSTOM_SCRIPT=/path/to/shelfmark-hook.sh
-#   CUSTOM_SCRIPT_PATH_MODE=absolute
-#   CUSTOM_SCRIPT_JSON_PAYLOAD=true
+# Follows Shelfmark v1.5.1 specification (docs/custom-scripts.md):
+# 1. Shelfmark ALWAYS passes the target file path as $1.
+# 2. When CUSTOM_SCRIPT_JSON_PAYLOAD=true, Shelfmark ALSO writes a versioned,
+#    nested JSON payload to stdin containing task metadata and path structures.
+# 3. Timeout is bounded by Shelfmark at 300 seconds.
+# 4. Shelfmark marks the download task as "Error" if this script exits non-zero!
+#    Therefore, if the companion bridge is temporarily unavailable or network
+#    fails, we log a warning and exit 0 so Shelfmark's completed download is not
+#    corrupted. The companion bridge's periodic reconciliation strategy
+#    discovers and fulfills the completed task from Shelfmark /api/status.
 #
-# Reads JSON from stdin when CUSTOM_SCRIPT_JSON_PAYLOAD=true,
-# or reads $1 (file path) when disabled.
-# Sends authenticated HTTP notification to the BookOrbit-Shelfmark companion bridge.
+# Docker Networking:
+#   Inside Docker, 'localhost' refers to the Shelfmark container itself.
+#   Point BRIDGE_WEBHOOK_URL to your companion container name or host address:
+#   e.g. http://bookorbit-companion:8085/webhook/shelfmark or http://host.docker.internal:8085/...
 
-set -euo pipefail
+set -u
 
-BRIDGE_URL="${BRIDGE_WEBHOOK_URL:-http://localhost:8085/webhook/shelfmark}"
+TARGET_PATH="${1:-}"
+
+# Docker-friendly default: check container hostname or fallback to localhost
+DEFAULT_BRIDGE_HOST="${BRIDGE_HOST:-bookorbit-companion}"
+DEFAULT_BRIDGE_PORT="${BRIDGE_PORT:-8085}"
+BRIDGE_URL="${BRIDGE_WEBHOOK_URL:-http://${DEFAULT_BRIDGE_HOST}:${DEFAULT_BRIDGE_PORT}/webhook/shelfmark}"
 BRIDGE_SECRET="${BRIDGE_SECRET:-bookorbit-shelfmark-secret}"
 
 PAYLOAD=""
 
-# Mode 1: Argument mode (Shelfmark passes $1 when CUSTOM_SCRIPT_JSON_PAYLOAD=false)
-if [ $# -gt 0 ] && [ -n "${1:-}" ]; then
-  FILE_PATH="$1"
-  FILE_NAME=$(basename "$FILE_PATH")
-  PAYLOAD=$(printf '{"download_path":"%s","file_name":"%s","status":"completed"}' "$FILE_PATH" "$FILE_NAME")
-fi
-
-# Mode 2: Stdin JSON mode (Shelfmark pipes JSON payload when CUSTOM_SCRIPT_JSON_PAYLOAD=true)
-if [ -z "$PAYLOAD" ] && [ ! -t 0 ]; then
+# Check if data is piped to stdin (Shelfmark JSON payload mode)
+if [ ! -t 0 ]; then
   STDIN_DATA=$(cat || true)
   if [ -n "$STDIN_DATA" ]; then
     PAYLOAD="$STDIN_DATA"
   fi
 fi
 
+# If stdin was empty, construct structured payload using $1
 if [ -z "$PAYLOAD" ]; then
-  echo "[Shelfmark Hook] Error: No payload received via stdin or arguments." >&2
-  exit 1
+  if [ -n "$TARGET_PATH" ]; then
+    FILE_NAME=$(basename "$TARGET_PATH")
+    PAYLOAD=$(printf '{"version":1,"phase":"post_transfer","task":{"title":"%s"},"paths":{"target":"%s","final_paths":["%s"]},"target_path":"%s"}' \
+      "$FILE_NAME" "$TARGET_PATH" "$TARGET_PATH" "$TARGET_PATH")
+  else
+    echo "[Shelfmark Hook] Warning: No target path in \$1 and no stdin JSON received." >&2
+    exit 0
+  fi
 fi
 
-echo "[Shelfmark Hook] Delivering completion notification to $BRIDGE_URL..."
+echo "[Shelfmark Hook] Delivering completion notification to $BRIDGE_URL (target: $TARGET_PATH)..."
 
-# Send authenticated POST request to Companion Bridge
+# Deliver notification with a 15-second timeout
+DELIVERY_SUCCESS=0
+HTTP_STATUS=""
+HTTP_BODY=""
+
 if command -v curl >/dev/null 2>&1; then
-  RESPONSE=$(curl -s -S -w "\nHTTP_STATUS:%{http_code}" \
+  set +e
+  RESPONSE=$(curl -s -S --max-time 15 -w "\nHTTP_STATUS:%{http_code}" \
     -X POST "$BRIDGE_URL" \
     -H "Content-Type: application/json" \
     -H "X-Bridge-Secret: $BRIDGE_SECRET" \
-    -d "$PAYLOAD")
+    -d "$PAYLOAD" 2>&1)
+  CURL_EXIT=$?
+  set -e
 
-  HTTP_BODY=$(echo "$RESPONSE" | sed -e '$d')
-  HTTP_STATUS=$(echo "$RESPONSE" | tail -n 1 | sed -e 's/HTTP_STATUS://')
-
-  if [ "$HTTP_STATUS" -ge 200 ] && [ "$HTTP_STATUS" -lt 300 ]; then
-    echo "[Shelfmark Hook] Success (HTTP $HTTP_STATUS): $HTTP_BODY"
-    exit 0
+  if [ $CURL_EXIT -eq 0 ]; then
+    HTTP_BODY=$(echo "$RESPONSE" | sed -e '$d')
+    HTTP_STATUS=$(echo "$RESPONSE" | tail -n 1 | sed -e 's/HTTP_STATUS://')
+    if [ -n "$HTTP_STATUS" ] && [ "$HTTP_STATUS" -ge 200 ] && [ "$HTTP_STATUS" -lt 300 ]; then
+      DELIVERY_SUCCESS=1
+    fi
   else
-    echo "[Shelfmark Hook] Failed (HTTP $HTTP_STATUS): $HTTP_BODY" >&2
-    exit 1
+    HTTP_BODY="$RESPONSE"
   fi
 else
-  # Fallback to Node.js if curl is not installed in the container
-  node -e "
+  # Node.js fallback
+  set +e
+  NODE_OUT=$(node -e "
     const http = require('http');
     const url = new URL('$BRIDGE_URL');
     const req = http.request({
@@ -68,6 +87,7 @@ else
       port: url.port,
       path: url.pathname,
       method: 'POST',
+      timeout: 15000,
       headers: {
         'Content-Type': 'application/json',
         'X-Bridge-Secret': '$BRIDGE_SECRET',
@@ -78,19 +98,42 @@ else
       res.on('data', chunk => data += chunk);
       res.on('end', () => {
         if (res.statusCode >= 200 && res.statusCode < 300) {
-          console.log('[Shelfmark Hook] Success (HTTP ' + res.statusCode + '): ' + data);
           process.exit(0);
         } else {
-          console.error('[Shelfmark Hook] Failed (HTTP ' + res.statusCode + '): ' + data);
-          process.exit(1);
+          console.error('HTTP ' + res.statusCode + ': ' + data);
+          process.exit(2);
         }
       });
     });
     req.on('error', (e) => {
-      console.error('[Shelfmark Hook] Request failed: ' + e.message);
-      process.exit(1);
+      console.error(e.message);
+      process.exit(3);
+    });
+    req.on('timeout', () => {
+      req.destroy();
+      process.exit(4);
     });
     req.write(process.env.PAYLOAD);
     req.end();
-  " PAYLOAD="$PAYLOAD"
+  " 2>&1)
+  NODE_EXIT=$?
+  set -e
+
+  if [ $NODE_EXIT -eq 0 ]; then
+    DELIVERY_SUCCESS=1
+  else
+    HTTP_BODY="$NODE_OUT"
+  fi
+fi
+
+if [ $DELIVERY_SUCCESS -eq 1 ]; then
+  echo "[Shelfmark Hook] Successfully notified companion bridge."
+  exit 0
+else
+  # CRITICAL SAFETY: Shelfmark marks tasks as Error if the custom script exits with non-zero.
+  # If the companion service is temporarily down, unreachable, or restarts, we must NOT fail the
+  # download in Shelfmark. Log a clear warning and exit 0; companion reconciliation will recover it.
+  echo "[Shelfmark Hook] Warning: Companion bridge unreachable or returned error ($HTTP_BODY)." >&2
+  echo "[Shelfmark Hook] Exiting 0 to preserve completed task in Shelfmark. Reconciliation will recover." >&2
+  exit 0
 fi

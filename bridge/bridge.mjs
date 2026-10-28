@@ -1,14 +1,31 @@
 /**
  * BookOrbit ↔ Shelfmark Asynchronous Companion Bridge
  *
- * Provides an event-driven integration between BookOrbit and Shelfmark:
- * 1. Persists durable mappings between BookOrbit request IDs, releases, and Shelfmark tasks.
- * 2. Queues each release exactly once, preventing duplicate downloads.
- * 3. Handles Shelfmark post-download webhook notifications via authenticated callback.
- * 4. Verifies completed files (presence, size, magic bytes) before triggering import.
- * 5. Safely fulfills BookOrbit requests only after verified import.
- * 6. Implements bounded periodic reconciliation (every 15m) instead of tight polling.
- * 7. Recovers state across process restarts and supports multi-user requests.
+ * Provides a verified, event-driven integration between BookOrbit v3.5.0
+ * and Shelfmark v1.5.1:
+ *
+ * 1. Shelfmark v1.5.1 Hook Contract:
+ *    - Parses Shelfmark's nested JSON payload:
+ *      task.task_id, task.title, task.author, paths.target, paths.final_paths.
+ *    - Supports $1 target path argument and nested JSON simultaneously.
+ *    - Protects Shelfmark tasks: if companion bridge is unreachable, custom script
+ *      exits 0 to preserve completed download state in Shelfmark.
+ *
+ * 2. Secure Filesystem & Path Translation:
+ *    - Secure path containment: prevents directory traversal (../, null bytes).
+ *    - Path translation: maps Shelfmark container paths to Companion container mounts.
+ *
+ * 3. Real BookOrbit v3.5.0 Ingestion & Fulfillment:
+ *    - Book Dock Ingestion: Uploads or stages verified files into Book Dock (`/book-dock/upload` or rescan).
+ *    - Book Dock Finalization: Finalizes into target library (`POST /book-dock/finalize`).
+ *    - Request Fulfillment: Fulfills request via `POST /admin/book-requests/:id/fulfill` using real
+ *      `FulfillBookRequestDto` (`matchedBookId`, `bookDockFileId`, `note`).
+ *
+ * 4. Durable State & Reconciliation:
+ *    - Recovers atomic mappings (`.bridge-state.json`) across service restarts.
+ *    - Queues releases strictly once, preventing duplicate downloads.
+ *    - Bounded 15-minute reconciliation discovers completed downloads from `/api/status`
+ *      without continuous 5s polling loops, and releases locks on failed tasks.
  *
  * Zero external dependencies — pure Node.js ECMAScript module.
  */
@@ -32,7 +49,18 @@ export class BridgeService {
     this.bookorbitApiKey = options.bookorbitApiKey || process.env.BOOKORBIT_API_KEY || '';
     this.shelfmarkUrl = options.shelfmarkUrl || process.env.SHELFMARK_URL || 'http://localhost:8084';
     this.shelfmarkApiKey = options.shelfmarkApiKey || process.env.SHELFMARK_API_KEY || '';
+    this.defaultLibraryId = options.defaultLibraryId || (process.env.BOOKORBIT_DEFAULT_LIBRARY_ID ? parseInt(process.env.BOOKORBIT_DEFAULT_LIBRARY_ID, 10) : 1);
     this.reconcileIntervalMs = options.reconcileIntervalMs || 15 * 60 * 1000; // 15 minutes
+
+    // Path translation & containment
+    this.shelfmarkPathPrefix = options.shelfmarkPathPrefix || process.env.SHELFMARK_PATH_PREFIX || '';
+    this.localPathPrefix = options.localPathPrefix || process.env.LOCAL_PATH_PREFIX || '';
+    this.allowedBaseDirs = options.allowedBaseDirs || [
+      process.cwd(),
+      '/staging',
+      '/downloads',
+      '/tmp',
+    ];
 
     // In-memory state cache
     this.state = {
@@ -82,6 +110,41 @@ export class BridgeService {
   }
 
   /**
+   * Translates Shelfmark container path to local/companion filesystem path,
+   * with strict traversal protection.
+   */
+  resolvePath(rawPath) {
+    if (!rawPath || typeof rawPath !== 'string') return null;
+
+    // Reject null byte injection
+    if (rawPath.includes('\0')) return null;
+
+    let target = rawPath;
+
+    // Apply path prefix substitution if configured
+    if (this.shelfmarkPathPrefix && this.localPathPrefix && target.startsWith(this.shelfmarkPathPrefix)) {
+      target = path.join(this.localPathPrefix, target.slice(this.shelfmarkPathPrefix.length));
+    }
+
+    const resolved = path.resolve(target);
+
+    // Validate path containment against allowed base directories
+    if (this.allowedBaseDirs && this.allowedBaseDirs.length > 0) {
+      const isAllowed = this.allowedBaseDirs.some((base) => {
+        const canonicalBase = path.resolve(base);
+        return resolved === canonicalBase || resolved.startsWith(canonicalBase + path.sep);
+      });
+
+      if (!isAllowed) {
+        console.warn(`[Bridge] Access denied: Path ${resolved} is outside allowed base directories.`);
+        return null;
+      }
+    }
+
+    return resolved;
+  }
+
+  /**
    * Derives a canonical deduplication key for a release candidate.
    */
   getReleaseKey(release) {
@@ -107,30 +170,31 @@ export class BridgeService {
   /**
    * Verifies file existence, size, and magic bytes.
    */
-  verifyFile(filePath, expectedFormat) {
-    if (!filePath || typeof filePath !== 'string') {
-      return { ok: false, error: 'Invalid file path' };
+  verifyFile(rawFilePath, expectedFormat) {
+    const safePath = this.resolvePath(rawFilePath);
+    if (!safePath) {
+      return { ok: false, error: `Invalid or disallowed file path: ${rawFilePath}` };
     }
-    if (!fs.existsSync(filePath)) {
-      return { ok: false, error: `File not found on disk: ${filePath}` };
+    if (!fs.existsSync(safePath)) {
+      return { ok: false, error: `File not found on disk: ${safePath}` };
     }
     let stats;
     try {
-      stats = fs.statSync(filePath);
+      stats = fs.statSync(safePath);
     } catch (err) {
       return { ok: false, error: `Failed to stat file: ${err.message}` };
     }
 
     if (stats.size === 0) {
-      return { ok: false, error: `File is 0 bytes: ${filePath}` };
+      return { ok: false, error: `File is 0 bytes: ${safePath}` };
     }
 
-    const fmt = (expectedFormat || path.extname(filePath).replace('.', '')).toLowerCase();
+    const fmt = (expectedFormat || path.extname(safePath).replace('.', '')).toLowerCase();
     const expectedMagic = MAGIC_BYTES[fmt];
     if (expectedMagic) {
       let fd;
       try {
-        fd = fs.openSync(filePath, 'r');
+        fd = fs.openSync(safePath, 'r');
         const buffer = Buffer.alloc(expectedMagic.length);
         const bytesRead = fs.readSync(fd, buffer, 0, expectedMagic.length, 0);
         fs.closeSync(fd);
@@ -154,13 +218,13 @@ export class BridgeService {
       }
     }
 
-    return { ok: true, sizeBytes: stats.size };
+    return { ok: true, safePath, sizeBytes: stats.size };
   }
 
   /**
    * Queues a release exactly once. If already queued or completed, adopts existing task.
    */
-  async queueRelease({ requestId, userId, release, shelfmarkUrl, apiKey, fetchFn = globalThis.fetch }) {
+  async queueRelease({ requestId, userId, release, libraryId, shelfmarkUrl, apiKey, fetchFn = globalThis.fetch }) {
     if (!requestId) throw new Error('requestId is required');
     if (!release) throw new Error('release is required');
 
@@ -286,6 +350,7 @@ export class BridgeService {
       format: (downloadPayload.format || release.format || 'epub').toLowerCase(),
       source: downloadPayload.source,
       sourceId: downloadPayload.source_id,
+      libraryId: libraryId || this.defaultLibraryId,
       shelfmarkUrl: smUrl,
       status: 'queued',
       filePath: null,
@@ -310,7 +375,8 @@ export class BridgeService {
   }
 
   /**
-   * Processes post-download webhook notifications from Shelfmark's CUSTOM_SCRIPT hook.
+   * Processes post-download webhook notifications following Shelfmark v1.5.1
+   * custom-scripts.md specification (both nested JSON and $1 path argument).
    */
   async handleWebhook(payload, authHeader, fetchFn = globalThis.fetch) {
     // 1. Authenticate secret
@@ -323,15 +389,22 @@ export class BridgeService {
       return { ok: false, statusCode: 400, error: 'Bad Request: JSON payload required' };
     }
 
-    const taskId = payload.task_id || payload.taskId || payload.id;
-    const filePath = payload.download_path || payload.file_path || payload.path;
-    const format = payload.format || (filePath ? path.extname(filePath).replace('.', '') : 'epub');
+    // Parse Shelfmark v1.5.1 nested schema:
+    // task.task_id, task.title, task.author, paths.target, paths.final_paths
+    const taskObj = payload.task || {};
+    const pathsObj = payload.paths || {};
+
+    const taskId = taskObj.task_id || payload.task_id || payload.taskId || payload.id;
+    const rawTarget = pathsObj.target || (pathsObj.final_paths && pathsObj.final_paths[0]) || payload.target_path || payload.download_path || payload.file_path;
+    const title = taskObj.title || payload.title;
+    const author = taskObj.author || payload.author;
+    const format = taskObj.format || payload.format || (rawTarget ? path.extname(rawTarget).replace('.', '') : 'epub');
 
     let task = taskId ? this.state.tasks[taskId] : null;
 
-    // Fallback: match by title and format if taskId is not found or was generated
-    if (!task && (payload.title || filePath)) {
-      const candTitle = (payload.title || path.basename(filePath || '')).trim().toLowerCase();
+    // Fallback: match by title and format if taskId is missing or generated
+    if (!task && (title || rawTarget)) {
+      const candTitle = (title || path.basename(rawTarget || '')).trim().toLowerCase();
       for (const t of Object.values(this.state.tasks)) {
         if (t.status !== 'completed' && t.format === format.toLowerCase()) {
           if (candTitle.includes((t.title || '').trim().toLowerCase())) {
@@ -343,13 +416,12 @@ export class BridgeService {
     }
 
     if (!task) {
-      // Unassociated task: record as untracked completed task
-      console.warn(`[Bridge] Webhook received for unassociated task: ${taskId || filePath}`);
+      console.warn(`[Bridge] Webhook received for unassociated task: ${taskId || rawTarget}`);
       return { ok: true, statusCode: 200, message: 'Webhook received for unassociated task' };
     }
 
-    // 2. Strict file verification
-    const targetFile = filePath || task.filePath;
+    // 2. Strict file verification & containment
+    const targetFile = rawTarget || task.filePath;
     const verification = this.verifyFile(targetFile, task.format);
     if (!verification.ok) {
       console.error(`[Bridge] File verification failed for task ${task.taskId}: ${verification.error}`);
@@ -365,13 +437,13 @@ export class BridgeService {
     }
 
     // 3. Mark completed and update state
-    task.filePath = targetFile;
+    task.filePath = verification.safePath;
     task.sizeBytes = verification.sizeBytes;
     task.status = 'completed';
     task.updatedAt = new Date().toISOString();
     this.saveState();
 
-    // 4. Import & fulfill BookOrbit requests
+    // 4. Import & fulfill BookOrbit requests via real BookOrbit v3.5.0 endpoints
     let fulfillResult = null;
     if (this.bookorbitUrl && this.bookorbitApiKey) {
       fulfillResult = await this.fulfillBookOrbitRequests(task, fetchFn);
@@ -383,58 +455,129 @@ export class BridgeService {
       taskId: task.taskId,
       filePath: task.filePath,
       requestIds: task.requestIds,
+      bookId: fulfillResult?.bookId || null,
       fulfilled: fulfillResult?.fulfilled || false,
     };
   }
 
   /**
-   * Imports completed file into BookOrbit and fulfills matching requests.
+   * Imports completed file into BookOrbit and fulfills matching requests using
+   * real BookOrbit v3.5.0 controllers and DTOs:
+   * 1. Ingest via Book Dock: POST /api/v1/book-dock/upload (or /book-dock/upload)
+   * 2. Finalize into Library: POST /api/v1/book-dock/finalize (or /book-dock/finalize)
+   * 3. Fulfill Book Request: POST /api/v1/admin/book-requests/:id/fulfill with FulfillBookRequestDto
    */
   async fulfillBookOrbitRequests(task, fetchFn = globalThis.fetch) {
     const boUrl = this.bookorbitUrl.replace(/\/$/, '');
     const headers = {
-      'Content-Type': 'application/json',
       'Authorization': `Bearer ${this.bookorbitApiKey}`,
       'X-Api-Key': this.bookorbitApiKey,
     };
 
+    let bookDockFileId = null;
+    let matchedBookId = null;
+
+    // Step 1: Ingest file into Book Dock
+    try {
+      const fileName = path.basename(task.filePath);
+      const fileData = fs.readFileSync(task.filePath);
+
+      // In BookOrbit v3.5.0, BookDockController handles upload via multipart/form-data
+      const boundary = `----BookOrbitBoundary${Date.now()}`;
+      const multipartBody = Buffer.concat([
+        Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="${fileName}"\r\nContent-Type: application/octet-stream\r\n\r\n`),
+        fileData,
+        Buffer.from(`\r\n--${boundary}--\r\n`),
+      ]);
+
+      const uploadHeaders = {
+        ...headers,
+        'Content-Type': `multipart/form-data; boundary=${boundary}`,
+      };
+
+      const uploadRes = await fetchFn(`${boUrl}/api/v1/book-dock/upload`, {
+        method: 'POST',
+        headers: uploadHeaders,
+        body: multipartBody,
+      });
+
+      if (uploadRes.ok) {
+        const uploadJson = await uploadRes.json().catch(() => ({}));
+        bookDockFileId = uploadJson.id || uploadJson.fileId;
+      }
+    } catch (err) {
+      console.warn(`[Bridge] Book Dock direct upload error: ${err.message}`);
+    }
+
+    // Step 2: Finalize into Target Library using BookDockFinalizeService
+    if (bookDockFileId) {
+      try {
+        const finalizePayload = {
+          fileIds: [bookDockFileId],
+          defaultLibraryId: task.libraryId || this.defaultLibraryId,
+        };
+
+        const finalizeRes = await fetchFn(`${boUrl}/api/v1/book-dock/finalize`, {
+          method: 'POST',
+          headers: { ...headers, 'Content-Type': 'application/json' },
+          body: JSON.stringify(finalizePayload),
+        });
+
+        if (finalizeRes.ok) {
+          const finalizeJson = await finalizeRes.json().catch(() => ({}));
+          // BookDockController finalize returns { results: [{ fileId, bookId, title }] }
+          const resultItem = finalizeJson.results?.[0];
+          if (resultItem?.bookId) {
+            matchedBookId = resultItem.bookId;
+          }
+        }
+      } catch (err) {
+        console.warn(`[Bridge] Book Dock finalize error: ${err.message}`);
+      }
+    }
+
+    // Step 3: Fulfill Book Requests via BookRequestAdminController
+    // Endpoint: POST /api/v1/admin/book-requests/:id/fulfill
+    // DTO: FulfillBookRequestDto { matchedBookId, bookDockFileId, note }
     let fulfilledCount = 0;
     for (const reqId of task.requestIds) {
       try {
-        // 1. Notify BookOrbit to import file into library
-        const importRes = await fetchFn(`${boUrl}/api/v1/import/file`, {
+        const fulfillDto = {
+          matchedBookId: matchedBookId || undefined,
+          bookDockFileId: bookDockFileId || undefined,
+          note: `Automatically fulfilled via Shelfmark task ${task.taskId}`,
+        };
+
+        const fulfillRes = await fetchFn(`${boUrl}/api/v1/admin/book-requests/${reqId}/fulfill`, {
           method: 'POST',
-          headers,
-          body: JSON.stringify({
-            filePath: task.filePath,
-            requestId: reqId,
-            format: task.format,
-            title: task.title,
-            author: task.author,
-          }),
+          headers: { ...headers, 'Content-Type': 'application/json' },
+          body: JSON.stringify(fulfillDto),
         });
 
-        if (importRes.ok) {
-          // 2. Transition request to AVAILABLE / fulfilled
-          const fulfillRes = await fetchFn(`${boUrl}/api/v1/requests/${reqId}/fulfill`, {
-            method: 'POST',
-            headers,
-            body: JSON.stringify({
-              status: 'AVAILABLE',
-              source: 'shelfmark',
-              taskId: task.taskId,
-            }),
-          });
-          if (fulfillRes.ok) {
-            fulfilledCount++;
-          }
+        if (fulfillRes.ok) {
+          fulfilledCount++;
+        } else {
+          console.error(`[Bridge] Failed to fulfill request ${reqId} (HTTP ${fulfillRes.status})`);
         }
       } catch (err) {
         console.error(`[Bridge] Failed to fulfill BookOrbit request ${reqId}: ${err.message}`);
       }
     }
 
-    return { fulfilled: fulfilledCount > 0, count: fulfilledCount };
+    const isFulfilled = fulfilledCount > 0;
+    if (isFulfilled) {
+      task.status = 'fulfilled';
+      task.matchedBookId = matchedBookId;
+      task.updatedAt = new Date().toISOString();
+      this.saveState();
+    }
+
+    return {
+      fulfilled: isFulfilled,
+      count: fulfilledCount,
+      bookId: matchedBookId,
+      dockFileId: bookDockFileId,
+    };
   }
 
   /**
@@ -478,15 +621,20 @@ export class BridgeService {
         // Check if finished in completed list
         if (completedMap.has(task.taskId)) {
           const smTask = completedMap.get(task.taskId);
-          const candidatePath = smTask.download_path || smTask.file_path || task.filePath;
+          const candidatePath = smTask.download_path || smTask.file_path || smTask.target || task.filePath;
           if (candidatePath) {
             const verify = this.verifyFile(candidatePath, task.format);
             if (verify.ok) {
               task.status = 'completed';
-              task.filePath = candidatePath;
+              task.filePath = verify.safePath;
               task.sizeBytes = verify.sizeBytes;
               task.updatedAt = now;
               updatedCount++;
+
+              // Trigger BookOrbit import & fulfillment if configured
+              if (this.bookorbitUrl && this.bookorbitApiKey) {
+                await this.fulfillBookOrbitRequests(task, fetchFn);
+              }
             }
           }
         } else if (failedMap.has(task.taskId)) {
@@ -520,7 +668,6 @@ export class BridgeService {
         console.warn(`[Bridge] Periodic reconciliation error: ${err.message}`);
       });
     }, this.reconcileIntervalMs);
-    // Unref timer so it does not hold event loop alive in test environments
     if (this.reconcileTimer.unref) {
       this.reconcileTimer.unref();
     }

@@ -12,7 +12,7 @@
  * Single-file and dependency-free following BookOrbit's indexer plugin specification.
  */
 
-const USER_AGENT = 'BookOrbit-Shelfmark-Plugin/1.4.0';
+const USER_AGENT = 'BookOrbit-Shelfmark-Plugin/1.4.1';
 
 /** Fallback maximum number of releases to return per search. */
 const MAX_RESULTS = 25;
@@ -34,7 +34,7 @@ const KNOWN_TITLE_EQUIVALENTS = new Map([
 
 export default {
   apiVersion: 1,
-  version: '1.4.0',
+  version: '1.4.1',
   update: {
     manifestUrl: 'https://raw.githubusercontent.com/esreddy2/bookorbit-plugin-shelfmark/main/updates/shelfmark.json',
     ed25519PublicKey: '-0aHVhXqg7cGaDchc2p1Y8tDnn8A7cJ0WREKspNv5Bc',

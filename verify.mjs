@@ -100,7 +100,7 @@ async function runTests() {
   ok('preferFormat defaults to epub', plugin.settingsFields.find((f) => f.key === 'preferFormat')?.default === 'epub');
   ok('defines downloadViaShelfmark toggle', plugin.settingsFields.some((f) => f.key === 'downloadViaShelfmark'));
   ok('defines pollTimeoutSeconds defaulting to 240', plugin.settingsFields.find((f) => f.key === 'pollTimeoutSeconds')?.default === 240);
-  ok('declares semantic version 1.4.0', plugin.version === '1.4.0');
+  ok('declares semantic version 1.4.1', plugin.version === '1.4.1');
   ok('declares update channel', typeof plugin.update === 'object' && plugin.update !== null);
   ok('update manifestUrl is HTTPS and points to fork repo', typeof plugin.update?.manifestUrl === 'string' && plugin.update.manifestUrl.includes('esreddy2/bookorbit-plugin-shelfmark'));
   ok('update ed25519PublicKey is 43-char base64url', /^[A-Za-z0-9_-]{43}$/.test(plugin.update?.ed25519PublicKey ?? ''));
@@ -1600,9 +1600,16 @@ async function runTests() {
       ok('bridge accepts webhook with valid secret (200)', auth.statusCode === 200 && auth.ok);
     }
 
-    // Test B5: File verification (rejects missing, 0-byte, and invalid magic bytes)
+    // Test B5: File verification, directory traversal protection, and path mapping
     {
-      const bridge = new BridgeService({ stateFilePath: testStateFile, secret: 'test-secret' });
+      const bridge = new BridgeService({
+        stateFilePath: testStateFile,
+        secret: 'test-secret',
+        allowedBaseDirs: [testDir],
+        shelfmarkPathPrefix: '/data/shelfmark/downloads',
+        localPathPrefix: testDir,
+      });
+
       const missingFile = join(testDir, 'does-not-exist.epub');
       const zeroByteFile = join(testDir, 'zero.epub');
       const fakeEpubFile = join(testDir, 'fake.epub');
@@ -1626,6 +1633,15 @@ async function runTests() {
       ok('file verification accepts valid EPUB magic bytes', bridge.verifyFile(validEpubFile, 'epub').ok);
       ok('file verification accepts valid PDF magic bytes', bridge.verifyFile(validPdfFile, 'pdf').ok);
 
+      // Security: Directory traversal attacks rejected
+      const traversalPath = join(testDir, '..', '..', '..', 'etc', 'passwd');
+      ok('directory traversal attack rejected by path containment', bridge.resolvePath(traversalPath) === null);
+      ok('null-byte injection rejected by path containment', bridge.resolvePath(validEpubFile + '\0.png') === null);
+
+      // Path translation: translates container paths safely
+      const containerPath = '/data/shelfmark/downloads/valid.epub';
+      ok('translates Shelfmark container path to companion mount', bridge.resolvePath(containerPath) === validEpubFile);
+
       // Register a queued task to test webhook rejection on corrupt file
       bridge.state.tasks['task-corrupt'] = {
         taskId: 'task-corrupt',
@@ -1638,22 +1654,23 @@ async function runTests() {
       bridge.saveState();
 
       const hookResCorrupt = await bridge.handleWebhook({
-        task_id: 'task-corrupt',
-        download_path: fakeEpubFile,
-        format: 'epub',
+        task: { task_id: 'task-corrupt', format: 'epub' },
+        paths: { target: fakeEpubFile },
       }, 'test-secret');
 
       ok('bridge rejects corrupted download in webhook with 422', hookResCorrupt.statusCode === 422 && !hookResCorrupt.ok);
       ok('corrupted download does NOT mark task completed', bridge.state.tasks['task-corrupt'].status === 'failed');
     }
 
-    // Test B6: Fulfills BookOrbit requests only after verified file import
+    // Test B6: Real BookOrbit v3.5.0 Ingestion & Fulfillment (Book Dock upload -> finalize -> fulfill)
     {
       const bridge = new BridgeService({
         stateFilePath: testStateFile,
         secret: 'test-secret',
         bookorbitUrl: 'http://bookorbit:8080',
-        bookorbitApiKey: 'bo-api-key',
+        bookorbitApiKey: 'bo-admin-key',
+        allowedBaseDirs: [testDir],
+        defaultLibraryId: 2,
       });
 
       const validEpub = join(testDir, 'valid.epub');
@@ -1671,23 +1688,58 @@ async function runTests() {
       const boCalls = [];
       const fakeBoFetch = async (url, opts) => {
         boCalls.push({ url, opts });
-        return mockResponse({ ok: true, status: 'AVAILABLE' });
+        // 1. BookDockController upload
+        if (url.includes('/api/v1/book-dock/upload')) {
+          return mockResponse({ id: 501, filename: 'valid.epub', status: 'ready_to_file' });
+        }
+        // 2. BookDockController finalize
+        if (url.includes('/api/v1/book-dock/finalize')) {
+          return mockResponse({ success: true, results: [{ fileId: 501, bookId: 902, title: '1984' }] });
+        }
+        // 3. BookRequestAdminController fulfill
+        if (url.includes('/api/v1/admin/book-requests/req-success-1/fulfill')) {
+          return mockResponse({ id: 'req-success-1', status: 'AVAILABLE', matchedBookId: 902 });
+        }
+        return mockResponse({});
       };
 
-      const hookRes = await bridge.handleWebhook({
-        task_id: 'task-success',
-        download_path: validEpub,
-        format: 'epub',
-      }, 'test-secret', fakeBoFetch);
+      // Real Shelfmark v1.5.1 nested JSON payload
+      const shelfmarkPayload = {
+        version: 1,
+        phase: 'post_transfer',
+        task: {
+          task_id: 'task-success',
+          source: 'annas',
+          title: '1984',
+          author: 'George Orwell',
+          format: 'epub',
+        },
+        output: {
+          mode: 'folder',
+          organization_mode: 'organize',
+        },
+        paths: {
+          destination: testDir,
+          target: validEpub,
+          final_paths: [validEpub],
+        },
+      };
 
-      ok('webhook accepts valid file and marks completed', hookRes.ok && hookRes.statusCode === 200);
-      ok('notifies BookOrbit import endpoint with verified file path', boCalls.some((c) => c.url.includes('/api/v1/import/file') && JSON.parse(c.opts.body).filePath === validEpub));
-      ok('marks BookOrbit request AVAILABLE only after successful import', boCalls.some((c) => c.url.includes('/api/v1/requests/req-success-1/fulfill') && JSON.parse(c.opts.body).status === 'AVAILABLE'));
+      const hookRes = await bridge.handleWebhook(shelfmarkPayload, 'test-secret', fakeBoFetch);
+
+      ok('webhook accepts Shelfmark v1.5.1 nested JSON and marks completed', hookRes.ok && hookRes.statusCode === 200);
+      ok('ingests file via BookOrbit BookDockController upload endpoint', boCalls.some((c) => c.url.includes('/api/v1/book-dock/upload') && c.opts.headers['Content-Type'].includes('multipart/form-data')));
+      ok('finalizes Book Dock file into target library obtaining bookId', boCalls.some((c) => c.url.includes('/api/v1/book-dock/finalize') && JSON.parse(c.opts.body).fileIds.includes(501)));
+      ok('fulfills BookOrbit request using FulfillBookRequestDto with real matchedBookId', boCalls.some((c) => c.url.includes('/api/v1/admin/book-requests/req-success-1/fulfill') && JSON.parse(c.opts.body).matchedBookId === 902));
+      ok('task transitions to fulfilled only after verified BookOrbit fulfillment', bridge.state.tasks['task-success'].status === 'fulfilled' && bridge.state.tasks['task-success'].matchedBookId === 902);
     }
 
     // Test B7: Bounded periodic reconciliation discovers completed tasks without polling loops
     {
-      const bridge = new BridgeService({ stateFilePath: testStateFile });
+      const bridge = new BridgeService({
+        stateFilePath: testStateFile,
+        allowedBaseDirs: [testDir],
+      });
       const validEpub = join(testDir, 'valid.epub');
 
       bridge.state.tasks['task-missed-webhook'] = {
@@ -1705,7 +1757,7 @@ async function runTests() {
         if (url.includes('/api/status')) {
           return mockResponse({
             completed_tasks: [
-              { id: 'task-missed-webhook', title: 'Fahrenheit 451', format: 'epub', download_path: validEpub },
+              { id: 'task-missed-webhook', title: 'Fahrenheit 451', format: 'epub', target: validEpub },
             ],
             failed_tasks: [],
           });
@@ -1751,48 +1803,82 @@ async function runTests() {
       ok('reconciliation frees release lock so retry is permitted', bridge.state.releases[releaseKey] === undefined);
     }
 
-    // Test B9: Shelfmark hook script executes cleanly in both stdin JSON and argument modes
+    // Test B9: Shelfmark hook script executes cleanly with BOTH $1 AND nested stdin JSON
     {
+      const validEpub = join(testDir, 'valid.epub');
+      let receivedHeaders = null;
+      let receivedBody = null;
+
       const hookServer = http.createServer((req, res) => {
         let body = '';
         req.on('data', (c) => { body += c; });
         req.on('end', () => {
-          const secret = req.headers['x-bridge-secret'];
-          const parsed = body ? JSON.parse(body) : {};
+          receivedHeaders = req.headers;
+          receivedBody = body ? JSON.parse(body) : {};
           res.writeHead(200, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ ok: true, secret, received: parsed }));
+          res.end(JSON.stringify({ ok: true, taskId: receivedBody.task?.task_id }));
         });
       });
 
       await new Promise((resolve) => hookServer.listen(8098, resolve));
 
       try {
-        // Mode 1: Argument mode (CLI argument $1)
-        const argOut = await new Promise((resolve, reject) => {
-          execFile('scripts/shelfmark-hook.sh', ['/tmp/downloads/Book.epub'], {
-            env: { ...process.env, BRIDGE_WEBHOOK_URL: 'http://localhost:8098/webhook', BRIDGE_SECRET: 'test-hook-secret' },
-          }, (err, stdout) => {
-            if (err) reject(err);
-            else resolve(stdout);
-          });
-        });
-        ok('shelfmark hook executes in argument mode ($1)', argOut.includes('Success (HTTP 200)') && argOut.includes('Book.epub'));
+        // Shelfmark v1.5.1 specification: ALWAYS passes $1 AND pipes nested JSON to stdin
+        const nestedPayload = {
+          version: 1,
+          phase: 'post_transfer',
+          task: {
+            task_id: 'task-simultaneous-1',
+            source: 'annas',
+            title: 'Foundation',
+            author: 'Isaac Asimov',
+          },
+          output: {
+            mode: 'folder',
+            organization_mode: 'organize',
+          },
+          paths: {
+            destination: testDir,
+            target: validEpub,
+            final_paths: [validEpub],
+          },
+        };
 
-        // Mode 2: Stdin JSON mode (CUSTOM_SCRIPT_JSON_PAYLOAD=true)
-        const stdinOut = await new Promise((resolve, reject) => {
-          const child = execFile('scripts/shelfmark-hook.sh', [], {
+        const stdout = await new Promise((resolve, reject) => {
+          const child = execFile('scripts/shelfmark-hook.sh', [validEpub], {
             env: { ...process.env, BRIDGE_WEBHOOK_URL: 'http://localhost:8098/webhook', BRIDGE_SECRET: 'test-hook-secret' },
-          }, (err, stdout) => {
+          }, (err, out) => {
             if (err) reject(err);
-            else resolve(stdout);
+            else resolve(out);
           });
-          child.stdin.write(JSON.stringify({ task_id: 'task-hook-stdin', status: 'completed', format: 'epub' }));
+          child.stdin.write(JSON.stringify(nestedPayload));
           child.stdin.end();
         });
-        ok('shelfmark hook executes in stdin JSON mode', stdinOut.includes('Success (HTTP 200)') && stdinOut.includes('task-hook-stdin'));
+
+        ok('shelfmark hook delivers simultaneously passed $1 and nested stdin JSON', stdout.includes('Successfully notified'));
+        ok('delivered payload contains Shelfmark nested task_id', receivedBody.task?.task_id === 'task-simultaneous-1');
+        ok('delivered payload contains Shelfmark paths.target', receivedBody.paths?.target === validEpub);
+        ok('sent correct X-Bridge-Secret authentication header', receivedHeaders['x-bridge-secret'] === 'test-hook-secret');
       } finally {
         await new Promise((resolve) => hookServer.close(resolve));
       }
+    }
+
+    // Test B10: Safe delivery when companion service is unavailable (Exit code 0 to protect Shelfmark task state)
+    {
+      const validEpub = join(testDir, 'valid.epub');
+      // Point to closed port 8097 where nothing is listening
+      const exitCode = await new Promise((resolve) => {
+        const child = execFile('scripts/shelfmark-hook.sh', [validEpub], {
+          env: { ...process.env, BRIDGE_WEBHOOK_URL: 'http://localhost:8097/webhook', BRIDGE_SECRET: 'test-secret' },
+        }, (err) => {
+          resolve(err ? err.code : 0);
+        });
+        child.stdin.write(JSON.stringify({ version: 1, task: { task_id: 'offline-task' } }));
+        child.stdin.end();
+      });
+
+      ok('shelfmark hook exits 0 when companion bridge is offline to preserve Shelfmark completed task', exitCode === 0);
     }
   } finally {
     // Cleanup temporary test files
