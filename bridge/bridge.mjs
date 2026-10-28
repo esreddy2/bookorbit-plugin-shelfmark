@@ -363,7 +363,8 @@ export class BookOrbitSocketClient {
       try {
         const handshake = JSON.parse(data.slice(1));
         const pingInterval = handshake.pingInterval || 25000;
-        this.setupPing(pingInterval);
+        const pingTimeout = handshake.pingTimeout || 20000;
+        this.resetHeartbeatWatchdog(pingInterval, pingTimeout);
 
         // Send Socket.IO connect packet for /book-requests namespace with auth token
         const connectPacket = `40/book-requests,${JSON.stringify({ token: this.token })}`;
@@ -372,9 +373,16 @@ export class BookOrbitSocketClient {
       return;
     }
 
-    // Engine.IO packet 2: Ping from server -> reply with Pong ('3')
+    // Engine.IO packet 2: Ping from server -> reply with Pong ('3') and reset watchdog
     if (data === '2') {
       try { this.ws.send('3'); } catch {}
+      this.resetHeartbeatWatchdog();
+      return;
+    }
+
+    // Engine.IO packet 3: Pong from server
+    if (data === '3') {
+      this.resetHeartbeatWatchdog();
       return;
     }
 
@@ -419,19 +427,37 @@ export class BookOrbitSocketClient {
     }
   }
 
-  setupPing(interval) {
+  /**
+   * Engine.IO v4 heartbeat watchdog:
+   * The server sends PING ('2') every pingInterval ms.
+   * Client replies with PONG ('3').
+   * If no server PING is received within (pingInterval + pingTimeout) ms,
+   * the client marks the connection dead and schedules reconnect.
+   * The client NEVER sends unsolicited PING ('2') packets in Engine.IO v4.
+   */
+  resetHeartbeatWatchdog(interval = this.pingInterval, timeout = this.pingTimeout) {
+    if (interval) this.pingInterval = interval;
+    if (timeout) this.pingTimeout = timeout;
     this.clearPingTimer();
-    this.pingTimer = setInterval(() => {
-      if (this.ws && this.ws.readyState === WebSocket.OPEN) {
-        try { this.ws.send('2'); } catch {}
+    const allowedSilenceMs = (this.pingInterval || 25000) + (this.pingTimeout || 20000);
+    this.pingTimer = setTimeout(() => {
+      console.warn('[SocketClient] Server heartbeat timeout (no ping received). Reconnecting...');
+      this.isConnected = false;
+      if (this.ws) {
+        try { this.ws.close(); } catch {}
       }
-    }, interval);
+    }, allowedSilenceMs);
     if (this.pingTimer.unref) this.pingTimer.unref();
+  }
+
+  setupPing(interval) {
+    // Engine.IO v4 compatibility: monitor server heartbeat without sending unsolicited pings
+    this.resetHeartbeatWatchdog(interval);
   }
 
   clearPingTimer() {
     if (this.pingTimer) {
-      clearInterval(this.pingTimer);
+      clearTimeout(this.pingTimer);
       this.pingTimer = null;
     }
   }
@@ -475,6 +501,9 @@ export class BridgeService {
     this.dockReadinessAttempts = options.dockReadinessAttempts || 25;
     this.dockReadinessIntervalMs = options.dockReadinessIntervalMs || 100;
     this.reconcileIntervalMs = options.reconcileIntervalMs || 15 * 60 * 1000; // 15 minutes
+    this.fileVisibilityAttempts = options.fileVisibilityAttempts ?? 10;
+    this.fileVisibilityDelayMs = options.fileVisibilityDelayMs ?? 200;
+    this.fileVisibilityBackoff = options.fileVisibilityBackoff ?? 1.5;
 
     // Path translation & containment
     this.shelfmarkPathPrefix = options.shelfmarkPathPrefix || process.env.SHELFMARK_PATH_PREFIX || '';
@@ -735,17 +764,17 @@ export class BridgeService {
   verifyFile(rawFilePath, expectedFormat) {
     const safePath = this.resolvePath(rawFilePath);
     if (!safePath) {
-      return { ok: false, error: `Invalid or disallowed file path: ${rawFilePath}` };
+      return { ok: false, notFound: true, error: `Invalid or disallowed file path: ${rawFilePath}` };
     }
     let stats;
     try {
       stats = fs.statSync(safePath);
     } catch (err) {
-      return { ok: false, error: `Failed to stat file: ${err.message}` };
+      return { ok: false, notFound: true, error: `Failed to stat file: ${err.message}` };
     }
 
     if (stats.size === 0) {
-      return { ok: false, error: `File is 0 bytes: ${safePath}` };
+      return { ok: false, notFound: true, error: `File is 0 bytes: ${safePath}` };
     }
 
     const fmt = (expectedFormat || path.extname(safePath).replace('.', '')).toLowerCase();
@@ -778,6 +807,31 @@ export class BridgeService {
     }
 
     return { ok: true, safePath, sizeBytes: stats.size };
+  }
+
+  /**
+   * Verifies file with bounded retries and exponential backoff.
+   * Handles transient missing-file or filesystem-visibility delays across container mounts
+   * without loosening canonical path containment or magic byte checks.
+   */
+  async verifyFileWithRetry(rawFilePath, expectedFormat, {
+    attempts = this.fileVisibilityAttempts,
+    delayMs = this.fileVisibilityDelayMs,
+    backoff = this.fileVisibilityBackoff,
+  } = {}) {
+    let lastResult = null;
+    let currentDelay = delayMs;
+    for (let attempt = 0; attempt < attempts; attempt++) {
+      lastResult = this.verifyFile(rawFilePath, expectedFormat);
+      if (lastResult.ok) {
+        return lastResult;
+      }
+      if (attempt < attempts - 1) {
+        await new Promise((resolve) => setTimeout(resolve, currentDelay));
+        currentDelay = Math.round(currentDelay * backoff);
+      }
+    }
+    return lastResult;
   }
 
   /**
@@ -894,16 +948,9 @@ export class BridgeService {
           if (req.status !== 'approved') continue;
           if (req.mediaKind && req.mediaKind !== 'ebook') continue;
 
-          // 3. Skip if already tracked
+          // 3. Skip if already tracked (never blindly requeue on Socket.IO broadcasts)
           if (this.state.requests[req.id]) {
-            const existingTaskId = this.state.requests[req.id];
-            if (existingTaskId === 'uncertain') {
-              continue;
-            }
-            const existingTask = this.state.tasks[existingTaskId];
-            if (existingTask && existingTask.status !== 'failed') {
-              continue;
-            }
+            continue;
           }
 
           // 4. Search releases using corrected plugin logic
@@ -1009,7 +1056,7 @@ export class BridgeService {
       existing.updatedAt = new Date().toISOString();
       this.saveState();
 
-      if (existing.status === 'completed' && existing.filePath) {
+      if ((existing.status === 'completed' || existing.status === 'fulfilled') && existing.filePath) {
         const verify = this.verifyFile(existing.filePath, existing.format);
         if (verify.ok) {
           return {
@@ -1021,7 +1068,7 @@ export class BridgeService {
         }
       }
 
-      if (existing.status === 'queued' || existing.status === 'downloading') {
+      if (existing.status === 'queued' || existing.status === 'downloading' || existing.status === 'awaiting_file') {
         return {
           status: 'in_progress',
           taskId: existingTaskId,
@@ -1193,17 +1240,25 @@ export class BridgeService {
     const title = taskObj.title || payload.title;
     const format = taskObj.format || payload.format || (rawTarget ? path.extname(rawTarget).replace('.', '') : 'epub');
 
-    let task = taskId ? this.state.tasks[taskId] : null;
+    let task = taskId ? (this.state.tasks[taskId] || this.state.tasks[String(taskId)]) : null;
 
     if (!task && (title || rawTarget)) {
-      const candTitle = (title || path.basename(rawTarget || '')).trim().toLowerCase();
+      const rawBase = path.basename(rawTarget || '').replace(/\.[^/.]+$/, '').trim().toLowerCase();
+      const candTitle = (title || rawBase).trim().toLowerCase();
+      const matchingTasks = [];
       for (const t of Object.values(this.state.tasks)) {
-        if (t.status !== 'completed' && t.status !== 'fulfilled' && t.format === format.toLowerCase()) {
-          if (candTitle.includes((t.title || '').trim().toLowerCase())) {
-            task = t;
-            break;
+        if (t.status === 'queued' || t.status === 'downloading' || t.status === 'awaiting_file') {
+          const tTitle = (t.title || '').trim().toLowerCase();
+          const fmtMatch = !format || (t.format || '').toLowerCase() === format.toLowerCase();
+          if (fmtMatch && (tTitle === candTitle || rawBase === tTitle || rawBase.startsWith(tTitle + '_') || rawBase.startsWith(tTitle + ' '))) {
+            matchingTasks.push(t);
           }
         }
+      }
+      if (matchingTasks.length === 1) {
+        task = matchingTasks[0];
+      } else if (matchingTasks.length > 1) {
+        console.warn(`[Bridge] Ambiguous task match for "${candTitle}": multiple candidate tasks found. Refusing to guess.`);
       }
     }
 
@@ -1212,13 +1267,33 @@ export class BridgeService {
       return { ok: true, statusCode: 200, message: 'Webhook received for unassociated task' };
     }
 
-    // Strict file verification & containment
+    // Strict file verification & containment with bounded visibility retries
     const targetFile = rawTarget || task.filePath;
-    const verification = this.verifyFile(targetFile, task.format);
+    const verification = await this.verifyFileWithRetry(targetFile, task.format);
     if (!verification.ok) {
+      if (verification.notFound) {
+        console.warn(`[Bridge] File not visible for task ${task.taskId}: ${verification.error}. Preserving recoverable awaiting_file state.`);
+        task.status = 'awaiting_file';
+        task.filePath = targetFile;
+        task.error = verification.error;
+        task.errorSource = 'companion_verification';
+        task.updatedAt = new Date().toISOString();
+        this.saveState();
+        return {
+          ok: true,
+          statusCode: 200,
+          status: 'awaiting_file',
+          taskId: task.taskId,
+          filePath: targetFile,
+          requestIds: task.requestIds,
+          message: `File not yet visible: ${verification.error}. Preserved as awaiting_file for subsequent reconciliation.`,
+        };
+      }
+
       console.error(`[Bridge] File verification failed for task ${task.taskId}: ${verification.error}`);
       task.status = 'failed';
       task.error = verification.error;
+      task.errorSource = 'companion_verification';
       task.updatedAt = new Date().toISOString();
       this.saveState();
       return {
@@ -1231,6 +1306,8 @@ export class BridgeService {
     task.filePath = verification.safePath;
     task.sizeBytes = verification.sizeBytes;
     task.status = 'completed';
+    task.error = null;
+    task.errorSource = null;
     task.updatedAt = new Date().toISOString();
     this.saveState();
 
@@ -1274,12 +1351,12 @@ export class BridgeService {
     };
 
     let bookDockFileId = task.dockFileId || null;
-    let matchedBookId = task.matchedBookId || null;
-    let readyToFinalize = false;
-    let isAlreadyFinalized = false;
+    let matchedBookId = parsePositiveInt(task.matchedBookId) || null;
+    let readyToFinalize = Boolean(matchedBookId);
+    let isAlreadyFinalized = Boolean(matchedBookId);
 
-    // Step 1: Ingest file into Book Dock if not already uploaded
-    if (!bookDockFileId) {
+    // Step 1: Ingest file into Book Dock if not already uploaded and not already finalized
+    if (!bookDockFileId && !matchedBookId) {
       try {
         if (!task.filePath) {
           throw new Error('Task filePath is missing');
@@ -1322,12 +1399,12 @@ export class BridgeService {
       }
     }
 
-    if (!bookDockFileId) {
+    if (!bookDockFileId && !matchedBookId) {
       return { fulfilled: false, error: 'Book Dock file ID could not be obtained' };
     }
 
     // Step 2: Wait for upload to reach a genuinely finalizable state (ready_to_file) or adopt already-filed file
-    if (!readyToFinalize) {
+    if (!readyToFinalize && !matchedBookId) {
       try {
         for (let attempt = 0; attempt < this.dockReadinessAttempts; attempt++) {
           const checkRes = await fetchFn(`${boUrl}/api/v1/book-dock/files/${bookDockFileId}`, { headers });
@@ -1368,7 +1445,7 @@ export class BridgeService {
     }
 
     // Fail closed: Never finalize a still-processing file!
-    if (!readyToFinalize && !isAlreadyFinalized) {
+    if (!readyToFinalize && !isAlreadyFinalized && !matchedBookId) {
       task.status = 'finalization_failed';
       task.error = `Book Dock file ${bookDockFileId} timed out waiting for ready_to_file state (still processing)`;
       this.saveState();
@@ -1497,6 +1574,13 @@ export class BridgeService {
   async reconcile({ fetchFn = globalThis.fetch } = {}) {
     // 1. Reconcile pending BookOrbit requests
     if (this.bookorbitUrl) {
+      if (!this.state.baselineEstablishedAt) {
+        const baselineResult = await this.initializeBaseline({ fetchFn });
+        if (!baselineResult.established || !this.state.baselineEstablishedAt) {
+          console.warn('[Bridge] Baseline not established. Halting reconciliation until baseline succeeds.');
+          return { ok: false, error: 'Baseline not established' };
+        }
+      }
       await this.processPendingRequests({ fetchFn }).catch((err) => {
         console.warn(`[Bridge] Reconciliation request scan error: ${sanitizeLog(err.message)}`);
       });
@@ -1533,12 +1617,13 @@ export class BridgeService {
         }) || candidates.find((t) => {
           const titleMatch = (t.title || '').trim().toLowerCase() === (unrec.release?.title || '').trim().toLowerCase();
           const formatMatch = (t.format || '').toLowerCase() === (unrec.release?.format || '').toLowerCase();
-          return titleMatch && formatMatch;
+          const authorMatch = !unrec.release?.author || !t.author || ((t.author || '').toLowerCase().includes(unrec.release.author.toLowerCase()) || unrec.release.author.toLowerCase().includes((t.author || '').toLowerCase()));
+          return titleMatch && formatMatch && authorMatch;
         });
 
         if (matched) {
           const realTaskId = matched.id || matched.task_id;
-          const isComplete = parsedStatus.complete.some((c) => (c.id || c.task_id) === realTaskId);
+          const isComplete = parsedStatus.complete.some((c) => String(c.id || c.task_id) === String(realTaskId));
           const taskRecord = {
             taskId: realTaskId,
             releaseKey: rKey,
@@ -1568,46 +1653,80 @@ export class BridgeService {
       }
     }
 
-    // 4. Correlate tracked active/queued tasks against complete and error groups
+    // 4. Correlate tracked tasks against complete and error groups
     const completedMap = new Map();
     for (const t of parsedStatus.complete) {
       const id = t.id || t.task_id;
-      if (id) completedMap.set(id, t);
+      if (id !== undefined && id !== null) completedMap.set(String(id), t);
     }
 
     const failedMap = new Map();
     for (const t of parsedStatus.error) {
       const id = t.id || t.task_id;
-      if (id) failedMap.set(id, t);
+      if (id !== undefined && id !== null) failedMap.set(String(id), t);
     }
 
     for (const task of Object.values(this.state.tasks)) {
-      if (task.status === 'queued' || task.status === 'downloading') {
-        if (completedMap.has(task.taskId)) {
-          const smTask = completedMap.get(task.taskId);
-          const candidatePath = smTask.download_path || smTask.file_path || smTask.target || smTask.paths?.target || smTask.final_paths?.[0] || task.filePath;
-          if (candidatePath) {
-            const verify = this.verifyFile(candidatePath, task.format);
-            if (verify.ok) {
-              task.status = 'completed';
-              task.filePath = verify.safePath;
-              task.sizeBytes = verify.sizeBytes;
+      if (task.status === 'fulfilled') {
+        continue;
+      }
+
+      const taskIdStr = String(task.taskId);
+
+      if (completedMap.has(taskIdStr)) {
+        // Shelfmark positively reports completion for this exact task ID!
+        // Recovers tasks in 'queued', 'downloading', 'awaiting_file', 'completed', 'finalization_failed',
+        // or earlier 'failed' (from transient verification failure)
+        const smTask = completedMap.get(taskIdStr);
+        const candidatePath = smTask.download_path || smTask.file_path || smTask.target || smTask.paths?.target || smTask.final_paths?.[0] || task.filePath;
+        if (candidatePath) {
+          const verify = this.verifyFile(candidatePath, task.format);
+          if (verify.ok) {
+            task.status = 'completed';
+            task.filePath = verify.safePath;
+            task.sizeBytes = verify.sizeBytes;
+            task.error = null;
+            task.errorSource = null;
+            task.updatedAt = now;
+            if (task.releaseKey) {
+              this.state.releases[task.releaseKey] = task.taskId;
+            }
+            updatedCount++;
+
+            if (this.bookorbitUrl) {
+              await this.fulfillBookOrbitRequests(task, fetchFn);
+            }
+          } else {
+            // Completed by Shelfmark, but file is not yet visible / verifiable
+            if (task.status !== 'awaiting_file') {
+              task.status = 'awaiting_file';
+              task.filePath = candidatePath;
+              task.error = verify.error;
+              task.errorSource = 'companion_verification';
               task.updatedAt = now;
               updatedCount++;
-
-              if (this.bookorbitUrl) {
-                await this.fulfillBookOrbitRequests(task, fetchFn);
-              }
             }
           }
-        } else if (failedMap.has(task.taskId)) {
-          task.status = 'failed';
-          task.error = failedMap.get(task.taskId)?.error || failedMap.get(task.taskId)?.message || 'Shelfmark reported failure';
-          task.updatedAt = now;
-          if (task.releaseKey && this.state.releases[task.releaseKey] === task.taskId) {
-            delete this.state.releases[task.releaseKey];
+        }
+      } else if (failedMap.has(taskIdStr)) {
+        // Shelfmark genuinely reports failure for this task ID!
+        const smError = failedMap.get(taskIdStr);
+        task.status = 'failed';
+        task.error = smError?.error || smError?.message || 'Shelfmark reported failure';
+        task.errorSource = 'shelfmark';
+        task.updatedAt = now;
+        if (task.releaseKey && this.state.releases[task.releaseKey] === task.taskId) {
+          delete this.state.releases[task.releaseKey];
+        }
+        updatedCount++;
+      } else if (task.status === 'completed' || task.status === 'finalization_failed') {
+        // Task was completed and verified, but Book Dock finalization or fulfillment failed mid-flight
+        if (task.filePath && this.bookorbitUrl) {
+          const verify = this.verifyFile(task.filePath, task.format);
+          if (verify.ok) {
+            await this.fulfillBookOrbitRequests(task, fetchFn);
+            updatedCount++;
           }
-          updatedCount++;
         }
       }
     }
@@ -1621,8 +1740,14 @@ export class BridgeService {
 
   /**
    * Starts periodic reconciliation loop.
+   * Runs an immediate reconciliation on startup by default, then falls back to periodic interval.
    */
-  startReconciliation() {
+  startReconciliation({ runImmediately = true } = {}) {
+    if (runImmediately) {
+      this.reconcile().catch((err) => {
+        console.warn(`[Bridge] Initial startup reconciliation error: ${sanitizeLog(err.message)}`);
+      });
+    }
     if (this.reconcileTimer) return;
     this.reconcileTimer = setInterval(() => {
       this.reconcile().catch((err) => {

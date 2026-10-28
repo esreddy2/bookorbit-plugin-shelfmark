@@ -110,7 +110,7 @@ async function runTests() {
   ok('preferFormat defaults to epub', plugin.settingsFields.find((f) => f.key === 'preferFormat')?.default === 'epub');
   ok('defines downloadViaShelfmark toggle', plugin.settingsFields.some((f) => f.key === 'downloadViaShelfmark'));
   ok('defines pollTimeoutSeconds defaulting to 240', plugin.settingsFields.find((f) => f.key === 'pollTimeoutSeconds')?.default === 240);
-  ok('declares semantic version 1.5.2', plugin.version === '1.5.2');
+  ok('declares semantic version 1.5.3', plugin.version === '1.5.3');
   ok('declares update channel', typeof plugin.update === 'object' && plugin.update !== null);
   ok('update manifestUrl is HTTPS and points to fork repo', typeof plugin.update?.manifestUrl === 'string' && plugin.update.manifestUrl.includes('esreddy2/bookorbit-plugin-shelfmark'));
   ok('update ed25519PublicKey is 43-char base64url', /^[A-Za-z0-9_-]{43}$/.test(plugin.update?.ed25519PublicKey ?? ''));
@@ -3038,6 +3038,420 @@ async function runTests() {
       // 5. parsePositiveInt validation helper
       ok('parsePositiveInt accepts positive integers', parsePositiveInt(1) === 1 && parsePositiveInt('42') === 42);
       ok('parsePositiveInt rejects zero, negative numbers, decimals, and non-numeric values', parsePositiveInt(0) === null && parsePositiveInt(-5) === null && parsePositiveInt(1.5) === null && parsePositiveInt('abc') === null && parsePositiveInt(null) === null);
+    }
+
+    // Test B28: Real Production Failure Sequence & Lifecycle Recovery (v1.5.3)
+    {
+      const b28StateFile = join(testDir, '.bridge-b28-state.json');
+      const bridge = new BridgeService({
+        stateFilePath: b28StateFile,
+        secret: 'test-secret',
+        bookorbitUrl: 'http://bookorbit:8080',
+        bookorbitApiKey: 'bo-key',
+        shelfmarkUrl: 'http://shelfmark:8084',
+        shelfmarkApiKey: 'sm-key',
+        allowedBaseDirs: [testDir],
+        fileVisibilityAttempts: 4,
+        fileVisibilityDelayMs: 25,
+        defaultLibraryId: 10,
+        defaultFolderId: 20,
+      });
+
+      // Establish baseline to satisfy fail-closed safety
+      bridge.state.baselineEstablishedAt = new Date().toISOString();
+      bridge.state.baselineRequestIds = { 'historical-1': true };
+      bridge.saveState();
+
+      const delayedFile = join(testDir, 'Animal Farm_1.epub');
+      const fahrenheitFile = join(testDir, 'Fahrenheit 451_3.epub');
+      const validEpubBytes = Buffer.from([0x50, 0x4b, 0x03, 0x04, 0x0a, 0x00, 0x00, 0x00]);
+
+      // 1. Webhook arrives before completed file becomes visible; file appears after short delay and succeeds
+      bridge.state.tasks['task-delayed'] = {
+        taskId: 'task-delayed',
+        title: 'Animal Farm',
+        format: 'epub',
+        status: 'queued',
+        filePath: null,
+        dockFileId: null,
+        matchedBookId: null,
+        requestIds: [32],
+        userIds: [1],
+        libraryId: 10,
+        folderId: 20,
+      };
+      bridge.state.requests[32] = 'task-delayed';
+      bridge.saveState();
+
+      // Ensure file does not exist initially
+      if (existsSync(delayedFile)) unlinkSync(delayedFile);
+
+      // Write file after 40ms (during retry window)
+      setTimeout(() => {
+        writeFileSync(delayedFile, validEpubBytes);
+      }, 40);
+
+      const fakeFulfillFetch = async (url) => {
+        if (url.includes('/api/v1/book-dock/upload')) {
+          return mockResponse({ id: 801, status: 'ready_to_file' });
+        }
+        if (url.includes('/api/v1/book-dock/finalize')) {
+          return mockResponse({ results: [{ fileId: 801, success: true, bookId: 101 }] });
+        }
+        if (url.includes('/fulfill')) {
+          return mockResponse({ id: 32, status: 'AVAILABLE' });
+        }
+        return mockResponse({});
+      };
+
+      const webhookRes = await bridge.handleWebhook({
+        task: { task_id: 'task-delayed', title: 'Animal Farm', format: 'epub' },
+        paths: { target: delayedFile },
+      }, 'test-secret', fakeFulfillFetch);
+
+      ok('webhook arrives before completed file becomes visible and succeeds after delay', webhookRes.ok === true && webhookRes.fulfilled === true);
+      ok('delayed file task transitions to fulfilled after visibility retry and fulfillment', bridge.state.tasks['task-delayed'].status === 'fulfilled');
+      ok('delayed file task preserves original request ID and library/folder IDs', bridge.state.tasks['task-delayed'].requestIds[0] === 32 && bridge.state.tasks['task-delayed'].libraryId === 10 && bridge.state.tasks['task-delayed'].folderId === 20);
+
+      // 2. File remains missing; task stays recoverable in awaiting_file state without failing hook
+      const missingFilePath = join(testDir, 'NeverAppearing.epub');
+      bridge.state.tasks['task-missing'] = {
+        taskId: 'task-missing',
+        title: 'Missing Book',
+        format: 'epub',
+        status: 'queued',
+        filePath: null,
+        dockFileId: null,
+        matchedBookId: null,
+        requestIds: [33],
+        userIds: [1],
+        libraryId: 10,
+        folderId: 20,
+      };
+      bridge.state.requests[33] = 'task-missing';
+      bridge.saveState();
+
+      const webhookMissingRes = await bridge.handleWebhook({
+        task: { task_id: 'task-missing', title: 'Missing Book', format: 'epub' },
+        paths: { target: missingFilePath },
+      }, 'test-secret');
+
+      ok('file remains missing returns HTTP 200 with awaiting_file status so Shelfmark hook exits 0', webhookMissingRes.ok === true && webhookMissingRes.statusCode === 200 && webhookMissingRes.status === 'awaiting_file');
+      ok('task transitions to recoverable awaiting_file state', bridge.state.tasks['task-missing'].status === 'awaiting_file' && bridge.state.tasks['task-missing'].filePath === missingFilePath);
+
+      // File appears later; reconciliation recovers it
+      writeFileSync(missingFilePath, validEpubBytes);
+      const fakeStatusWithMissingNowComplete = {
+        complete: {
+          'task-missing': {
+            id: 'task-missing',
+            title: 'Missing Book',
+            format: 'epub',
+            target: missingFilePath,
+          },
+        },
+        downloading: {},
+        queued: {},
+        error: {},
+      };
+
+      const reconcileRecoverRes = await bridge.reconcile({
+        fetchFn: async (url) => {
+          if (url.includes('/api/status')) return mockResponse(fakeStatusWithMissingNowComplete);
+          if (url.includes('/api/v1/book-dock/upload')) return mockResponse({ id: 802, status: 'ready_to_file' });
+          if (url.includes('/api/v1/book-dock/finalize')) return mockResponse({ results: [{ fileId: 802, success: true, bookId: 102 }] });
+          if (url.includes('/fulfill')) return mockResponse({ id: 33, status: 'AVAILABLE' });
+          return mockResponse({});
+        },
+      });
+
+      ok('reconciliation safely recovers task from awaiting_file state once file appears', reconcileRecoverRes.ok === true && bridge.state.tasks['task-missing'].status === 'fulfilled');
+
+      // 3. Completed Shelfmark task with companion in queued state (exact production bug for requests #31 and #32)
+      writeFileSync(fahrenheitFile, validEpubBytes);
+      const prodTaskFahrenheit = '0b2a56a29733af39836d73b46dbfac73';
+      bridge.state.tasks[prodTaskFahrenheit] = {
+        taskId: prodTaskFahrenheit,
+        title: 'Fahrenheit 451',
+        format: 'epub',
+        status: 'queued', // Companion still queued when Shelfmark complete!
+        filePath: null,
+        dockFileId: null,
+        matchedBookId: null,
+        requestIds: [31],
+        userIds: [2],
+        libraryId: 10,
+        folderId: 20,
+      };
+      bridge.state.requests[31] = prodTaskFahrenheit;
+      bridge.saveState();
+
+      const prodStatusKeyed = {
+        complete: {
+          [prodTaskFahrenheit]: {
+            id: prodTaskFahrenheit,
+            title: 'Fahrenheit 451',
+            format: 'epub',
+            paths: { target: fahrenheitFile },
+          },
+        },
+        downloading: {},
+        queued: {},
+        error: {},
+      };
+
+      await bridge.reconcile({
+        fetchFn: async (url) => {
+          if (url.includes('/api/status')) return mockResponse(prodStatusKeyed);
+          if (url.includes('/api/v1/book-dock/upload')) return mockResponse({ id: 803, status: 'ready_to_file' });
+          if (url.includes('/api/v1/book-dock/finalize')) return mockResponse({ results: [{ fileId: 803, success: true, bookId: 103 }] });
+          if (url.includes('/fulfill')) return mockResponse({ id: 31, status: 'AVAILABLE' });
+          return mockResponse({});
+        },
+      });
+
+      ok('completed Shelfmark task with companion queued recovers and fulfills successfully', bridge.state.tasks[prodTaskFahrenheit].status === 'fulfilled');
+      ok('preserves original request ID 31 on fulfilled task', bridge.state.tasks[prodTaskFahrenheit].requestIds[0] === 31);
+
+      // 4. Completed Shelfmark task with companion failed due only to previous file verification
+      const prevFailedTask = 'task-prev-failed';
+      bridge.state.tasks[prevFailedTask] = {
+        taskId: prevFailedTask,
+        title: 'Recovered Novel',
+        format: 'epub',
+        status: 'failed',
+        error: 'Invalid or disallowed file path: /books/Recovered Novel.epub',
+        errorSource: 'companion_verification',
+        filePath: delayedFile,
+        dockFileId: null,
+        matchedBookId: null,
+        requestIds: [34],
+        userIds: [1],
+        libraryId: 10,
+        folderId: 20,
+      };
+      bridge.state.requests[34] = prevFailedTask;
+      bridge.saveState();
+
+      const statusWithPrevFailedComplete = {
+        complete: {
+          [prevFailedTask]: {
+            id: prevFailedTask,
+            title: 'Recovered Novel',
+            format: 'epub',
+            file_path: delayedFile,
+          },
+        },
+        downloading: {},
+        queued: {},
+        error: {},
+      };
+
+      await bridge.reconcile({
+        fetchFn: async (url) => {
+          if (url.includes('/api/status')) return mockResponse(statusWithPrevFailedComplete);
+          if (url.includes('/api/v1/book-dock/upload')) return mockResponse({ id: 804, status: 'ready_to_file' });
+          if (url.includes('/api/v1/book-dock/finalize')) return mockResponse({ results: [{ fileId: 804, success: true, bookId: 104 }] });
+          if (url.includes('/fulfill')) return mockResponse({ id: 34, status: 'AVAILABLE' });
+          return mockResponse({});
+        },
+      });
+
+      ok('completed Shelfmark task with companion failed due to file verification recovers and fulfills', bridge.state.tasks[prevFailedTask].status === 'fulfilled');
+
+      // 5. Completed task where Book Dock upload succeeded but fulfillment didn't (preserves upload and finalize IDs)
+      const uploadOnlyTask = 'task-upload-only';
+      bridge.state.tasks[uploadOnlyTask] = {
+        taskId: uploadOnlyTask,
+        title: 'Midflight Book',
+        format: 'epub',
+        status: 'completed',
+        filePath: delayedFile,
+        dockFileId: 855, // Upload already succeeded!
+        matchedBookId: null,
+        requestIds: [35],
+        userIds: [1],
+        libraryId: 10,
+        folderId: 20,
+      };
+      bridge.state.requests[35] = uploadOnlyTask;
+      bridge.saveState();
+
+      let uploadCalledForMidflight = false;
+      let finalizeCalledForMidflight = false;
+      let fulfillCalledForMidflight = false;
+
+      const fakeBoMidflight = async (url) => {
+        if (url.includes('/api/v1/book-dock/upload')) {
+          uploadCalledForMidflight = true;
+          return mockResponse({});
+        }
+        if (url.includes('/api/v1/book-dock/files/855')) {
+          return mockResponse({ id: 855, status: 'ready_to_file' });
+        }
+        if (url.includes('/api/v1/book-dock/finalize')) {
+          finalizeCalledForMidflight = true;
+          return mockResponse({ results: [{ fileId: 855, success: true, bookId: 105 }] });
+        }
+        if (url.includes('/fulfill')) {
+          fulfillCalledForMidflight = true;
+          return mockResponse({ id: 35, status: 'AVAILABLE' });
+        }
+        return mockResponse({});
+      };
+
+      await bridge.fulfillBookOrbitRequests(bridge.state.tasks[uploadOnlyTask], fakeBoMidflight);
+
+      ok('does NOT upload second copy when dockFileId is already preserved', !uploadCalledForMidflight);
+      ok('finalizes existing dockFileId and fulfills request', finalizeCalledForMidflight && fulfillCalledForMidflight);
+      ok('task transitions to fulfilled with preserved dockFileId and matchedBookId', bridge.state.tasks[uploadOnlyTask].status === 'fulfilled' && bridge.state.tasks[uploadOnlyTask].dockFileId === 855 && bridge.state.tasks[uploadOnlyTask].matchedBookId === 105);
+
+      // Now verify that if matchedBookId was already set, neither upload nor finalize is called!
+      let uploadCalledAgain = false;
+      let finalizeCalledAgain = false;
+      let fulfillCalledAgain = false;
+      bridge.state.tasks[uploadOnlyTask].status = 'completed'; // reset to simulate fulfillment retry
+      const fakeBoFulfillRetry = async (url) => {
+        if (url.includes('/api/v1/book-dock/upload')) uploadCalledAgain = true;
+        if (url.includes('/api/v1/book-dock/finalize')) finalizeCalledAgain = true;
+        if (url.includes('/fulfill')) {
+          fulfillCalledAgain = true;
+          return mockResponse({ id: 35, status: 'AVAILABLE' });
+        }
+        return mockResponse({});
+      };
+      await bridge.fulfillBookOrbitRequests(bridge.state.tasks[uploadOnlyTask], fakeBoFulfillRetry);
+      ok('does NOT call upload or finalize again when matchedBookId is already preserved', !uploadCalledAgain && !finalizeCalledAgain && fulfillCalledAgain);
+
+      // 6. Companion restart immediately reconciles pending completed jobs
+      let initialReconcileRan = false;
+      const restartBridge = new BridgeService({
+        stateFilePath: b28StateFile,
+        allowedBaseDirs: [testDir],
+      });
+      restartBridge.reconcile = async () => {
+        initialReconcileRan = true;
+        return { ok: true, updatedCount: 1 };
+      };
+      restartBridge.startReconciliation({ runImmediately: true });
+      ok('companion restart immediately reconciles pending completed jobs without waiting 15 minutes', initialReconcileRan === true);
+      restartBridge.stop();
+
+      // 7. Several Socket.IO events do not requeue the same release
+      let downloadPostCount = 0;
+      const fakeFetchWithPostCounter = async (url, opts = {}) => {
+        if (url.includes('/api/releases/download')) {
+          downloadPostCount++;
+          return mockResponse({ task_id: 'sm-should-not-be-called' });
+        }
+        if (url.includes('/api/v1/admin/book-requests')) {
+          return mockResponse({
+            items: [
+              { id: 32, status: 'approved', title: 'Animal Farm', mediaKind: 'ebook' },
+              { id: 31, status: 'approved', title: 'Fahrenheit 451', mediaKind: 'ebook' },
+            ],
+            total: 2,
+          });
+        }
+        return mockResponse({});
+      };
+
+      // Both requests 31 and 32 are tracked in bridge.state.requests
+      await bridge.processPendingRequests({ fetchFn: fakeFetchWithPostCounter });
+      await bridge.processPendingRequests({ fetchFn: fakeFetchWithPostCounter });
+      await bridge.processPendingRequests({ fetchFn: fakeFetchWithPostCounter });
+
+      ok('several Socket.IO events do not requeue the same release', downloadPostCount === 0);
+
+      // 8. Shelfmark genuinely reports error; no unrelated file is adopted
+      const errorTaskId = 'oceanofpdf:145751b6b720f7ac36f0a514a2ff8fdc';
+      bridge.state.tasks[errorTaskId] = {
+        taskId: errorTaskId,
+        title: '1984',
+        format: 'epub',
+        status: 'queued',
+        filePath: null,
+        dockFileId: null,
+        matchedBookId: null,
+        requestIds: [30],
+        userIds: [3],
+        libraryId: 10,
+        folderId: 20,
+      };
+      bridge.state.requests[30] = errorTaskId;
+      bridge.saveState();
+
+      const prodErrorKeyedStatus = {
+        complete: {
+          'unrelated-task-99': {
+            id: 'unrelated-task-99',
+            title: '1984: Graphic Novel Edition',
+            format: 'epub',
+            target: delayedFile,
+          },
+        },
+        downloading: {},
+        queued: {},
+        error: {
+          [errorTaskId]: {
+            id: errorTaskId,
+            title: '1984',
+            format: 'epub',
+            error: 'OceanofPDF mirror unavailable',
+          },
+        },
+      };
+
+      await bridge.reconcile({
+        fetchFn: async (url) => {
+          if (url.includes('/api/status')) return mockResponse(prodErrorKeyedStatus);
+          return mockResponse({});
+        },
+      });
+
+      ok('Shelfmark genuine error marks task failed with shelfmark error source', bridge.state.tasks[errorTaskId].status === 'failed' && bridge.state.tasks[errorTaskId].errorSource === 'shelfmark');
+      ok('Shelfmark genuine error does NOT adopt unrelated completed file despite similar title', bridge.state.tasks[errorTaskId].filePath === null && bridge.state.tasks[errorTaskId].dockFileId === null);
+
+      // 9. Task IDs with colons, such as oceanofpdf:...
+      ok('task IDs with colons are preserved and retrievable in state and maps', bridge.state.tasks[errorTaskId].taskId === 'oceanofpdf:145751b6b720f7ac36f0a514a2ff8fdc');
+
+      // 10. Original request IDs, library/folder IDs and first-run baseline are preserved across restarts
+      const restoredBridge = new BridgeService({
+        stateFilePath: b28StateFile,
+        allowedBaseDirs: [testDir],
+      });
+      ok('original request IDs preserved after reload', restoredBridge.state.tasks[errorTaskId].requestIds[0] === 30);
+      ok('original library and folder IDs preserved after reload', restoredBridge.state.tasks[errorTaskId].libraryId === 10 && restoredBridge.state.tasks[errorTaskId].folderId === 20);
+      ok('first-run baseline IDs and timestamp preserved after reload', restoredBridge.state.baselineRequestIds['historical-1'] === true && Boolean(restoredBridge.state.baselineEstablishedAt));
+
+      // 11. Engine.IO v4 Socket.IO heartbeat behavior
+      let wsClientSentPackets = [];
+      const mockWs = {
+        readyState: 1, // WebSocket.OPEN
+        send: (msg) => wsClientSentPackets.push(msg),
+        close: () => {},
+      };
+
+      const socketClient = new BookOrbitSocketClient({
+        url: 'http://localhost:8080',
+        token: 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJleHAiOjI1MDAwMDAwMDB9.sig',
+      });
+      socketClient.ws = mockWs;
+
+      // Handle handshake (0)
+      socketClient.handlePacket('0{"sid":"eio4-test","pingInterval":100,"pingTimeout":50}');
+      ok('handshake sets pingInterval and sends namespace connect packet', wsClientSentPackets.some((p) => p.startsWith('40/book-requests')));
+
+      // Clear sent packets
+      wsClientSentPackets = [];
+
+      // Server sends PING ('2') -> client must reply with PONG ('3')
+      socketClient.handlePacket('2');
+      ok('client replies to server Engine.IO PING with PONG 3', wsClientSentPackets.includes('3'));
+      ok('client does NOT send unsolicited PING 2 packets', !wsClientSentPackets.includes('2'));
+
+      socketClient.close();
+      bridge.stop();
     }
   } finally {
     // Cleanup temporary test files

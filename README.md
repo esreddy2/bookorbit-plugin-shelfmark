@@ -204,7 +204,7 @@ BookOrbit computes release scores using its internal scoring matrix (title match
 
 ---
 
-### 5. Asynchronous Event-Driven Companion Architecture (v1.5.2)
+### 5. Asynchronous Event-Driven Companion Architecture (v1.5.3)
 
 To decouple BookOrbit from its synchronous 240s HTTP `resolveFile` deadline for long-running downloads:
 
@@ -216,7 +216,10 @@ To decouple BookOrbit from its synchronous 240s HTTP `resolveFile` deadline for 
    On first launch, the companion authenticates to BookOrbit and enumerates all pre-existing requests across paginated admin endpoints (`{ items, total }`), establishing a durable baseline in `.bridge-state.json`. Historical requests in this baseline are ignored; only requests approved after companion activation are processed. Enumeration fails closed on any HTTP or network error or partial pagination, guaranteeing no historical requests are queued if baseline setup fails.
 
 3. **Secure Zero-Dependency Companion Service:**  
-   - **Engine.IO / Socket.IO v4 Client:** Listens to `/book-requests` with authenticated session JWTs, handles heartbeats, auto-reconnects, and proactively refreshes expired tokens via `/api/v1/auth/refresh`.
+   - **Engine.IO / Socket.IO v4 Client:** Listens to `/book-requests` with authenticated session JWTs, handles heartbeats according to Engine.IO v4 semantics (replies with PONG `3` to server PING `2`, sends no unsolicited pings, watchdog monitoring), auto-reconnects, and proactively refreshes expired tokens via `/api/v1/auth/refresh`.
+   - **Transient Webhook Visibility Handling:** Uses bounded retries with backoff if a completed download is not yet visible across mount namespaces. Preserves a recoverable `awaiting_file` state without failing the Shelfmark task hook.
+   - **Full Recoverable State Reconciliation:** Safely recovers tracked tasks in `queued`, `downloading`, `awaiting_file`, `finalization_failed`, and earlier transient verification failures when Shelfmark reports completion. Reconciles immediately on service startup.
+   - **Duplicate Download Prevention & Idempotency:** Distinguishes Shelfmark genuine `error` from companion verification errors; never requeues tracked tasks on Socket.IO broadcasts; preserves Book Dock upload and finalization IDs without re-uploading.
    - **Timing-Safe HTTP Server:** Binds to `127.0.0.1` (or private Docker network) and requires timing-safe secret validation (`crypto.timingSafeEqual`) on `/webhook/shelfmark`, `/api/queue`, and `/api/reconcile`, capping body sizes at 1MB.
    - **Keyed Status Groups:** Fully parses and normalizes Shelfmark v1.5.1 `/api/status` keyed dictionary groups (`complete`, `downloading`, `queued`, `error`), freeing locks on errors and tracking genuine task states without throwing.
    - **No Fabricated Task IDs:** If Shelfmark returns 200 without a task ID, the bridge queries `/api/status` or marks the task as `uncertain_queue` using strong release identity, never inventing synthetic IDs or double-POSTing duplicate jobs.
@@ -245,13 +248,14 @@ For Proxmox LXC 105 (CT105) hosting BookOrbit v3.5.0 (`/opt/bookorbit/data/app`)
 
 ```bash
 git fetch origin --tags && \
-git checkout v1.5.2 && \
+git checkout v1.5.3 && \
 mkdir -p /opt/bookorbit/data/app/plugins/indexers/shelfmark && \
 cp index.mjs /opt/bookorbit/data/app/plugins/indexers/shelfmark/index.mjs && \
+cp -r bridge /opt/bookorbit/data/app/plugins/indexers/shelfmark/ && \
 chmod 644 /opt/bookorbit/data/app/plugins/indexers/shelfmark/index.mjs && \
 chmod +x scripts/shelfmark-hook.sh && \
 docker restart bookorbit && \
-echo "✅ BookOrbit plugin updated to v1.5.2 and restarted."
+echo "✅ BookOrbit plugin updated to v1.5.3 and restarted."
 ```
 
 To run the companion bridge as a managed background service:
