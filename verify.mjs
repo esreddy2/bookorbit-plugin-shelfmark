@@ -413,7 +413,7 @@ async function runTests() {
       if (url.includes('/api/releases')) {
         releasesIsbn = new URL(url).searchParams.get('isbn');
         return mockResponse([
-          { id: 'rel-isbn', source_id: 'src-isbn', source: 'annas', title: '1984', author: 'George Orwell', format: 'epub', size_bytes: 500000 },
+          { id: 'rel-isbn', source_id: 'src-isbn', source: 'annas', title: '1984', author: 'George Orwell', format: 'epub', size_bytes: 500000, isbn: '9780451524935' },
         ]);
       }
       return mockResponse([]);

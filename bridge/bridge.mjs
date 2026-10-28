@@ -332,6 +332,52 @@ export function areEditionsCompatible(a, b) {
   return true;
 }
 
+function getEditionIncompatibilityReason(req, rel) {
+  if (!req || !rel) return 'incompatible_edition';
+
+  const titleReq = (req.bookTitle || req.title || '').trim().toLowerCase();
+  const titleRel = (rel.bookTitle || rel.title || '').trim().toLowerCase();
+  if (titleReq && titleRel && titleReq !== titleRel) {
+    return 'incompatible_title';
+  }
+
+  const authorReq = (req.author || (Array.isArray(req.authors) ? req.authors[0] : '') || '').trim().toLowerCase();
+  const authorRel = (rel.author || (Array.isArray(rel.authors) ? rel.authors[0] : '') || '').trim().toLowerCase();
+  if (authorReq && authorRel && authorReq !== authorRel) {
+    return 'incompatible_author';
+  }
+
+  const formatReq = (req.format || '').trim().toLowerCase();
+  const formatRel = (rel.format || '').trim().toLowerCase();
+  if (formatReq && formatRel && formatReq !== formatRel) {
+    return 'incompatible_format';
+  }
+
+  const langReq = (req.language || '').trim().toLowerCase();
+  const langRel = (rel.language || '').trim().toLowerCase();
+  if (langReq && langRel && langReq !== langRel) {
+    return 'language_mismatch';
+  }
+
+  const isbnReq = String(req.isbn13 || req.isbn || req.extra?.isbn || '').replace(/[^0-9X]/gi, '');
+  const isbnRel = String(rel.isbn13 || rel.isbn || rel.extra?.isbn || '').replace(/[^0-9X]/gi, '');
+  if (isbnReq && isbnRel && isbnReq !== isbnRel) {
+    return 'conflicting_isbn';
+  }
+
+  const yearReq = parsePositiveInt(req.year || req.publicationYear || req.publishedYear);
+  const yearRel = parsePositiveInt(rel.year || rel.publicationYear || rel.publishedYear);
+  if (yearReq && yearRel && yearReq !== yearRel) {
+    return 'incompatible_year';
+  }
+  if (yearReq && !yearRel && !isbnReq && !isbnRel) {
+    // Known requested year with unknown release year is not verified.
+    return 'unknown_release_year';
+  }
+
+  return null;
+}
+
 function isHttpUrlBridge(value) {
   if (typeof value !== 'string') return false;
   const trimmed = value.trim();
@@ -730,6 +776,10 @@ export class BridgeService {
       requestSourceAttempts: {}, // requestId -> count
       requestAttempts: {},    // requestId -> [ { attemptId, taskId, releaseKey, ... } ]
       requestErrors: {},      // requestId -> { error, errorType, lastAttemptAt, attempts }
+      requestProgress: {},    // requestId -> { stage, status, updatedAt, ... }
+      requestStages: {},      // alias for requestProgress
+      requestStatus: {},      // alias for requestProgress
+      requestFailureReasons: {}, // requestId -> reason
     };
 
     this.reconcileTimer = null;
@@ -759,6 +809,10 @@ export class BridgeService {
           requestSourceAttempts: parsed.requestSourceAttempts || {},
           requestAttempts: parsed.requestAttempts || {},
           requestErrors: parsed.requestErrors || {},
+          requestProgress: parsed.requestProgress || parsed.requestStages || parsed.requestStatus || {},
+          requestStages: parsed.requestStages || parsed.requestProgress || parsed.requestStatus || {},
+          requestStatus: parsed.requestStatus || parsed.requestProgress || parsed.requestStages || {},
+          requestFailureReasons: parsed.requestFailureReasons || {},
         };
       }
     } catch (err) {
@@ -1085,6 +1139,44 @@ export class BridgeService {
     if (this.debounceTimer.unref) this.debounceTimer.unref();
   }
 
+  setRequestProgress(reqId, stage, details = {}) {
+    if (!reqId) return;
+    const entry = {
+      stage,
+      status: stage,
+      updatedAt: new Date().toISOString(),
+      ...details,
+    };
+    this.state.requestProgress = this.state.requestProgress || {};
+    this.state.requestStages = this.state.requestStages || {};
+    this.state.requestStatus = this.state.requestStatus || {};
+    this.state.requestProgress[reqId] = entry;
+    this.state.requestStages[reqId] = entry;
+    this.state.requestStatus[reqId] = entry;
+    if (details && details.reason) {
+      this.state.requestFailureReasons = this.state.requestFailureReasons || {};
+      this.state.requestFailureReasons[reqId] = details.reason;
+    }
+    this.saveState();
+  }
+
+  async isRequestCancelled(reqId, fetchFn = globalThis.fetch) {
+    if (!reqId) return false;
+    try {
+      const token = this.bookorbitToken || this.bookorbitApiKey;
+      const headers = token ? { 'Authorization': `Bearer ${token}`, 'X-Api-Key': token } : {};
+      const res = await fetchFn(`${this.bookorbitUrl}/api/v1/admin/book-requests/${reqId}`, { headers });
+      if (res && res.ok) {
+        const data = await res.json().catch(() => ({}));
+        const status = String(data.status || data.state || '').toLowerCase();
+        return status === 'cancelled' || status === 'canceled';
+      }
+    } catch (e) {
+      // Best effort only
+    }
+    return false;
+  }
+
   /**
    * Fetches approved ebook requests from BookOrbit admin API and processes them.
    * Serialized with an async mutex lock to prevent duplicate runs.
@@ -1169,7 +1261,15 @@ export class BridgeService {
             continue;
           }
 
-          // 4. Search releases using corrected plugin logic
+          // Cancellation-aware: check request status before queueing/searching
+          if (await this.isRequestCancelled(req.id, fetchFn)) {
+            this.setRequestProgress(req.id, 'cancelled', { reason: 'cancelled' });
+            continue;
+          }
+
+          this.setRequestProgress(req.id, 'searching');
+
+          // 4. Search releases using corrected plugin logic (bounded per request)
           const query = {
             title: req.title,
             author: req.author || (Array.isArray(req.authors) ? req.authors[0] : ''),
@@ -1201,21 +1301,46 @@ export class BridgeService {
           };
 
           let searchResults = [];
+          const searchController = new AbortController();
+          const searchTimeout = setTimeout(() => searchController.abort(), 30000);
           try {
-            searchResults = await plugin.search(query, config, host);
+            searchResults = await plugin.search(query, config, host, searchController.signal);
           } catch (err) {
             console.warn(`[Bridge] Plugin search error for "${query.title}": ${sanitizeLog(err.message)}`);
+            this.setRequestProgress(req.id, 'search_failed', { reason: 'search_failed', error: err.message });
+            this.state.requestErrors[req.id] = {
+              error: err.message,
+              errorType: 'search_failed',
+              reason: 'search_failed',
+              lastAttemptAt: new Date().toISOString(),
+              attempts: this.state.requestSourceAttempts[req.id] || 0,
+            };
+            this.saveState();
             continue;
+          } finally {
+            clearTimeout(searchTimeout);
           }
 
           if (!searchResults || searchResults.length === 0) {
             console.log(`[Bridge] No valid releases found for approved request ${req.id} ("${query.title}")`);
+            this.setRequestProgress(req.id, 'no_releases', { reason: 'no_releases' });
+            this.state.requestErrors[req.id] = {
+              error: 'No releases found',
+              errorType: 'no_releases',
+              reason: 'no_releases',
+              lastAttemptAt: new Date().toISOString(),
+              attempts: this.state.requestSourceAttempts[req.id] || 0,
+            };
+            this.saveState();
             continue;
           }
 
           // 5. Filter releases for edition compatibility and filter out recently failed releases
+          let ineligibilityReason = null;
           const eligibleReleases = searchResults.filter((rel) => {
-            if (!areEditionsCompatible(req, rel)) {
+            const reason = getEditionIncompatibilityReason(req, rel);
+            if (reason) {
+              if (!ineligibilityReason) ineligibilityReason = reason;
               return false;
             }
             const rKey = this.getReleaseKey(rel);
@@ -1223,6 +1348,7 @@ export class BridgeService {
               const failedRecord = this.state.failedReleases[rKey];
               const timeSinceFail = Date.now() - new Date(failedRecord.failedAt).getTime();
               if (timeSinceFail < this.releaseFailureCooldownMs) {
+                if (!ineligibilityReason) ineligibilityReason = 'cooldown';
                 return false;
               }
             }
@@ -1230,7 +1356,17 @@ export class BridgeService {
           });
 
           if (eligibleReleases.length === 0) {
+            const reason = ineligibilityReason || 'no_eligible_edition';
             console.log(`[Bridge] No eligible edition-compatible releases found for approved request ${req.id} ("${query.title}")`);
+            this.setRequestProgress(req.id, 'no_eligible_edition', { reason });
+            this.state.requestErrors[req.id] = {
+              error: reason,
+              errorType: reason,
+              reason,
+              lastAttemptAt: new Date().toISOString(),
+              attempts: this.state.requestSourceAttempts[req.id] || 0,
+            };
+            this.saveState();
             continue;
           }
 
@@ -1249,6 +1385,13 @@ export class BridgeService {
               }
             }
 
+            // Cancellation-aware before queueing
+            if (await this.isRequestCancelled(req.id, fetchFn)) {
+              this.setRequestProgress(req.id, 'cancelled', { reason: 'cancelled' });
+              queuedSuccessfully = true; // stop trying candidates
+              break;
+            }
+
             try {
               const queueRes = await this.queueRelease({
                 requestId: req.id,
@@ -1264,6 +1407,7 @@ export class BridgeService {
                 console.log(`[Bridge] Queued release for request ${req.id} ("${candidateRelease.title}")`);
               }
               queuedSuccessfully = true;
+              this.setRequestProgress(req.id, 'queued', { reason: 'queued' });
               break;
             } catch (err) {
               const isEditionConflict = err.message && (err.message.toLowerCase().includes('incompatible edition') || err.message.toLowerCase().includes('incompatible'));
@@ -1332,6 +1476,12 @@ export class BridgeService {
     const smUrl = (shelfmarkUrl || this.shelfmarkUrl).replace(/\/$/, '');
     const smKey = apiKey || this.shelfmarkApiKey;
     const releaseKey = this.getReleaseKey(release);
+
+    // Cancellation-aware: do not queue for a cancelled request
+    if (requestId && await this.isRequestCancelled(requestId, fetchFn)) {
+      this.setRequestProgress(requestId, 'cancelled', { reason: 'cancelled' });
+      throw new Error('Request cancelled');
+    }
 
     // 1. Check if release already tracked or in uncertain queue
     const existingTaskId = this.state.releases[releaseKey];
@@ -2045,6 +2195,34 @@ export class BridgeService {
 
     let matchedBookId = parsePositiveInt(task.matchedBookId) || null;
 
+    // Cancellation-aware: determine which requests are still active before importing
+    const activeRequestIds = [];
+    for (const rid of (task.requestIds || [])) {
+      if (await this.isRequestCancelled(rid, fetchFn)) {
+        if (!task.requestFulfillments) task.requestFulfillments = {};
+        task.requestFulfillments[rid] = {
+          fulfilled: false,
+          errorType: 'cancelled',
+          error: 'Request cancelled',
+          updatedAt: new Date().toISOString(),
+        };
+        this.setRequestProgress(rid, 'cancelled', { reason: 'cancelled' });
+      } else {
+        activeRequestIds.push(rid);
+      }
+    }
+    this.saveState();
+
+    if ((task.requestIds || []).length > 0 && activeRequestIds.length === 0) {
+      // All requests cancelled; preserve shared download but skip import/fulfillment
+      this.setRequestProgress((task.requestIds || [])[0], 'cancelled', { reason: 'cancelled' });
+      return { fulfilled: false, error: 'All requests cancelled' };
+    }
+
+    for (const rid of activeRequestIds) {
+      this.setRequestProgress(rid, 'importing', { reason: 'importing' });
+    }
+
     // Step 1: Import file into Library if not already uploaded/matched
     if (!matchedBookId) {
       if (!task.filePath) {
@@ -2177,6 +2355,18 @@ export class BridgeService {
 
     let fulfilledCount = 0;
     for (const reqId of task.requestIds) {
+      if (await this.isRequestCancelled(reqId, fetchFn)) {
+        if (!task.requestFulfillments) task.requestFulfillments = {};
+        task.requestFulfillments[reqId] = {
+          fulfilled: false,
+          errorType: 'cancelled',
+          error: 'Request cancelled',
+          updatedAt: new Date().toISOString(),
+        };
+        this.setRequestProgress(reqId, 'cancelled', { reason: 'cancelled' });
+        this.saveState();
+        continue;
+      }
       if (task.requestFulfillments[reqId]?.fulfilled) {
         fulfilledCount++;
         continue;
@@ -2422,12 +2612,35 @@ export class BridgeService {
       if (id !== undefined && id !== null) failedMap.set(String(id), t);
     }
 
+    const downloadingMap = new Map();
+    for (const t of parsedStatus.downloading) {
+      const id = t.id || t.task_id;
+      if (id !== undefined && id !== null) downloadingMap.set(String(id), t);
+    }
+
+    const queuedMap = new Map();
+    for (const t of parsedStatus.queued) {
+      const id = t.id || t.task_id;
+      if (id !== undefined && id !== null) queuedMap.set(String(id), t);
+    }
+
     for (const task of Object.values(this.state.tasks)) {
       if (task.status === 'fulfilled') {
         continue;
       }
 
       const taskIdStr = String(task.taskId);
+
+      if (downloadingMap.has(taskIdStr)) {
+        for (const rid of (task.requestIds || [])) {
+          this.setRequestProgress(rid, 'downloading', { reason: 'downloading' });
+        }
+      }
+      if (queuedMap.has(taskIdStr)) {
+        for (const rid of (task.requestIds || [])) {
+          this.setRequestProgress(rid, 'queued', { reason: 'queued' });
+        }
+      }
 
       if (completedMap.has(taskIdStr)) {
         // Shelfmark positively reports completion for this exact task ID!
@@ -2440,6 +2653,9 @@ export class BridgeService {
           if (verify.ok) {
             if (task.status !== 'partially_fulfilled') {
               task.status = 'completed';
+            }
+            for (const rid of (task.requestIds || [])) {
+              this.setRequestProgress(rid, 'completed', { reason: 'completed' });
             }
             task.filePath = verify.safePath;
             task.sizeBytes = verify.sizeBytes;

@@ -231,7 +231,9 @@ export default {
       const displayAuthor = releaseAuthor || metadataAuthor || toNaturalAuthor(searchAuthor) || null;
 
       // Extract authentic ISBN
-      const authenticIsbn = extractIsbn(book, query) || (rel.isbn ? String(rel.isbn).trim() : null);
+      // Never claim a release has the request's ISBN without independent evidence.
+      // Preserve the release's own ISBN (or metadata book ISBN), never the query ISBN.
+      const authenticIsbn = extractIsbn(book, null) || (rel.isbn ? String(rel.isbn).trim() : null);
 
       // Authentic book title:
       // Preserves authentic metadata book title or cleaned core release title.
@@ -245,6 +247,7 @@ export default {
         author: displayAuthor,
         isbn: authenticIsbn,
         format: detectedFormat,
+        year: (rel.year || rel.publication_year || rel.published_year || rel.publicationYear || rel.publishedYear || book?.year || book?.publication_year || null),
         sizeBytes,
         language: rel.language || null,
         seeders: toNumber(rel.seeders),
