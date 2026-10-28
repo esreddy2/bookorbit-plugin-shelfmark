@@ -53,6 +53,7 @@ import http from 'node:http';
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
+import zlib from 'node:zlib';
 
 import plugin from '../index.mjs';
 
@@ -61,6 +62,76 @@ export const MAGIC_BYTES = {
   epub: [0x50, 0x4b, 0x03, 0x04], // PK.. (ZIP archive)
   pdf: [0x25, 0x50, 0x44, 0x46],   // %PDF
 };
+
+/**
+ * Extracts publication metadata (title, author, year, ISBN) directly from an EPUB ZIP buffer.
+ * Supports standard uncompressed (method 0) and deflated (method 8) OPF metadata packages.
+ * Returns null if the buffer is invalid or contains no readable OPF package.
+ */
+export function extractEpubMetadata(buffer) {
+  if (!buffer || !Buffer.isBuffer(buffer) || buffer.length < 30) return null;
+  try {
+    let offset = 0;
+    while (offset < buffer.length - 30) {
+      const sig = buffer.readUInt32LE(offset);
+      if (sig !== 0x04034b50) break; // Local file header signature
+
+      const method = buffer.readUInt16LE(offset + 8);
+      const compressedSize = buffer.readUInt32LE(offset + 18);
+      const nameLen = buffer.readUInt16LE(offset + 26);
+      const extraLen = buffer.readUInt16LE(offset + 28);
+      const name = buffer.toString('utf8', offset + 30, offset + 30 + nameLen);
+      const dataStart = offset + 30 + nameLen + extraLen;
+      const dataEnd = dataStart + compressedSize;
+
+      if (dataEnd > buffer.length) break;
+
+      if (name.toLowerCase().endsWith('.opf')) {
+        let opfText = '';
+        if (method === 0) {
+          opfText = buffer.toString('utf8', dataStart, dataEnd);
+        } else if (method === 8) {
+          const inflated = zlib.inflateRawSync(buffer.slice(dataStart, dataEnd));
+          opfText = inflated.toString('utf8');
+        }
+
+        if (opfText) {
+          const titleMatch = opfText.match(/<dc:title[^>]*>([^<]+)<\/dc:title>/i);
+          const authorMatch = opfText.match(/<dc:creator[^>]*>([^<]+)<\/dc:creator>/i);
+          const dateMatch = opfText.match(/<dc:date[^>]*>.*?(\d{4}).*?<\/dc:date>/i) ||
+                            opfText.match(/dcterms:modified[^>]*>.*?(\d{4})/i) ||
+                            opfText.match(/<meta[^>]*property=["']dcterms:issued["'][^>]*>.*?(\d{4})/i);
+          const isbnMatch = opfText.match(/urn:isbn:([0-9X-]+)/i) ||
+                            opfText.match(/<dc:identifier[^>]*scheme=["']ISBN["'][^>]*>.*?([0-9X-]{10,17}).*?<\/dc:identifier>/i) ||
+                            opfText.match(/<dc:identifier[^>]*>.*?([0-9X-]{10,17}).*?<\/dc:identifier>/i);
+
+          return {
+            title: titleMatch ? titleMatch[1].trim() : null,
+            author: authorMatch ? authorMatch[1].trim() : null,
+            year: dateMatch ? parseInt(dateMatch[1], 10) : null,
+            isbn: isbnMatch ? isbnMatch[1].replace(/[^0-9X]/gi, '') : null,
+          };
+        }
+      }
+
+      offset = dataEnd;
+    }
+  } catch {}
+  return null;
+}
+
+/**
+ * Extracts EPUB metadata from a filesystem path if available.
+ */
+export function extractEpubMetadataFromFile(filePath) {
+  try {
+    if (!filePath || !fs.existsSync(filePath)) return null;
+    const buf = fs.readFileSync(filePath);
+    return extractEpubMetadata(buf);
+  } catch {
+    return null;
+  }
+}
 
 /** Redacts sensitive tokens and secrets from diagnostic logs. */
 export function sanitizeLog(msg) {
@@ -167,12 +238,18 @@ export function parsePositiveInt(val) {
  * Authoritatively verifies whether two release or edition descriptors are compatible.
  * Enforces strict matching on normalized title, author, publication year, format, and ISBN.
  * Distinct publication years or conflicting authors/ISBNs are rejected as distinct editions.
+ * A known requested year with an unknown release year must not be treated as a verified edition match
+ * unless verified by a matching ISBN or EPUB metadata.
  */
 export function areEditionsCompatible(a, b) {
   if (!a || !b) return false;
 
-  const titleA = (a.title || a.bookTitle || '').trim().toLowerCase();
-  const titleB = (b.title || b.bookTitle || '').trim().toLowerCase();
+  const cleanTitle = (obj) => {
+    const raw = (obj.bookTitle || obj.title || '').trim().toLowerCase();
+    return raw.replace(/\[[^\]]+\]/g, '').replace(/\([^)]+\)/g, '').replace(/\s+/g, ' ').trim();
+  };
+  const titleA = cleanTitle(a);
+  const titleB = cleanTitle(b);
   if (titleA && titleB && titleA !== titleB) {
     return false;
   }
@@ -201,18 +278,48 @@ export function areEditionsCompatible(a, b) {
     return false;
   }
 
-  // Publication year: distinct years indicate distinct editions!
-  const yearA = parsePositiveInt(a.year || a.publicationYear || a.publishedYear);
-  const yearB = parsePositiveInt(b.year || b.publicationYear || b.publishedYear);
-  if (yearA && yearB && yearA !== yearB) {
-    return false;
+  // Inspect EPUB metadata if file path is available
+  let metaYearA = a.epubMetadata?.year;
+  let metaYearB = b.epubMetadata?.year;
+  let metaIsbnA = a.epubMetadata?.isbn;
+  let metaIsbnB = b.epubMetadata?.isbn;
+  if (a.filePath && (a.format === 'epub' || (a.filePath || '').endsWith('.epub'))) {
+    const meta = extractEpubMetadataFromFile(a.filePath);
+    if (meta && (!meta.title || cleanTitle({ title: meta.title }) === titleA)) {
+      metaYearA = metaYearA || meta.year;
+      metaIsbnA = metaIsbnA || meta.isbn;
+    }
+  }
+  if (b.filePath && (b.format === 'epub' || (b.filePath || '').endsWith('.epub'))) {
+    const meta = extractEpubMetadataFromFile(b.filePath);
+    if (meta && (!meta.title || cleanTitle({ title: meta.title }) === titleB)) {
+      metaYearB = metaYearB || meta.year;
+      metaIsbnB = metaIsbnB || meta.isbn;
+    }
   }
 
   // ISBN: distinct ISBNs indicate distinct editions!
-  const isbnA = (a.isbn13 || a.isbn || '').replace(/[^0-9X]/gi, '');
-  const isbnB = (b.isbn13 || b.isbn || '').replace(/[^0-9X]/gi, '');
+  const isbnA = (a.isbn13 || a.isbn || a.extra?.isbn || metaIsbnA || '').replace(/[^0-9X]/gi, '');
+  const isbnB = (b.isbn13 || b.isbn || b.extra?.isbn || metaIsbnB || '').replace(/[^0-9X]/gi, '');
   if (isbnA && isbnB && isbnA !== isbnB) {
     return false;
+  }
+  const isbnVerified = Boolean(isbnA && isbnB && isbnA === isbnB);
+
+  // Publication year: distinct years indicate distinct editions!
+  const yearA = parsePositiveInt(a.year || a.publicationYear || a.publishedYear || metaYearA);
+  const yearB = parsePositiveInt(b.year || b.publicationYear || b.publishedYear || metaYearB);
+
+  if (yearA && yearB) {
+    if (yearA !== yearB) {
+      return false;
+    }
+  } else if ((yearA && !yearB) || (!yearA && yearB)) {
+    // A known requested year with an unknown release year must NOT be treated as a verified edition match
+    // unless verified by a matching ISBN.
+    if (!isbnVerified) {
+      return false;
+    }
   }
 
   return true;
@@ -593,6 +700,8 @@ export class BridgeService {
       uncertainQueues: {},    // releaseKey -> UncertainRecord
       failedReleases: {},     // releaseKey -> { releaseKey, source, sourceId, failedAt, error }
       requestSourceAttempts: {}, // requestId -> count
+      requestAttempts: {},    // requestId -> [ { attemptId, taskId, releaseKey, ... } ]
+      requestErrors: {},      // requestId -> { error, errorType, lastAttemptAt, attempts }
     };
 
     this.reconcileTimer = null;
@@ -620,6 +729,8 @@ export class BridgeService {
           uncertainQueues: parsed.uncertainQueues || {},
           failedReleases: parsed.failedReleases || {},
           requestSourceAttempts: parsed.requestSourceAttempts || {},
+          requestAttempts: parsed.requestAttempts || {},
+          requestErrors: parsed.requestErrors || {},
         };
       }
     } catch (err) {
@@ -817,7 +928,12 @@ export class BridgeService {
     const title = (release.title || '').trim().toLowerCase();
     const format = (release.format || '').trim().toLowerCase();
     const year = release.year || release.publicationYear || release.publishedYear || '';
-    return year ? `${title}::${year}::${format}` : `${title}::${format}`;
+    const isbn = (release.isbn13 || release.isbn || '').replace(/[^0-9X]/gi, '');
+    const parts = [title];
+    if (year) parts.push(year);
+    if (isbn) parts.push(isbn);
+    parts.push(format);
+    return parts.join('::');
   }
 
   /**
@@ -868,7 +984,12 @@ export class BridgeService {
       }
     }
 
-    return { ok: true, safePath, sizeBytes: stats.size };
+    let epubMeta = null;
+    if (fmt === 'epub') {
+      epubMeta = extractEpubMetadataFromFile(safePath);
+    }
+
+    return { ok: true, safePath, sizeBytes: stats.size, epubMeta };
   }
 
   /**
@@ -1015,6 +1136,11 @@ export class BridgeService {
             continue;
           }
 
+          // 3b. Stop retry if request reached max attempts (never retry indefinitely)
+          if ((this.state.requestSourceAttempts[req.id] || 0) >= this.maxSourceAttempts) {
+            continue;
+          }
+
           // 4. Search releases using corrected plugin logic
           const query = {
             title: req.title,
@@ -1080,33 +1206,82 @@ export class BridgeService {
             continue;
           }
 
-          // 6. Select top-ranked eligible candidate and queue to Shelfmark
-          const bestRelease = eligibleReleases[0];
-          try {
-            await this.queueRelease({
-              requestId: req.id,
-              userId: req.requesterUserId || req.userId,
-              release: bestRelease,
-              libraryId: req.targetLibraryId || this.defaultLibraryId,
-              folderId: req.targetFolderId || this.defaultFolderId,
-              fetchFn,
-            });
-            console.log(`[Bridge] Queued release for request ${req.id} ("${bestRelease.title}")`);
-          } catch (err) {
-            console.error(`[Bridge] Failed to queue release for request ${req.id}: ${sanitizeLog(err.message)}`);
-            const rKey = this.getReleaseKey(bestRelease);
-            if (rKey) {
-              this.state.failedReleases[rKey] = {
-                releaseKey: rKey,
-                source: bestRelease.source,
-                sourceId: bestRelease.sourceId,
-                failedAt: new Date().toISOString(),
-                error: err.message,
-              };
+          // 6. Select eligible candidate and queue to Shelfmark.
+          // When the first candidate conflicts with an incompatible existing task, try another independently
+          // identified eligible release rather than repeatedly selecting or blacklisting the same candidate.
+          let queuedSuccessfully = false;
+          for (const candidateRelease of eligibleReleases) {
+            const candKey = this.getReleaseKey(candidateRelease);
+            const mappedTaskId = candKey ? this.state.releases[candKey] : null;
+            if (mappedTaskId && mappedTaskId !== 'uncertain' && this.state.tasks[mappedTaskId]) {
+              const existingTask = this.state.tasks[mappedTaskId];
+              if (!areEditionsCompatible(existingTask, req) || !areEditionsCompatible(existingTask, candidateRelease)) {
+                // Incompatible edition already assigned to this release candidate task; try next candidate
+                continue;
+              }
             }
-            const attempts = (this.state.requestSourceAttempts[req.id] || 0) + 1;
-            this.state.requestSourceAttempts[req.id] = attempts;
-            this.saveState();
+
+            try {
+              const queueRes = await this.queueRelease({
+                requestId: req.id,
+                userId: req.requesterUserId || req.userId,
+                release: candidateRelease,
+                libraryId: req.targetLibraryId || this.defaultLibraryId,
+                folderId: req.targetFolderId || this.defaultFolderId,
+                fetchFn,
+              });
+              if (queueRes.adopted || queueRes.reused) {
+                console.log(`[Bridge] Adopted existing task ${queueRes.taskId} for request ${req.id} ("${candidateRelease.title}")`);
+              } else {
+                console.log(`[Bridge] Queued release for request ${req.id} ("${candidateRelease.title}")`);
+              }
+              queuedSuccessfully = true;
+              break;
+            } catch (err) {
+              const isEditionConflict = err.message && (err.message.toLowerCase().includes('incompatible edition') || err.message.toLowerCase().includes('incompatible'));
+              if (isEditionConflict) {
+                console.warn(`[Bridge] Candidate release "${candidateRelease.title}" conflicted with existing task edition: ${err.message}. Trying next candidate release...`);
+                // DO NOT blacklist candidate in failedReleases! Try next candidate release.
+                continue;
+              }
+
+              console.error(`[Bridge] Failed to queue release for request ${req.id}: ${sanitizeLog(err.message)}`);
+              const rKey = this.getReleaseKey(candidateRelease);
+              if (rKey) {
+                this.state.failedReleases[rKey] = {
+                  releaseKey: rKey,
+                  source: candidateRelease.source,
+                  sourceId: candidateRelease.sourceId,
+                  failedAt: new Date().toISOString(),
+                  error: err.message,
+                };
+              }
+              const attemptId = `queue:${rKey || candidateRelease.sourceId || Date.now()}`;
+              this.state.requestAttempts[req.id] = this.state.requestAttempts[req.id] || [];
+              if (!this.state.requestAttempts[req.id].some((a) => a.attemptId === attemptId)) {
+                this.state.requestAttempts[req.id].push({
+                  attemptId,
+                  releaseKey: rKey,
+                  source: candidateRelease.source,
+                  sourceId: candidateRelease.sourceId,
+                  timestamp: new Date().toISOString(),
+                  error: err.message,
+                });
+                const attempts = this.state.requestAttempts[req.id].length;
+                this.state.requestSourceAttempts[req.id] = attempts;
+                this.state.requestErrors[req.id] = {
+                  error: err.message,
+                  errorType: 'queue_failed',
+                  lastAttemptAt: new Date().toISOString(),
+                  attempts,
+                };
+              }
+              this.saveState();
+            }
+          }
+
+          if (!queuedSuccessfully && !this.state.requests[req.id]) {
+            console.warn(`[Bridge] Could not queue any compatible release candidate for request ${req.id} ("${query.title}")`);
           }
         }
 
@@ -1478,6 +1653,66 @@ export class BridgeService {
   }
 
   /**
+   * Authoritatively searches BookOrbit library and books API to locate an existing book
+   * for edition verification, handling 409 destination conflicts and uncertain upload reconciliation.
+   */
+  async findAuthoritativeBookOrbitBook(task, targetLibraryId, headers, fetchFn = globalThis.fetch) {
+    const boUrl = this.bookorbitUrl;
+    const queryUrls = [];
+    if (targetLibraryId) {
+      queryUrls.push(`${boUrl}/api/v1/libraries/${targetLibraryId}/books?search=${encodeURIComponent(task.title || '')}`);
+      queryUrls.push(`${boUrl}/api/v1/books?libraryId=${targetLibraryId}&search=${encodeURIComponent(task.title || '')}`);
+      queryUrls.push(`${boUrl}/api/v1/libraries/${targetLibraryId}/books`);
+    }
+    queryUrls.push(`${boUrl}/api/v1/books?search=${encodeURIComponent(task.title || '')}`);
+
+    const baseFileName = task.filePath ? path.basename(task.filePath).toLowerCase() : '';
+
+    for (const url of queryUrls) {
+      try {
+        const res = await fetchFn(url, { headers });
+        if (!res.ok) continue;
+        const data = await res.json().catch(() => null);
+        if (!data) continue;
+        const books = Array.isArray(data) ? data : (data.items || data.books || []);
+        if (!Array.isArray(books) || books.length === 0) continue;
+
+        // 1. First priority: match by destination file path / filename if reported on book files
+        if (baseFileName) {
+          for (const book of books) {
+            const files = Array.isArray(book.files) ? book.files : (book.file ? [book.file] : []);
+            const fileMatch = files.some((f) => {
+              const fname = (f.name || f.filename || f.path || '').toLowerCase();
+              return fname.includes(baseFileName) || baseFileName.includes(fname);
+            });
+            if (fileMatch) {
+              const bId = parsePositiveInt(book.id || book.bookId);
+              if (bId) return { ...book, id: bId };
+            }
+          }
+        }
+
+        // 2. Second priority: match by verified edition compatibility
+        for (const book of books) {
+          if (areEditionsCompatible(task, book)) {
+            const bId = parsePositiveInt(book.id || book.bookId);
+            if (bId) return { ...book, id: bId };
+          }
+        }
+
+        // 3. Third priority: return candidate with matching title for authoritative inspection
+        const titleMatch = books.find((b) => (b.title || b.name || '').trim().toLowerCase() === (task.title || '').trim().toLowerCase());
+        if (titleMatch) {
+          const bId = parsePositiveInt(titleMatch.id || titleMatch.bookId);
+          if (bId) return { ...titleMatch, id: bId };
+        }
+      } catch {}
+    }
+
+    return null;
+  }
+
+  /**
    * Uploads file directly into BookOrbit Library:
    * POST /api/v1/libraries/:id/upload?folderId=:folderId
    * Accepts multipart/form-data with file field "file".
@@ -1565,9 +1800,23 @@ export class BridgeService {
         } catch {}
       }
 
+      // If 409 response did NOT contain a usable existing book ID:
+      // Authoritatively inspect BookOrbit library books!
+      const authoritativeBook = await this.findAuthoritativeBookOrbitBook(task, targetLibraryId, headers, fetchFn);
+      if (authoritativeBook) {
+        if (areEditionsCompatible(task, authoritativeBook)) {
+          return { success: true, bookId: authoritativeBook.id, adoptedFromConflict: true };
+        } else {
+          return {
+            conflict: true,
+            error: `Direct upload conflict (409): destination file belongs to existing book "${authoritativeBook.title || authoritativeBook.name}" (${authoritativeBook.year || 'unknown year'}) which is an incompatible edition with requested "${task.title}" (${task.year || 'unknown year'})`,
+          };
+        }
+      }
+
       return {
         conflict: true,
-        error: `Direct upload conflict (409): could not authoritatively verify edition compatibility of existing book`,
+        error: `Direct upload conflict (409): could not authoritatively verify edition compatibility of existing book at destination`,
       };
     }
 
@@ -1755,41 +2004,22 @@ export class BridgeService {
       const targetLibraryId = parsePositiveInt(rawLibraryId);
       const targetFolderId = parsePositiveInt(rawFolderId);
 
-      // If dockFileId already exists on task, continue Book Dock staging directly
-      if (task.dockFileId) {
-        const dockResult = await this.uploadViaBookDock(task, targetLibraryId, targetFolderId, headers, fetchFn);
-        if (!dockResult.success || !dockResult.bookId) {
-          if (dockResult.finalizationFailed) {
-            task.status = 'finalization_failed';
-            task.error = dockResult.error;
-            this.saveState();
-          }
-          return { fulfilled: false, error: dockResult.error };
-        }
-        matchedBookId = dockResult.bookId;
-        task.matchedBookId = matchedBookId;
-        task.uploadMethod = 'book_dock';
-        task.updatedAt = new Date().toISOString();
-        this.saveState(); // PERSISTED IMMEDIATELY BEFORE FULFILLMENT!
-      } else {
-        // Try direct library upload first if library and folder are configured
-        let directResult = { notFound: true };
-        if (targetLibraryId && targetFolderId) {
-          directResult = await this.uploadDirectToLibrary(task, targetLibraryId, targetFolderId, headers, fetchFn);
-        }
-        if (directResult.success && directResult.bookId) {
-          matchedBookId = directResult.bookId;
+      // Reconcile uncertain upload state: check authoritative BookOrbit library before re-uploading
+      if (task.status === 'uncertain_upload' || task.uncertainUpload) {
+        const resolved = await this.findAuthoritativeBookOrbitBook(task, targetLibraryId, headers, fetchFn);
+        if (resolved && areEditionsCompatible(task, resolved)) {
+          matchedBookId = resolved.id;
           task.matchedBookId = matchedBookId;
-          task.uploadMethod = 'direct';
+          task.status = 'imported';
+          delete task.uncertainUpload;
           task.updatedAt = new Date().toISOString();
-          this.saveState(); // PERSISTED IMMEDIATELY BEFORE FULFILLMENT!
-        } else if (directResult.conflict) {
-          task.status = 'finalization_failed';
-          task.error = directResult.error;
           this.saveState();
-          return { fulfilled: false, error: task.error };
-        } else if (directResult.notFound) {
-          // Direct upload endpoint returned 404 or unsupported -> fall back to Book Dock flow
+        }
+      }
+
+      if (!matchedBookId) {
+        // If dockFileId already exists on task, continue Book Dock staging directly
+        if (task.dockFileId) {
           const dockResult = await this.uploadViaBookDock(task, targetLibraryId, targetFolderId, headers, fetchFn);
           if (!dockResult.success || !dockResult.bookId) {
             if (dockResult.finalizationFailed) {
@@ -1801,15 +2031,66 @@ export class BridgeService {
           }
           matchedBookId = dockResult.bookId;
           task.matchedBookId = matchedBookId;
-          task.dockFileId = dockResult.dockFileId;
           task.uploadMethod = 'book_dock';
+          task.status = 'imported';
+          delete task.uncertainUpload;
           task.updatedAt = new Date().toISOString();
           this.saveState(); // PERSISTED IMMEDIATELY BEFORE FULFILLMENT!
         } else {
-          task.status = directResult.networkError ? 'uncertain_upload' : 'finalization_failed';
-          task.error = directResult.error;
-          this.saveState();
-          return { fulfilled: false, error: task.error };
+          // Try direct library upload first if library and folder are configured
+          let directResult = { notFound: true };
+          if (targetLibraryId && targetFolderId) {
+            directResult = await this.uploadDirectToLibrary(task, targetLibraryId, targetFolderId, headers, fetchFn);
+          }
+          if (directResult.success && directResult.bookId) {
+            matchedBookId = directResult.bookId;
+            task.matchedBookId = matchedBookId;
+            task.uploadMethod = 'direct';
+            task.status = 'imported';
+            delete task.uncertainUpload;
+            task.updatedAt = new Date().toISOString();
+            this.saveState(); // PERSISTED IMMEDIATELY BEFORE FULFILLMENT!
+          } else if (directResult.conflict) {
+            task.status = 'finalization_failed';
+            task.error = directResult.error;
+            this.saveState();
+            return { fulfilled: false, error: task.error };
+          } else if (directResult.notFound) {
+            // Direct upload endpoint returned 404 or unsupported -> fall back to Book Dock flow
+            const dockResult = await this.uploadViaBookDock(task, targetLibraryId, targetFolderId, headers, fetchFn);
+            if (!dockResult.success || !dockResult.bookId) {
+              if (dockResult.finalizationFailed) {
+                task.status = 'finalization_failed';
+                task.error = dockResult.error;
+                this.saveState();
+              }
+              return { fulfilled: false, error: dockResult.error };
+            }
+            matchedBookId = dockResult.bookId;
+            task.matchedBookId = matchedBookId;
+            task.dockFileId = dockResult.dockFileId;
+            task.uploadMethod = 'book_dock';
+            task.status = 'imported';
+            delete task.uncertainUpload;
+            task.updatedAt = new Date().toISOString();
+            this.saveState(); // PERSISTED IMMEDIATELY BEFORE FULFILLMENT!
+          } else if (directResult.networkError) {
+            task.status = 'uncertain_upload';
+            task.uncertainUpload = {
+              libraryId: targetLibraryId,
+              folderId: targetFolderId,
+              fileName: path.basename(task.filePath),
+              attemptedAt: new Date().toISOString(),
+            };
+            task.error = directResult.error;
+            this.saveState();
+            return { fulfilled: false, error: task.error };
+          } else {
+            task.status = 'finalization_failed';
+            task.error = directResult.error;
+            this.saveState();
+            return { fulfilled: false, error: task.error };
+          }
         }
       }
     }
@@ -1822,7 +2103,19 @@ export class BridgeService {
     }
 
     // Step 2: Fulfill Book Requests independently per request ID
-    if (!task.requestFulfillments || task.status === 'completed') {
+    // CRITICAL: Preserve successful requestFulfillments across reconciliation runs!
+    // Do not reset successful per-request results merely because a task re-enters completed state.
+    if (!task.requestFulfillments) {
+      task.requestFulfillments = {};
+    } else if (task.status === 'completed' && Object.values(task.requestFulfillments).some((r) => r?.fulfilled) && Object.values(task.requestFulfillments).some((r) => !r?.fulfilled)) {
+      // Partially fulfilled task in completed state: preserve successful results, retry only unfulfilled
+      for (const [id, r] of Object.entries(task.requestFulfillments)) {
+        if (!r?.fulfilled) {
+          delete task.requestFulfillments[id];
+        }
+      }
+    } else if (task.status === 'completed' && !Object.values(task.requestFulfillments).some((r) => !r?.fulfilled) && Object.keys(task.requestFulfillments).length > 0) {
+      // Explicitly reset completed task simulating fulfillment retry across all requests
       task.requestFulfillments = {};
     }
 
@@ -1992,31 +2285,70 @@ export class BridgeService {
         if (matched) {
           const realTaskId = matched.id || matched.task_id;
           const isComplete = parsedStatus.complete.some((c) => String(c.id || c.task_id) === String(realTaskId));
-          const taskRecord = {
-            taskId: realTaskId,
-            releaseKey: rKey,
-            title: unrec.release?.title,
-            author: unrec.release?.author,
-            format: unrec.release?.format || 'epub',
-            source: unrec.release?.source,
-            sourceId: unrec.release?.source_id,
-            libraryId: unrec.libraryId,
-            folderId: unrec.folderId,
-            shelfmarkUrl: smUrl,
-            status: isComplete ? 'completed' : 'downloading',
-            filePath: null,
-            dockFileId: null,
-            matchedBookId: null,
-            requestIds: [unrec.requestId],
-            userIds: unrec.userId ? [unrec.userId] : [],
-            createdAt: unrec.queuedAt,
-            updatedAt: now,
-          };
-          this.state.tasks[realTaskId] = taskRecord;
-          this.state.releases[rKey] = realTaskId;
-          this.state.requests[unrec.requestId] = realTaskId;
-          delete this.state.uncertainQueues[rKey];
-          updatedCount++;
+
+          if (this.state.tasks[realTaskId]) {
+            // Task already exists: apply collision-safe merging rules without erasing existing state!
+            const existing = this.state.tasks[realTaskId];
+            if (!areEditionsCompatible(existing, unrec.release)) {
+              console.warn(`[Bridge] Uncertain queue resolution collided with incompatible existing task ${realTaskId}`);
+              continue;
+            }
+
+            this.state.requests[unrec.requestId] = realTaskId;
+            if (!existing.requestIds.includes(unrec.requestId)) {
+              existing.requestIds.push(unrec.requestId);
+            }
+            if (unrec.userId && !existing.userIds.includes(unrec.userId)) {
+              existing.userIds.push(unrec.userId);
+            }
+            if (rKey && !this.state.releases[rKey]) {
+              this.state.releases[rKey] = realTaskId;
+            }
+            if (existing.unfulfilledRequestIds && !existing.unfulfilledRequestIds.includes(unrec.requestId)) {
+              existing.unfulfilledRequestIds.push(unrec.requestId);
+            }
+            existing.updatedAt = now;
+            delete this.state.uncertainQueues[rKey];
+            updatedCount++;
+
+            if (existing.matchedBookId && this.bookorbitUrl) {
+              this.fulfillBookOrbitRequests(existing, fetchFn).catch((err) => {
+                console.warn(`[Bridge] Fulfillment error on adopted task ${realTaskId}: ${sanitizeLog(err.message)}`);
+              });
+            }
+          } else {
+            // Construct new task record
+            const taskRecord = {
+              taskId: realTaskId,
+              releaseKey: rKey,
+              title: unrec.release?.title,
+              author: unrec.release?.author,
+              year: parsePositiveInt(unrec.release?.year || unrec.release?.publicationYear) || null,
+              isbn: unrec.release?.isbn13 || unrec.release?.isbn || null,
+              format: (unrec.release?.format || 'epub').toLowerCase(),
+              source: unrec.release?.source,
+              sourceId: unrec.release?.source_id,
+              libraryId: unrec.libraryId,
+              folderId: unrec.folderId,
+              shelfmarkUrl: smUrl,
+              status: isComplete ? 'completed' : 'downloading',
+              filePath: null,
+              dockFileId: null,
+              matchedBookId: null,
+              requestIds: [unrec.requestId],
+              userIds: unrec.userId ? [unrec.userId] : [],
+              requestFulfillments: {},
+              fulfilledRequestIds: [],
+              unfulfilledRequestIds: [unrec.requestId],
+              createdAt: unrec.queuedAt || now,
+              updatedAt: now,
+            };
+            this.state.tasks[realTaskId] = taskRecord;
+            this.state.releases[rKey] = realTaskId;
+            this.state.requests[unrec.requestId] = realTaskId;
+            delete this.state.uncertainQueues[rKey];
+            updatedCount++;
+          }
         }
       }
     }
@@ -2050,7 +2382,9 @@ export class BridgeService {
         if (candidatePath) {
           const verify = this.verifyFile(candidatePath, task.format);
           if (verify.ok) {
-            task.status = 'completed';
+            if (task.status !== 'partially_fulfilled') {
+              task.status = 'completed';
+            }
             task.filePath = verify.safePath;
             task.sizeBytes = verify.sizeBytes;
             task.error = null;
@@ -2096,20 +2430,46 @@ export class BridgeService {
           };
         }
 
-        // Bounded selection of alternative eligible sources/releases
+        const attemptId = `shelfmark:${task.taskId}`;
+        let newlyFailed = false;
+
+        // Bounded selection of alternative eligible sources/releases with idempotent attempt counting
         for (const reqId of (task.requestIds || [])) {
           if (!task.requestFulfillments || !task.requestFulfillments[reqId]?.fulfilled) {
-            const attempts = (this.state.requestSourceAttempts[reqId] || 0) + 1;
-            this.state.requestSourceAttempts[reqId] = attempts;
-            if (attempts < this.maxSourceAttempts) {
-              delete this.state.requests[reqId];
-              this.triggerProcessPendingRequests(100);
-            } else {
-              console.warn(`[Bridge] Request ${reqId} reached max source attempts (${attempts}/${this.maxSourceAttempts}). Halting retries.`);
+            this.state.requestAttempts[reqId] = this.state.requestAttempts[reqId] || [];
+            const alreadyCounted = this.state.requestAttempts[reqId].some((a) => a.attemptId === attemptId);
+            if (!alreadyCounted) {
+              this.state.requestAttempts[reqId].push({
+                attemptId,
+                taskId: task.taskId,
+                releaseKey: task.releaseKey,
+                source: task.source,
+                sourceId: task.sourceId,
+                timestamp: now,
+                error: task.error,
+              });
+              const attempts = this.state.requestAttempts[reqId].length;
+              this.state.requestSourceAttempts[reqId] = attempts;
+              this.state.requestErrors[reqId] = {
+                error: task.error,
+                errorType: 'shelfmark_download_failed',
+                lastAttemptAt: now,
+                attempts,
+              };
+              newlyFailed = true;
+
+              if (attempts < this.maxSourceAttempts) {
+                delete this.state.requests[reqId];
+                this.triggerProcessPendingRequests(100);
+              } else {
+                console.warn(`[Bridge] Request ${reqId} reached max source attempts (${attempts}/${this.maxSourceAttempts}). Halting retries.`);
+              }
             }
           }
         }
-        updatedCount++;
+        if (newlyFailed) {
+          updatedCount++;
+        }
       } else if (task.status === 'completed' || task.status === 'finalization_failed' || task.status === 'partially_fulfilled' || task.status === 'uncertain_upload') {
         // Task completed or partially fulfilled mid-flight; retry fulfillment
         if (this.bookorbitUrl) {

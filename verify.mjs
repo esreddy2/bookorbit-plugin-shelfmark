@@ -26,6 +26,8 @@ import {
   normalizeTaskGroup,
   parsePositiveInt,
   areEditionsCompatible,
+  extractEpubMetadata,
+  extractEpubMetadataFromFile,
 } from './bridge/bridge.mjs';
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -111,7 +113,7 @@ async function runTests() {
   ok('preferFormat defaults to epub', plugin.settingsFields.find((f) => f.key === 'preferFormat')?.default === 'epub');
   ok('defines downloadViaShelfmark toggle', plugin.settingsFields.some((f) => f.key === 'downloadViaShelfmark'));
   ok('defines pollTimeoutSeconds defaulting to 240', plugin.settingsFields.find((f) => f.key === 'pollTimeoutSeconds')?.default === 240);
-  ok('declares semantic version 1.5.4', plugin.version === '1.5.4');
+  ok('declares semantic version 1.5.5', plugin.version === '1.5.5');
   ok('declares update channel', typeof plugin.update === 'object' && plugin.update !== null);
   ok('update manifestUrl is HTTPS and points to fork repo', typeof plugin.update?.manifestUrl === 'string' && plugin.update.manifestUrl.includes('esreddy2/bookorbit-plugin-shelfmark'));
   ok('update ed25519PublicKey is 43-char base64url', /^[A-Za-z0-9_-]{43}$/.test(plugin.update?.ed25519PublicKey ?? ''));
@@ -3711,6 +3713,592 @@ async function runTests() {
       ok('failed release lock freed so alternative selection is permitted', bridge.state.releases[failReleaseKey] === undefined);
 
       bridge.stop();
+    }
+
+    // Section 13: Regression Tests for Systemic Fixes (Idempotency, Collisions, 409 Adoption, Uncertainty)
+    {
+      console.log('\n--- 13. Systemic Regression Suite (Idempotent Reconciliation, Edition Collisions & Idempotent Uploads) ---');
+
+      const b30StateFile = join(testDir, '.bridge-b30-state.json');
+      const bridge = new BridgeService({
+        stateFilePath: b30StateFile,
+        secret: 'test-secret',
+        bookorbitUrl: 'http://bookorbit:8080',
+        bookorbitApiKey: 'bo-key',
+        shelfmarkUrl: 'http://shelfmark:8084',
+        shelfmarkApiKey: 'sm-key',
+        allowedBaseDirs: [testDir],
+        defaultLibraryId: 10,
+        defaultFolderId: 20,
+        maxSourceAttempts: 3,
+        releaseFailureCooldownMs: 1000,
+      });
+
+      bridge.state.baselineEstablishedAt = new Date().toISOString();
+      bridge.state.baselineRequestIds = { 'hist-1': true };
+      bridge.saveState();
+
+      // 1. Repeated reconciliation of the same failed task is strictly idempotent
+      const taskFail1 = 'task-shelfmark-fail-1';
+      const releaseFail1 = 'oceanofpdf:fail-frankenstein-1';
+      bridge.state.releases[releaseFail1] = taskFail1;
+      bridge.state.tasks[taskFail1] = {
+        taskId: taskFail1,
+        releaseKey: releaseFail1,
+        title: 'Frankenstein',
+        author: 'Mary Shelley',
+        format: 'epub',
+        source: 'oceanofpdf',
+        sourceId: 'fail-frankenstein-1',
+        status: 'queued',
+        requestIds: [101],
+      };
+      bridge.state.requests[101] = taskFail1;
+      bridge.saveState();
+
+      const shelfmarkErrorStatus = {
+        complete: {},
+        downloading: {},
+        queued: {},
+        error: {
+          [taskFail1]: { id: taskFail1, title: 'Frankenstein', error: 'Shelfmark network gateway timeout' },
+        },
+      };
+
+      // First reconciliation pass: records failure and attempt 1
+      await bridge.reconcile({
+        fetchFn: async (url) => {
+          if (url.includes('/api/status')) return mockResponse(shelfmarkErrorStatus);
+          return mockResponse({});
+        },
+      });
+
+      ok('first failure reconciliation records attempt 1 with durable identifier', bridge.state.requestSourceAttempts[101] === 1 && bridge.state.requestAttempts[101]?.length === 1);
+      ok('durable attempt identifier is shelfmark:task-shelfmark-fail-1', bridge.state.requestAttempts[101][0].attemptId === `shelfmark:${taskFail1}`);
+
+      // Second and third reconciliation passes with the same failed task in Shelfmark history
+      await bridge.reconcile({
+        fetchFn: async (url) => {
+          if (url.includes('/api/status')) return mockResponse(shelfmarkErrorStatus);
+          return mockResponse({});
+        },
+      });
+      await bridge.reconcile({
+        fetchFn: async (url) => {
+          if (url.includes('/api/status')) return mockResponse(shelfmarkErrorStatus);
+          return mockResponse({});
+        },
+      });
+
+      ok('repeated reconciliation of the same failed task does NOT increment attempts', bridge.state.requestSourceAttempts[101] === 1 && bridge.state.requestAttempts[101]?.length === 1);
+
+      // 2. Genuinely distinct retry attempts track distinct identifiers up to maxSourceAttempts
+      const taskFail2 = 'task-shelfmark-fail-2';
+      const releaseFail2 = 'annas:fail-frankenstein-2';
+      bridge.state.tasks[taskFail2] = {
+        taskId: taskFail2,
+        releaseKey: releaseFail2,
+        title: 'Frankenstein',
+        author: 'Mary Shelley',
+        format: 'epub',
+        source: 'annas',
+        sourceId: 'fail-frankenstein-2',
+        status: 'queued',
+        requestIds: [101],
+      };
+      bridge.state.requests[101] = taskFail2;
+
+      shelfmarkErrorStatus.error[taskFail2] = { id: taskFail2, title: 'Frankenstein', error: 'Anna Archive HTTP 502' };
+
+      await bridge.reconcile({
+        fetchFn: async (url) => {
+          if (url.includes('/api/status')) return mockResponse(shelfmarkErrorStatus);
+          return mockResponse({});
+        },
+      });
+
+      ok('genuinely distinct second failure increments attempt count to 2', bridge.state.requestSourceAttempts[101] === 2 && bridge.state.requestAttempts[101]?.length === 2);
+
+      // Third distinct failure exhausts retry limit
+      const taskFail3 = 'task-shelfmark-fail-3';
+      const releaseFail3 = 'libgen:fail-frankenstein-3';
+      bridge.state.tasks[taskFail3] = {
+        taskId: taskFail3,
+        releaseKey: releaseFail3,
+        title: 'Frankenstein',
+        author: 'Mary Shelley',
+        format: 'epub',
+        source: 'libgen',
+        sourceId: 'fail-frankenstein-3',
+        status: 'queued',
+        requestIds: [101],
+      };
+      bridge.state.requests[101] = taskFail3;
+      shelfmarkErrorStatus.error[taskFail3] = { id: taskFail3, title: 'Frankenstein', error: 'LibGen mirror dead' };
+
+      await bridge.reconcile({
+        fetchFn: async (url) => {
+          if (url.includes('/api/status')) return mockResponse(shelfmarkErrorStatus);
+          return mockResponse({});
+        },
+      });
+
+      ok('third distinct failure reaches maxSourceAttempts (3)', bridge.state.requestSourceAttempts[101] === 3);
+      ok('actionable error history persisted for request remaining in approved state', bridge.state.requestErrors[101]?.error === 'LibGen mirror dead' && bridge.state.requestErrors[101]?.attempts === 3);
+
+      // Subsequent reconciliations do not increment past maxSourceAttempts
+      await bridge.reconcile({
+        fetchFn: async (url) => {
+          if (url.includes('/api/status')) return mockResponse(shelfmarkErrorStatus);
+          return mockResponse({});
+        },
+      });
+      ok('never automatically retries indefinitely beyond maxSourceAttempts', bridge.state.requestSourceAttempts[101] === 3);
+
+      // 3. Edition matching: Missing edition metadata & two Frankenstein editions
+      const frank1818 = { title: 'Frankenstein', author: 'Mary Shelley', year: 1818, format: 'epub' };
+      const frank2015 = { title: 'Frankenstein', author: 'Mary Shelley', year: 2015, format: 'epub' };
+      const frankUnknownYear = { title: 'Frankenstein', author: 'Mary Shelley', format: 'epub' };
+      const frankWithIsbn = { title: 'Frankenstein', author: 'Mary Shelley', isbn: '9780141439471', format: 'epub' };
+      const frankMatchingIsbnNoYear = { title: 'Frankenstein', author: 'Mary Shelley', isbn: '9780141439471', format: 'epub' };
+
+      ok('known requested year with unknown release year rejected without matching ISBN', !areEditionsCompatible(frank1818, frankUnknownYear));
+      ok('known requested year with unknown release year accepted when verified by ISBN', areEditionsCompatible(frankWithIsbn, frankMatchingIsbnNoYear));
+      ok('distinct publication years rejected (1818 vs 2015)', !areEditionsCompatible(frank1818, frank2015));
+
+      // 4. EPUB metadata extraction directly from OPF
+      function createMockEpubWithOpf({ title, author, year, isbn }) {
+        const opf = Buffer.from(`<?xml version="1.0" encoding="utf-8"?>
+<package xmlns="http://www.idpf.org/2007/opf" version="2.0">
+  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/">
+    <dc:title>${title}</dc:title>
+    <dc:creator>${author}</dc:creator>
+    <dc:date>${year}-01-01</dc:date>
+    <dc:identifier id="isbn">urn:isbn:${isbn}</dc:identifier>
+  </metadata>
+</package>`);
+        const nameBuf = Buffer.from('content.opf');
+        const header = Buffer.alloc(30);
+        header.writeUInt32LE(0x04034b50, 0);
+        header.writeUInt16LE(20, 4);
+        header.writeUInt16LE(0, 6);
+        header.writeUInt16LE(0, 8);
+        header.writeUInt32LE(0, 14);
+        header.writeUInt32LE(opf.length, 18);
+        header.writeUInt32LE(opf.length, 22);
+        header.writeUInt16LE(nameBuf.length, 26);
+        header.writeUInt16LE(0, 28);
+        return Buffer.concat([header, nameBuf, opf]);
+      }
+
+      const frank1818EpubFile = join(testDir, 'Frankenstein_1818.epub');
+      writeFileSync(frank1818EpubFile, createMockEpubWithOpf({
+        title: 'Frankenstein',
+        author: 'Mary Wollstonecraft Shelley',
+        year: 1818,
+        isbn: '9780141439471',
+      }));
+
+      const extractedMeta = extractEpubMetadataFromFile(frank1818EpubFile);
+      ok('extractEpubMetadataFromFile extracts authentic year from OPF', extractedMeta?.year === 1818);
+      ok('extractEpubMetadataFromFile extracts authentic ISBN from OPF', extractedMeta?.isbn === '9780141439471');
+
+      // Verify file path EPUB metadata enables edition compatibility
+      const frankDescriptorWithFile = { title: 'Frankenstein', author: 'Mary Shelley', filePath: frank1818EpubFile, format: 'epub' };
+      ok('EPUB metadata verifies compatibility with requested 1818 edition', areEditionsCompatible(frank1818, frankDescriptorWithFile));
+      ok('EPUB metadata rejects compatibility with requested 2015 edition', !areEditionsCompatible(frank2015, frankDescriptorWithFile));
+
+      // 5. Incompatible task collision & alternative candidate selection
+      // Request #81 is for Frankenstein 1818; Request #82 is for Frankenstein 2015
+      let downloadPosts = [];
+      const smMockDownload = async (url, opts) => {
+        if (url.includes('/api/releases/download')) {
+          const body = JSON.parse(opts.body);
+          downloadPosts.push(body);
+          if (body.source_id === 'frank-cand-1') {
+            return mockResponse({ task_id: 'task-frank-1818' });
+          }
+          if (body.source_id === 'frank-cand-2') {
+            return mockResponse({ task_id: 'task-frank-2015' });
+          }
+        }
+        return mockResponse({});
+      };
+
+      // Queue 1818 edition for Request #81
+      const rel1818 = {
+        title: 'Frankenstein',
+        author: 'Mary Shelley',
+        year: 1818,
+        format: 'epub',
+        source: 'annas',
+        sourceId: 'frank-cand-1',
+      };
+      const qRes1 = await bridge.queueRelease({
+        requestId: 81,
+        userId: 1,
+        release: rel1818,
+        fetchFn: smMockDownload,
+      });
+
+      ok('request #81 successfully queues task-frank-1818 for 1818 edition', qRes1.status === 'queued' && bridge.state.tasks['task-frank-1818']?.year === 1818);
+
+      // Attempting to queue an incompatible edition (2015) onto the SAME colliding task ID throws safely
+      let collisionError = null;
+      try {
+        await bridge.queueRelease({
+          requestId: 82,
+          userId: 2,
+          release: { title: 'Frankenstein', author: 'Mary Shelley', year: 2015, format: 'epub', source: 'annas', sourceId: 'frank-cand-1' },
+          fetchFn: async () => mockResponse({ task_id: 'task-frank-1818' }),
+        });
+      } catch (err) {
+        collisionError = err.message;
+      }
+      ok('incompatible edition with colliding task ID rejects safely with descriptive error', collisionError && collisionError.includes('Incompatible edition'));
+      ok('existing task-frank-1818 not overwritten by collision', bridge.state.tasks['task-frank-1818'].year === 1818 && bridge.state.tasks['task-frank-1818'].requestIds.includes(81));
+
+      // When candidate 1 conflicts, alternative candidate 2 (2015) is tried and queues cleanly
+      const rel2015 = {
+        title: 'Frankenstein',
+        author: 'Mary Shelley',
+        year: 2015,
+        format: 'epub',
+        source: 'oceanofpdf',
+        sourceId: 'frank-cand-2',
+      };
+      const qRes2 = await bridge.queueRelease({
+        requestId: 82,
+        userId: 2,
+        release: rel2015,
+        fetchFn: smMockDownload,
+      });
+      ok('alternative eligible candidate queues independently as task-frank-2015', qRes2.status === 'queued' && bridge.state.tasks['task-frank-2015']?.year === 2015);
+      ok('both Frankenstein tasks coexist independently without collision', bridge.state.tasks['task-frank-1818'] && bridge.state.tasks['task-frank-2015']);
+
+      // 6. Direct Upload 409 Conflict: Authoritative Book Lookup (no ID in response)
+      const conflictNoIdTask = 'task-conflict-no-id';
+      bridge.state.tasks[conflictNoIdTask] = {
+        taskId: conflictNoIdTask,
+        title: 'Frankenstein',
+        author: 'Mary Shelley',
+        year: 1818,
+        format: 'epub',
+        filePath: frank1818EpubFile,
+        libraryId: 10,
+        folderId: 20,
+        requestIds: [88],
+        userIds: [1],
+      };
+
+      // 409 response has NO book ID, but library lookup contains compatible edition (1818)
+      const fakeBo409LookupCompat = async (url) => {
+        if (url.includes('/upload')) {
+          return {
+            ok: false,
+            status: 409,
+            json: async () => ({ error: 'Conflict', message: 'Destination file already exists' }),
+            text: async () => 'Conflict: Destination file already exists',
+          };
+        }
+        if (url.includes('/api/v1/libraries/10/books') || url.includes('/api/v1/books')) {
+          return mockResponse([
+            { id: 250, title: 'Frankenstein', author: 'Mary Shelley', year: 1818, format: 'epub' },
+          ]);
+        }
+        if (url.includes('/fulfill')) {
+          return mockResponse({ id: 88, status: 'AVAILABLE' });
+        }
+        return mockResponse({});
+      };
+
+      const resCompat409 = await bridge.fulfillBookOrbitRequests(bridge.state.tasks[conflictNoIdTask], fakeBo409LookupCompat);
+      ok('409 without book ID authoritatively queries library and adopts compatible book ID 250', resCompat409.bookId === 250 && bridge.state.tasks[conflictNoIdTask].matchedBookId === 250);
+
+      // Incompatible 409 lookup: destination belongs to 2015 edition, requested 1818
+      const conflictIncompatTask = 'task-conflict-incompat-no-id';
+      bridge.state.tasks[conflictIncompatTask] = {
+        taskId: conflictIncompatTask,
+        title: 'Frankenstein',
+        author: 'Mary Shelley',
+        year: 1818,
+        format: 'epub',
+        filePath: frank1818EpubFile,
+        libraryId: 10,
+        folderId: 20,
+        requestIds: [89],
+        userIds: [1],
+      };
+
+      const fakeBo409LookupIncompat = async (url) => {
+        if (url.includes('/upload')) {
+          return {
+            ok: false,
+            status: 409,
+            json: async () => ({ error: 'Conflict', message: 'Destination file already exists' }),
+            text: async () => 'Conflict: Destination file already exists',
+          };
+        }
+        if (url.includes('/api/v1/libraries/10/books') || url.includes('/api/v1/books')) {
+          return mockResponse([
+            { id: 999, title: 'Frankenstein', author: 'Mary Shelley', year: 2015, format: 'epub' },
+          ]);
+        }
+        return mockResponse({});
+      };
+
+      const resIncompat409 = await bridge.fulfillBookOrbitRequests(bridge.state.tasks[conflictIncompatTask], fakeBo409LookupIncompat);
+      ok('409 with incompatible existing destination book rejects safely without adopting', resIncompat409.fulfilled === false && bridge.state.tasks[conflictIncompatTask].status === 'finalization_failed');
+
+      // 7. Uncertain Upload Reconciliation
+      const uncertainUploadTask = 'task-uncertain-upload-1';
+      bridge.state.tasks[uncertainUploadTask] = {
+        taskId: uncertainUploadTask,
+        title: 'Dracula',
+        author: 'Bram Stoker',
+        year: 1897,
+        format: 'epub',
+        filePath: frank1818EpubFile,
+        libraryId: 10,
+        folderId: 20,
+        requestIds: [95],
+        userIds: [1],
+      };
+
+      let uploadCallCount = 0;
+      const fakeBoUploadTimeout = async (url) => {
+        if (url.includes('/upload')) {
+          uploadCallCount++;
+          throw new Error('ETIMEDOUT: Connection reset by peer');
+        }
+        return mockResponse({});
+      };
+
+      const resUncertain = await bridge.fulfillBookOrbitRequests(bridge.state.tasks[uncertainUploadTask], fakeBoUploadTimeout);
+      ok('network timeout transitions task to uncertain_upload', bridge.state.tasks[uncertainUploadTask].status === 'uncertain_upload');
+      ok('persists durable uncertainUpload record with timestamp and library', bridge.state.tasks[uncertainUploadTask].uncertainUpload?.libraryId === 10);
+
+      // Reconcile uncertain upload: queries BookOrbit library and adopts book without re-uploading
+      let uploadCalledOnReconcile = false;
+      let fulfillCalledForUncertain = false;
+      const fakeBoResolveUncertain = async (url) => {
+        if (url.includes('/upload')) {
+          uploadCalledOnReconcile = true;
+          return mockResponse({});
+        }
+        if (url.includes('/api/v1/libraries/10/books') || url.includes('/api/v1/books')) {
+          return mockResponse([
+            { id: 310, title: 'Dracula', author: 'Bram Stoker', year: 1897, format: 'epub' },
+          ]);
+        }
+        if (url.includes('/fulfill')) {
+          fulfillCalledForUncertain = true;
+          return mockResponse({ id: 95, status: 'AVAILABLE' });
+        }
+        return mockResponse({});
+      };
+
+      await bridge.fulfillBookOrbitRequests(bridge.state.tasks[uncertainUploadTask], fakeBoResolveUncertain);
+      ok('uncertain upload reconciled via authoritative library query without second upload', !uploadCalledOnReconcile && bridge.state.tasks[uncertainUploadTask].matchedBookId === 310);
+      ok('request fulfilled and uncertainUpload cleared', fulfillCalledForUncertain && !bridge.state.tasks[uncertainUploadTask].uncertainUpload && bridge.state.tasks[uncertainUploadTask].status === 'fulfilled');
+
+      // 8. Uncertain Queue Reconciliation: Safe Collision Merging
+      bridge.state.uncertainQueues['gutenberg:dracula-44'] = {
+        releaseKey: 'gutenberg:dracula-44',
+        requestId: 96,
+        userId: 2,
+        release: { title: 'Dracula', author: 'Bram Stoker', year: 1897, format: 'epub', source: 'gutenberg', source_id: 'dracula-44' },
+        libraryId: 10,
+        folderId: 20,
+        queuedAt: new Date().toISOString(),
+        status: 'uncertain_queue',
+      };
+
+      const smStatusWithDracula = {
+        complete: {
+          [uncertainUploadTask]: { id: uncertainUploadTask, title: 'Dracula', source_id: 'dracula-44', format: 'epub', target: frank1818EpubFile },
+        },
+        downloading: {},
+        queued: {},
+        error: {},
+      };
+
+      await bridge.reconcile({
+        fetchFn: async (url) => {
+          if (url.includes('/api/status')) return mockResponse(smStatusWithDracula);
+          if (url.includes('/fulfill')) return mockResponse({ id: 96, status: 'AVAILABLE' });
+          return mockResponse({});
+        },
+      });
+
+      const mergedTask = bridge.state.tasks[uncertainUploadTask];
+      ok('uncertainQueues reconciliation safely adopts existing task without overwriting', mergedTask.requestIds.includes(95) && mergedTask.requestIds.includes(96));
+      ok('preserves existing matchedBookId (310) and dockFileId on merged task', mergedTask.matchedBookId === 310);
+      ok('clears uncertain queue entry after safe merge', !bridge.state.uncertainQueues['gutenberg:dracula-44']);
+
+      // 9. Partial multi-request fulfillment & preserving requestFulfillments across reconciliation runs
+      const multiReqTask = 'task-multi-req-preserve';
+      bridge.state.tasks[multiReqTask] = {
+        taskId: multiReqTask,
+        title: 'The Time Machine',
+        author: 'H. G. Wells',
+        year: 1895,
+        format: 'epub',
+        filePath: frank1818EpubFile,
+        libraryId: 10,
+        folderId: 20,
+        matchedBookId: 405,
+        requestIds: [111, 112],
+        userIds: [1, 2],
+        requestFulfillments: {},
+      };
+
+      // Fulfill: Request 111 succeeds (200), Request 112 fails (400)
+      const fakeBoPartialFulfill = async (url) => {
+        if (url.includes('/admin/book-requests/111/fulfill')) {
+          return mockResponse({ id: 111, status: 'AVAILABLE' });
+        }
+        if (url.includes('/admin/book-requests/112/fulfill')) {
+          return {
+            ok: false,
+            status: 400,
+            json: async () => ({ error: 'Invalid state: request pending review' }),
+            text: async () => 'Invalid state: request pending review',
+          };
+        }
+        return mockResponse({});
+      };
+
+      await bridge.fulfillBookOrbitRequests(bridge.state.tasks[multiReqTask], fakeBoPartialFulfill);
+      ok('task transitions to partially_fulfilled with 111 succeeded and 112 failed', bridge.state.tasks[multiReqTask].status === 'partially_fulfilled' && bridge.state.tasks[multiReqTask].requestFulfillments[111]?.fulfilled === true && bridge.state.tasks[multiReqTask].requestFulfillments[112]?.fulfilled === false);
+
+      // Reconcile: task re-enters reconciliation from Shelfmark completed group
+      const smStatusMulti = {
+        complete: {
+          [multiReqTask]: { id: multiReqTask, title: 'The Time Machine', format: 'epub', target: frank1818EpubFile },
+        },
+        downloading: {},
+        queued: {},
+        error: {},
+      };
+
+      let req111CalledInReconcile = false;
+      let req112CalledInReconcile = false;
+      const fakeBoReconcileFulfill = async (url) => {
+        if (url.includes('/admin/book-requests/111/fulfill')) req111CalledInReconcile = true;
+        if (url.includes('/admin/book-requests/112/fulfill')) {
+          req112CalledInReconcile = true;
+          return mockResponse({ id: 112, status: 'AVAILABLE' });
+        }
+        return mockResponse({});
+      };
+
+      await bridge.reconcile({
+        fetchFn: async (url) => {
+          if (url.includes('/api/status')) return mockResponse(smStatusMulti);
+          return fakeBoReconcileFulfill(url);
+        },
+      });
+
+      ok('reconciliation preserves successful request #111 without calling fulfill again', !req111CalledInReconcile && bridge.state.tasks[multiReqTask].requestFulfillments[111]?.fulfilled === true);
+      ok('reconciliation retries unfulfilled request #112 and succeeds', req112CalledInReconcile && bridge.state.tasks[multiReqTask].requestFulfillments[112]?.fulfilled === true);
+      ok('all requests now fulfilled transitions task to fulfilled', bridge.state.tasks[multiReqTask].status === 'fulfilled');
+
+      // 10. Persisted task history, attempt records and errors across restart
+      bridge.saveState();
+      const restartedService = new BridgeService({
+        stateFilePath: b30StateFile,
+        allowedBaseDirs: [testDir],
+      });
+
+      ok('reloaded service preserves requestAttempts history', restartedService.state.requestAttempts[101]?.length === 3);
+      ok('reloaded service preserves requestErrors with actionable error', restartedService.state.requestErrors[101]?.error === 'LibGen mirror dead');
+      ok('reloaded service preserves requestSourceAttempts', restartedService.state.requestSourceAttempts[101] === 3);
+      ok('reloaded service preserves multi-request task and fulfillment results', restartedService.state.tasks[multiReqTask]?.status === 'fulfilled' && restartedService.state.tasks[multiReqTask]?.requestFulfillments[111]?.fulfilled === true);
+
+      // 11. Simulating repeated BookOrbit events and Shelfmark reconciliation after a failed task;
+      // verify that later independent requests can still complete successfully
+      let hobbitQueued = false;
+      let hobbitFulfilled = false;
+      const smHobbitDownload = async (url, opts) => {
+        if (url.includes('/api/releases/download')) {
+          hobbitQueued = true;
+          return mockResponse({ task_id: 'task-hobbit-1' });
+        }
+        if (url.includes('/api/status')) {
+          return mockResponse({
+            complete: {
+              'task-hobbit-1': { id: 'task-hobbit-1', title: 'The Hobbit', format: 'epub', target: frank1818EpubFile },
+            },
+            downloading: {},
+            queued: {},
+            error: shelfmarkErrorStatus.error, // Historical failed tasks still present!
+          });
+        }
+        if (url.includes('/api/v1/libraries/10/upload')) {
+          return mockResponse({ id: 555, title: 'The Hobbit' });
+        }
+        if (url.includes('/admin/book-requests/199/fulfill')) {
+          hobbitFulfilled = true;
+          return mockResponse({ id: 199, status: 'AVAILABLE' });
+        }
+        if (url.includes('/api/v1/admin/book-requests')) {
+          return mockResponse({
+            items: [
+              { id: 199, status: 'approved', title: 'The Hobbit', author: 'J. R. R. Tolkien', mediaKind: 'ebook', targetLibraryId: 10, targetFolderId: 20 },
+            ],
+            total: 1,
+          });
+        }
+        if (url.includes('/api/metadata/search')) {
+          return mockResponse({
+            books: [
+              { provider: 'openlibrary', provider_id: 'OL-HOBBIT', title: 'The Hobbit', authors: ['J. R. R. Tolkien'] },
+            ],
+          });
+        }
+        if (url.includes('/api/releases')) {
+          return mockResponse([
+            { id: 'hobbit-1', source: 'oceanofpdf', source_id: 'hobbit-1', title: 'The Hobbit [EPUB]', author: 'J. R. R. Tolkien', format: 'epub' },
+          ]);
+        }
+        return mockResponse({});
+      };
+
+      // Fire simulated Socket.IO book-requests:changed events
+      restartedService.triggerProcessPendingRequests(0);
+      restartedService.triggerProcessPendingRequests(0);
+
+      // Run reconciliation
+      await restartedService.reconcile({ fetchFn: smHobbitDownload });
+
+      // Run pending requests processing for approved request 199
+      await restartedService.processPendingRequests({ fetchFn: smHobbitDownload });
+
+      ok('later independent request for The Hobbit queued despite historical failed tasks', restartedService.state.requests[199] === 'task-hobbit-1');
+
+      // Fulfill completed The Hobbit download
+      if (restartedService.state.tasks['task-hobbit-1']) {
+        restartedService.state.tasks['task-hobbit-1'].filePath = frank1818EpubFile;
+        await restartedService.fulfillBookOrbitRequests(restartedService.state.tasks['task-hobbit-1'], smHobbitDownload);
+      }
+
+      ok('later independent request completed and fulfilled successfully to AVAILABLE', restartedService.state.tasks['task-hobbit-1']?.status === 'fulfilled' && hobbitFulfilled);
+
+      // Completed task not downloaded twice
+      let downloadAttemptedForCompleted = false;
+      await restartedService.queueRelease({
+        requestId: 199,
+        release: { title: 'The Hobbit', author: 'J. R. R. Tolkien', format: 'epub', source: 'oceanofpdf', sourceId: 'hobbit-1' },
+        fetchFn: async (url) => {
+          if (url.includes('/api/releases/download')) downloadAttemptedForCompleted = true;
+          return mockResponse({});
+        },
+      });
+      ok('completed task is reused without POSTing download twice', !downloadAttemptedForCompleted);
+
+      bridge.stop();
+      restartedService.stop();
     }
   } finally {
     // Cleanup temporary test files
