@@ -34,7 +34,7 @@ const KNOWN_TITLE_EQUIVALENTS = new Map([
 
 export default {
   apiVersion: 1,
-  version: '1.5.5',
+  version: '1.5.6',
   update: {
     manifestUrl: 'https://raw.githubusercontent.com/esreddy2/bookorbit-plugin-shelfmark/main/updates/shelfmark.json',
     ed25519PublicKey: '-0aHVhXqg7cGaDchc2p1Y8tDnn8A7cJ0WREKspNv5Bc',
@@ -205,6 +205,8 @@ export default {
 
       const sizeBytes = toNumber(rel.size_bytes || rel.sizeBytes || rel.size);
       const directUrl = rel.download_url || rel.downloadUrl || rel.url || null;
+      const infoUrl = rel.info_url || rel.infoUrl || null;
+      const sourcePageUrl = infoUrl || directUrl || null;
 
       const payload = {
         source: relSource,
@@ -212,6 +214,12 @@ export default {
         title: rel.title || book?.title || searchTitle,
         format: detectedFormat,
       };
+
+      // Preserve the release's page/download URLs using Shelfmark's accepted field names.
+      // OceanofPDF (and other direct-download providers) require this page URL to queue.
+      if (directUrl) payload.download_url = directUrl;
+      if (infoUrl) payload.info_url = infoUrl;
+      if (sourcePageUrl) payload.source_url = sourcePageUrl;
 
       // Authentic author attribution:
       // Prefer authentic author reported by the release if present.
@@ -238,7 +246,7 @@ export default {
         isbn: authenticIsbn,
         format: detectedFormat,
         sizeBytes,
-        language: rel.language || book?.language || null,
+        language: rel.language || null,
         seeders: toNumber(rel.seeders),
         leechers: toNumber(rel.leechers),
         downloadUrl: directUrl,
@@ -830,6 +838,24 @@ async function doResolveFile(release, payload, resolvedFormat, fileName, baseUrl
     if (statusErr.code) throw statusErr;
   }
 
+  // Validate OceanofPDF page URL before attempting to queue.
+  const payloadSource = payload?.source || release?.extra?.source || '';
+  const payloadPageUrl =
+    payload?.source_url || payload?.download_url || payload?.info_url || release?.downloadUrl || null;
+  const isOceanofPdf = isOceanofPdfSource(payloadSource, release?.extra?.source, payloadPageUrl);
+  if (isOceanofPdf) {
+    if (!isValidOceanofPdfPageUrl(payloadPageUrl, payloadSource)) {
+      throw host.fail(
+        'error',
+        `OceanofPDF release "${release?.title || payload?.title || ''}" has no book page URL`
+      );
+    }
+    // Ensure the verified page URL is forwarded under Shelfmark's accepted field name.
+    payload.source_url = payloadPageUrl;
+    if (!payload.download_url) payload.download_url = payloadPageUrl;
+    if (!payload.info_url) payload.info_url = payloadPageUrl;
+  }
+
   // Step 2: Queue the download in Shelfmark if not already adopted from active queue
   if (!queuedTaskId) {
     let queueRes;
@@ -1135,6 +1161,30 @@ function sanitizeError(msg, apiKey) {
   return str;
 }
 
+function isHttpUrl(value) {
+  if (typeof value !== 'string') return false;
+  const trimmed = value.trim();
+  if (!trimmed) return false;
+  try {
+    const u = new URL(trimmed);
+    return u.protocol === 'http:' || u.protocol === 'https:';
+  } catch (e) {
+    return false;
+  }
+}
+
+function isOceanofPdfSource(source, extraSource, url) {
+  const blob = `${source || ''} ${extraSource || ''} ${url || ''}`.toLowerCase();
+  return blob.includes('oceanofpdf');
+}
+
+function isValidOceanofPdfPageUrl(url, source) {
+  if (!isHttpUrl(url)) return false;
+  const lower = String(url).toLowerCase();
+  // The page URL must belong to the OceanofPDF source, never a fabricated hash URL.
+  return lower.includes('oceanofpdf');
+}
+
 function normalizeString(str) {
   if (!str) return '';
   return String(str)
@@ -1299,6 +1349,17 @@ function isTitleMatch(candidateTitle, requestedTitle) {
   const normCand = normalizeString(candidateTitle);
   const normReq = normalizeString(requestedTitle);
   if (!normCand || !normReq) return false;
+
+  // Reject translated/compound titles that append extra letters directly to the
+  // requested title (e.g. Lithuanian "1984-ieji"), which are distinct editions.
+  try {
+    const escaped = String(requestedTitle).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    if (new RegExp(escaped + '-[\\p{L}]', 'iu').test(candidateTitle)) {
+      return false;
+    }
+  } catch (e) {
+    // Fall through to normal matching on regex failure
+  }
 
   if (normCand === normReq) return true;
   if (normCand.startsWith(normReq) || normReq.startsWith(normCand)) return true;

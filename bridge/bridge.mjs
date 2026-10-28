@@ -322,7 +322,35 @@ export function areEditionsCompatible(a, b) {
     }
   }
 
+  // Known language mismatch indicates a distinct edition (e.g. translated title).
+  const langA = (a.language || '').trim().toLowerCase();
+  const langB = (b.language || '').trim().toLowerCase();
+  if (langA && langB && langA !== langB) {
+    return false;
+  }
+
   return true;
+}
+
+function isHttpUrlBridge(value) {
+  if (typeof value !== 'string') return false;
+  const trimmed = value.trim();
+  if (!trimmed) return false;
+  try {
+    const u = new URL(trimmed);
+    return u.protocol === 'http:' || u.protocol === 'https:';
+  } catch (e) {
+    return false;
+  }
+}
+
+function isOceanofPdfBridge(source, extraSource, url) {
+  const blob = `${source || ''} ${extraSource || ''} ${url || ''}`.toLowerCase();
+  return blob.includes('oceanofpdf');
+}
+
+function isValidOceanofPdfPageUrlBridge(url) {
+  return isHttpUrlBridge(url) && String(url).toLowerCase().includes('oceanofpdf');
 }
 
 /**
@@ -1372,6 +1400,34 @@ export class BridgeService {
       downloadPayload.title = release.title;
       downloadPayload.format = release.format || 'epub';
       downloadPayload.author = release.author;
+    }
+
+    // Preserve/forward the verified source-page URL using Shelfmark's accepted field names.
+    const releasePageUrl =
+      release.infoUrl || release.info_url ||
+      release.downloadUrl || release.download_url ||
+      downloadPayload.info_url || downloadPayload.download_url || downloadPayload.source_url || null;
+    if (releasePageUrl) {
+      if (!downloadPayload.download_url) downloadPayload.download_url = releasePageUrl;
+      if (!downloadPayload.info_url) downloadPayload.info_url = releasePageUrl;
+      if (!downloadPayload.source_url) downloadPayload.source_url = releasePageUrl;
+    }
+    if (release.language && !downloadPayload.language) {
+      downloadPayload.language = release.language;
+    }
+
+    // OceanofPDF requires a real book page URL; never invent one from the hashed source_id.
+    const oceanSource = downloadPayload.source || release.source || release.extra?.source || '';
+    const oceanExtra = release.extra?.source || '';
+    const oceanUrl =
+      downloadPayload.source_url || downloadPayload.download_url || downloadPayload.info_url || releasePageUrl;
+    if (isOceanofPdfBridge(oceanSource, oceanExtra, oceanUrl)) {
+      if (!isValidOceanofPdfPageUrlBridge(oceanUrl)) {
+        throw new Error(`OceanofPDF release "${release.title || downloadPayload.title || ''}" has no book page URL`);
+      }
+      downloadPayload.source_url = oceanUrl;
+      if (!downloadPayload.download_url) downloadPayload.download_url = oceanUrl;
+      if (!downloadPayload.info_url) downloadPayload.info_url = oceanUrl;
     }
 
     const headers = { 'Content-Type': 'application/json' };

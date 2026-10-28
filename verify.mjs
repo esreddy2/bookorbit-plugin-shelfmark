@@ -113,7 +113,7 @@ async function runTests() {
   ok('preferFormat defaults to epub', plugin.settingsFields.find((f) => f.key === 'preferFormat')?.default === 'epub');
   ok('defines downloadViaShelfmark toggle', plugin.settingsFields.some((f) => f.key === 'downloadViaShelfmark'));
   ok('defines pollTimeoutSeconds defaulting to 240', plugin.settingsFields.find((f) => f.key === 'pollTimeoutSeconds')?.default === 240);
-  ok('declares semantic version 1.5.5', plugin.version === '1.5.5');
+  ok('declares semantic version 1.5.6', plugin.version === '1.5.6');
   ok('declares update channel', typeof plugin.update === 'object' && plugin.update !== null);
   ok('update manifestUrl is HTTPS and points to fork repo', typeof plugin.update?.manifestUrl === 'string' && plugin.update.manifestUrl.includes('esreddy2/bookorbit-plugin-shelfmark'));
   ok('update ed25519PublicKey is 43-char base64url', /^[A-Za-z0-9_-]{43}$/.test(plugin.update?.ed25519PublicKey ?? ''));
@@ -3966,6 +3966,8 @@ async function runTests() {
         format: 'epub',
         source: 'oceanofpdf',
         sourceId: 'frank-cand-2',
+        download_url: 'https://oceanofpdf.com/frankenstein-mary-shelley/',
+        info_url: 'https://oceanofpdf.com/frankenstein-mary-shelley/',
       };
       const qRes2 = await bridge.queueRelease({
         requestId: 82,
@@ -4259,7 +4261,7 @@ async function runTests() {
         }
         if (url.includes('/api/releases')) {
           return mockResponse([
-            { id: 'hobbit-1', source: 'oceanofpdf', source_id: 'hobbit-1', title: 'The Hobbit [EPUB]', author: 'J. R. R. Tolkien', format: 'epub' },
+            { id: 'hobbit-1', source: 'oceanofpdf', source_id: 'hobbit-1', title: 'The Hobbit [EPUB]', author: 'J. R. R. Tolkien', format: 'epub', download_url: 'https://oceanofpdf.com/the-hobbit-tolkien/', info_url: 'https://oceanofpdf.com/the-hobbit-tolkien/' },
           ]);
         }
         return mockResponse({});
@@ -4289,7 +4291,7 @@ async function runTests() {
       let downloadAttemptedForCompleted = false;
       await restartedService.queueRelease({
         requestId: 199,
-        release: { title: 'The Hobbit', author: 'J. R. R. Tolkien', format: 'epub', source: 'oceanofpdf', sourceId: 'hobbit-1' },
+        release: { title: 'The Hobbit', author: 'J. R. R. Tolkien', format: 'epub', source: 'oceanofpdf', sourceId: 'hobbit-1', downloadUrl: 'https://oceanofpdf.com/the-hobbit-tolkien/', infoUrl: 'https://oceanofpdf.com/the-hobbit-tolkien/' },
         fetchFn: async (url) => {
           if (url.includes('/api/releases/download')) downloadAttemptedForCompleted = true;
           return mockResponse({});
