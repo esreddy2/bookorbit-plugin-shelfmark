@@ -5,3 +5,5 @@ node_modules/
 .secrets/
 *.pem
 *.key
+.kilo/
+fixtures/bridge_test_*
