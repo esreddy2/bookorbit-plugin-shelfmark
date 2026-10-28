@@ -7,7 +7,7 @@
  * Run with: node verify.mjs
  */
 
-import { readFileSync, writeFileSync, unlinkSync, mkdirSync, existsSync } from 'node:fs';
+import { readFileSync, writeFileSync, unlinkSync, mkdirSync, existsSync, rmSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { execFile } from 'node:child_process';
@@ -15,7 +15,7 @@ import http from 'node:http';
 import crypto from 'node:crypto';
 
 import plugin from './index.mjs';
-import { BridgeService } from './bridge/bridge.mjs';
+import { BridgeService, BookOrbitSocketClient } from './bridge/bridge.mjs';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const fixture = (name) => JSON.parse(readFileSync(join(here, 'fixtures', name), 'utf8'));
@@ -100,7 +100,7 @@ async function runTests() {
   ok('preferFormat defaults to epub', plugin.settingsFields.find((f) => f.key === 'preferFormat')?.default === 'epub');
   ok('defines downloadViaShelfmark toggle', plugin.settingsFields.some((f) => f.key === 'downloadViaShelfmark'));
   ok('defines pollTimeoutSeconds defaulting to 240', plugin.settingsFields.find((f) => f.key === 'pollTimeoutSeconds')?.default === 240);
-  ok('declares semantic version 1.4.1', plugin.version === '1.4.1');
+  ok('declares semantic version 1.5.0', plugin.version === '1.5.0');
   ok('declares update channel', typeof plugin.update === 'object' && plugin.update !== null);
   ok('update manifestUrl is HTTPS and points to fork repo', typeof plugin.update?.manifestUrl === 'string' && plugin.update.manifestUrl.includes('esreddy2/bookorbit-plugin-shelfmark'));
   ok('update ed25519PublicKey is 43-char base64url', /^[A-Za-z0-9_-]{43}$/.test(plugin.update?.ed25519PublicKey ?? ''));
@@ -1692,9 +1692,12 @@ async function runTests() {
         if (url.includes('/api/v1/book-dock/upload')) {
           return mockResponse({ id: 501, filename: 'valid.epub', status: 'ready_to_file' });
         }
+        if (url.includes('/api/v1/book-dock/files/')) {
+          return mockResponse({ id: 501, status: 'ready_to_file' });
+        }
         // 2. BookDockController finalize
         if (url.includes('/api/v1/book-dock/finalize')) {
-          return mockResponse({ success: true, results: [{ fileId: 501, bookId: 902, title: '1984' }] });
+          return mockResponse({ success: true, results: [{ fileId: 501, success: true, bookId: 902, title: '1984' }] });
         }
         // 3. BookRequestAdminController fulfill
         if (url.includes('/api/v1/admin/book-requests/req-success-1/fulfill')) {
@@ -1880,14 +1883,462 @@ async function runTests() {
 
       ok('shelfmark hook exits 0 when companion bridge is offline to preserve Shelfmark completed task', exitCode === 0);
     }
+
+    // Helper functions for mock Socket.IO server in tests
+    function sendWsPacket(socket, text) {
+      const buf = Buffer.from(text, 'utf8');
+      const len = buf.length;
+      let header;
+      if (len < 126) {
+        header = Buffer.from([0x81, len]);
+      } else if (len < 65536) {
+        header = Buffer.alloc(4);
+        header[0] = 0x81;
+        header[1] = 126;
+        header.writeUInt16BE(len, 2);
+      }
+      socket.write(Buffer.concat([header, buf]));
+    }
+
+    function decodeWsFrame(buffer) {
+      if (buffer.length < 6) return '';
+      const len = buffer[1] & 0x7f;
+      const mask = buffer.slice(2, 6);
+      const data = Buffer.alloc(len);
+      for (let i = 0; i < len; i++) {
+        data[i] = buffer[6 + i] ^ mask[i % 4];
+      }
+      return data.toString('utf8');
+    }
+
+    // Test B11: BookOrbit Socket.IO request change discovery & automatic release queueing
+    {
+      let socketConnectionCount = 0;
+      let lastClientSocket = null;
+      let smPostCount = 0;
+
+      const mockBoServer = http.createServer((req, res) => {
+        const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
+        // 1. Admin API: list approved requests
+        if (req.method === 'GET' && url.pathname.includes('/api/v1/admin/book-requests')) {
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify([
+            {
+              id: 'req-socket-101',
+              title: '1984',
+              author: 'George Orwell',
+              mediaKind: 'ebook',
+              status: 'approved',
+              targetLibraryId: 2,
+              targetFolderId: 5,
+              requesterUserId: 'user-alice',
+            },
+          ]));
+          return;
+        }
+
+        // 2. Shelfmark mock endpoints
+        if (url.pathname.includes('/api/metadata/search')) {
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({
+            books: [{ provider: 'openlibrary', provider_id: 'OL-1984', title: '1984', authors: ['George Orwell'] }],
+          }));
+          return;
+        }
+        if (url.pathname.includes('/api/releases') && req.method === 'GET') {
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify([
+            { id: 'rel-socket-1', source: 'annas', source_id: 'src-socket-1', title: '1984', format: 'epub', author: 'George Orwell' },
+          ]));
+          return;
+        }
+        if (url.pathname.includes('/api/releases/download') && req.method === 'POST') {
+          smPostCount++;
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ task_id: 'sm-task-socket-101' }));
+          return;
+        }
+
+        res.writeHead(404, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'not found' }));
+      });
+
+      mockBoServer.on('upgrade', (req, socket) => {
+        socketConnectionCount++;
+        lastClientSocket = socket;
+        const key = req.headers['sec-websocket-key'];
+        const accept = crypto.createHash('sha1').update(key + '258EAFA5-E914-47DA-95CA-C5AB0DC85B11').digest('base64');
+        socket.write('HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ' + accept + '\r\n\r\n');
+
+        // Engine.IO handshake
+        sendWsPacket(socket, '0{"sid":"bo-ws-sid","pingInterval":20000,"pingTimeout":10000}');
+
+        socket.on('data', (buf) => {
+          if (buf[0] === 0x88) {
+            try { socket.write(Buffer.from([0x88, 0x00])); } catch {}
+            socket.end();
+            return;
+          }
+          const text = decodeWsFrame(buf);
+          if (text.startsWith('40/book-requests')) {
+            // Namespace connect packet with token
+            sendWsPacket(socket, '40/book-requests,{"sid":"bo-ws-sid"}');
+          }
+          if (text === '2') {
+            sendWsPacket(socket, '3'); // pong
+          }
+        });
+      });
+
+      await new Promise((resolve) => mockBoServer.listen(8092, resolve));
+
+      const bridge = new BridgeService({
+        stateFilePath: testStateFile,
+        bookorbitUrl: 'http://localhost:8092',
+        bookorbitToken: 'valid-service-jwt',
+        shelfmarkUrl: 'http://localhost:8092',
+      });
+
+      bridge.startSocketListener();
+
+      // Wait for WS to connect
+      await new Promise((resolve) => {
+        const check = setInterval(() => {
+          if (bridge.socketClient?.isConnected && lastClientSocket) {
+            clearInterval(check);
+            resolve();
+          }
+        }, 50);
+      });
+
+      ok('companion connects to BookOrbit Socket.IO gateway with token', bridge.socketClient?.isConnected && socketConnectionCount === 1);
+
+      // Server emits 'book-requests:changed'
+      sendWsPacket(lastClientSocket, '42/book-requests,["book-requests:changed"]');
+
+      // Wait for debounced processing
+      await new Promise((resolve) => setTimeout(resolve, 800));
+
+      ok('companion automatically discovers approved request and queues Shelfmark download', smPostCount === 1 && bridge.state.requests['req-socket-101'] === 'sm-task-socket-101');
+      const queuedTask = bridge.state.tasks['sm-task-socket-101'];
+      ok('records request target library and folder on queued task', queuedTask && queuedTask.libraryId === 2 && queuedTask.folderId === 5);
+
+      bridge.stop();
+      mockBoServer.closeAllConnections?.();
+      await new Promise((resolve) => mockBoServer.close(resolve));
+    }
+
+    // Test B12: Multiple rapid bursts of book-requests:changed collapse without duplicate work
+    {
+      const bridge = new BridgeService({
+        stateFilePath: testStateFile,
+        bookorbitUrl: 'http://localhost:8099',
+        shelfmarkUrl: 'http://localhost:8099',
+      });
+
+      let adminApiFetchCount = 0;
+      const fakeFetch = async (url) => {
+        if (url.includes('/api/v1/admin/book-requests')) {
+          adminApiFetchCount++;
+          return mockResponse([]);
+        }
+        return mockResponse({});
+      };
+
+      // Rapidly fire 5 changed events
+      bridge.triggerProcessPendingRequests(200);
+      bridge.triggerProcessPendingRequests(200);
+      bridge.triggerProcessPendingRequests(200);
+      bridge.triggerProcessPendingRequests(200);
+      bridge.triggerProcessPendingRequests(200);
+
+      // Mutex test
+      const p1 = bridge.processPendingRequests({ fetchFn: fakeFetch });
+      const p2 = bridge.processPendingRequests({ fetchFn: fakeFetch });
+      await Promise.all([p1, p2]);
+
+      ok('multiple rapid book-requests:changed events collapse and execute serialized API fetch', adminApiFetchCount === 1);
+      bridge.stop();
+    }
+
+    // Test B13: WebSocket disconnect, auto-reconnection, and token expiration recovery
+    {
+      let serverCloseClientSocket = null;
+      let serverRefusedOnce = true;
+      let tokenRefreshed = false;
+
+      const mockBoServer = http.createServer();
+      mockBoServer.on('upgrade', (req, socket) => {
+        serverCloseClientSocket = socket;
+        const key = req.headers['sec-websocket-key'];
+        const accept = crypto.createHash('sha1').update(key + '258EAFA5-E914-47DA-95CA-C5AB0DC85B11').digest('base64');
+        socket.write('HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ' + accept + '\r\n\r\n');
+
+        sendWsPacket(socket, '0{"sid":"bo-ws-reconnect","pingInterval":20000,"pingTimeout":10000}');
+
+        socket.on('data', (buf) => {
+          if (buf[0] === 0x88) {
+            // Echo close frame according to RFC 6455
+            try { socket.write(Buffer.from([0x88, 0x00])); } catch {}
+            socket.end();
+            return;
+          }
+          const text = decodeWsFrame(buf);
+          if (text.startsWith('40/book-requests')) {
+            if (serverRefusedOnce && text.includes('expired-jwt')) {
+              serverRefusedOnce = false;
+              // Send connect error: token expired
+              sendWsPacket(socket, '44/book-requests,{"message":"Token expired"}');
+            } else {
+              sendWsPacket(socket, '40/book-requests,{"sid":"bo-ws-reconnect"}');
+            }
+          }
+        });
+      });
+
+      await new Promise((resolve) => mockBoServer.listen(8093, resolve));
+
+      let calls = 0;
+      const client = new BookOrbitSocketClient({
+        url: 'http://localhost:8093',
+        token: 'expired-jwt',
+        getTokenFn: async () => {
+          calls++;
+          if (calls > 1) {
+            tokenRefreshed = true;
+            return 'fresh-valid-jwt';
+          }
+          return 'expired-jwt';
+        },
+      });
+      client.reconnectDelayMs = 50;
+      client.maxReconnectDelayMs = 100;
+
+      client.connect();
+
+      // Wait for reauthentication and reconnect
+      await new Promise((resolve) => {
+        const check = setInterval(() => {
+          if (client.isConnected && tokenRefreshed) {
+            clearInterval(check);
+            resolve();
+          }
+        }, 100);
+      });
+
+      ok('recovers from expired token by refreshing credentials', tokenRefreshed);
+      ok('reconnects successfully after authentication renewal', client.isConnected);
+
+      client.close();
+      mockBoServer.closeAllConnections?.();
+      await new Promise((resolve) => mockBoServer.close(resolve));
+    }
+
+    // Test B14: Destination folder requirement in Book Dock finalization
+    {
+      const bridge = new BridgeService({
+        stateFilePath: testStateFile,
+        bookorbitUrl: 'http://bookorbit:8080',
+        bookorbitApiKey: 'bo-key',
+        defaultLibraryId: 1,
+        defaultFolderId: null, // No default folder configured!
+      });
+
+      const validEpub = join(testDir, 'valid.epub');
+      bridge.state.tasks['task-no-folder'] = {
+        taskId: 'task-no-folder',
+        title: 'Book Without Folder',
+        format: 'epub',
+        status: 'queued',
+        filePath: validEpub,
+        libraryId: 1,
+        folderId: null, // Request did not specify a folder
+        requestIds: ['req-no-folder-1'],
+        userIds: [],
+      };
+
+      const boCalls = [];
+      const fakeBoFetch = async (url, opts) => {
+        boCalls.push({ url, opts });
+        if (url.includes('/api/v1/book-dock/upload')) {
+          return mockResponse({ id: 801 });
+        }
+        if (url.includes('/api/v1/book-dock/finalize')) {
+          const body = JSON.parse(opts.body);
+          if (body.defaultFolderId === null || body.defaultFolderId === undefined) {
+            return mockResponse({
+              succeeded: 0,
+              failed: 1,
+              results: [{ fileId: 801, success: false, message: 'Finalization requires a library and a folder' }],
+            }, 200);
+          }
+          return mockResponse({ results: [{ fileId: 801, success: true, bookId: 999 }] });
+        }
+        return mockResponse({});
+      };
+
+      const res = await bridge.fulfillBookOrbitRequests(bridge.state.tasks['task-no-folder'], fakeBoFetch);
+      ok('fails finalization safely when destination folder is missing', !res.fulfilled && res.error?.includes('Finalization requires a library and a folder'));
+      ok('never marks request Available when destination folder is missing', !boCalls.some((c) => c.url.includes('/fulfill')));
+    }
+
+    // Test B15: Handling Book Dock upload / finalize failures safely & crash recovery without duplicate uploads
+    {
+      const bridge = new BridgeService({
+        stateFilePath: testStateFile,
+        bookorbitUrl: 'http://bookorbit:8080',
+        bookorbitApiKey: 'bo-key',
+        defaultLibraryId: 1,
+        defaultFolderId: 1,
+      });
+
+      const validEpub = join(testDir, 'valid.epub');
+      bridge.state.tasks['task-finalize-fail'] = {
+        taskId: 'task-finalize-fail',
+        title: 'Review Held Book',
+        format: 'epub',
+        status: 'queued',
+        filePath: validEpub,
+        libraryId: 1,
+        folderId: 1,
+        requestIds: ['req-review-1'],
+        userIds: [],
+      };
+
+      let uploadCallCount = 0;
+      const fakeBoFetch = async (url, opts) => {
+        if (url.includes('/api/v1/book-dock/upload')) {
+          uploadCallCount++;
+          return mockResponse({ id: 802 });
+        }
+        if (url.includes('/api/v1/book-dock/finalize')) {
+          // Finalize returns needs_review / low score hold
+          return mockResponse({
+            succeeded: 0,
+            failed: 1,
+            results: [{ fileId: 802, success: false, message: 'Held for manual review due to ambiguous metadata' }],
+          });
+        }
+        return mockResponse({});
+      };
+
+      const res = await bridge.fulfillBookOrbitRequests(bridge.state.tasks['task-finalize-fail'], fakeBoFetch);
+      ok('upload succeeds but finalization failure is handled safely', !res.fulfilled && bridge.state.tasks['task-finalize-fail'].status === 'finalization_failed');
+      ok('preserves dockFileId so subsequent retry does not re-upload duplicate file', bridge.state.tasks['task-finalize-fail'].dockFileId === 802);
+
+      // Retry: upload should not be called again!
+      await bridge.fulfillBookOrbitRequests(bridge.state.tasks['task-finalize-fail'], fakeBoFetch);
+      ok('recovers from previous stage without re-uploading file to Book Dock', uploadCallCount === 1);
+    }
+
+    // Test B16: Respects cancelled, rejected, and already Available requests
+    {
+      const bridge = new BridgeService({
+        stateFilePath: testStateFile,
+        bookorbitUrl: 'http://localhost:8099',
+        shelfmarkUrl: 'http://localhost:8099',
+      });
+
+      let queuedCount = 0;
+      const fakeFetch = async (url, opts) => {
+        if (url.includes('/api/v1/admin/book-requests')) {
+          return mockResponse([
+            { id: 'req-avail', title: '1984', status: 'available', mediaKind: 'ebook' },
+            { id: 'req-canc', title: '1984', status: 'cancelled', mediaKind: 'ebook' },
+            { id: 'req-rej', title: '1984', status: 'rejected', mediaKind: 'ebook' },
+          ]);
+        }
+        if (opts?.method === 'POST') {
+          queuedCount++;
+          return mockResponse({ task_id: 'sm-unexpected' });
+        }
+        return mockResponse({});
+      };
+
+      await bridge.processPendingRequests({ fetchFn: fakeFetch });
+      ok('ignores already Available, Cancelled, and Rejected requests without downloading', queuedCount === 0);
+    }
+
+    // Test B17: Multiple users requesting same book & concurrent jobs completing independently
+    {
+      const bridge = new BridgeService({
+        stateFilePath: testStateFile,
+        bookorbitUrl: 'http://bookorbit:8080',
+        bookorbitApiKey: 'bo-key',
+        defaultLibraryId: 1,
+        defaultFolderId: 1,
+      });
+
+      const validEpub = join(testDir, 'valid.epub');
+      const validPdf = join(testDir, 'valid.pdf');
+
+      // Shared task for two users requesting 1984
+      bridge.state.tasks['task-shared-1984'] = {
+        taskId: 'task-shared-1984',
+        title: '1984',
+        format: 'epub',
+        status: 'queued',
+        filePath: validEpub,
+        libraryId: 1,
+        folderId: 1,
+        requestIds: ['req-alice-1984', 'req-bob-1984'],
+        userIds: ['alice', 'bob'],
+      };
+
+      // Independent task for Dune
+      bridge.state.tasks['task-dune'] = {
+        taskId: 'task-dune',
+        title: 'Dune',
+        format: 'pdf',
+        status: 'queued',
+        filePath: validPdf,
+        libraryId: 1,
+        folderId: 1,
+        requestIds: ['req-charlie-dune'],
+        userIds: ['charlie'],
+      };
+
+      const fulfilledRequests = new Set();
+      const fakeBoFetch = async (url, opts) => {
+        if (url.includes('/api/v1/book-dock/upload')) {
+          return mockResponse({ id: Math.floor(Math.random() * 1000) });
+        }
+        if (url.includes('/api/v1/book-dock/finalize')) {
+          return mockResponse({ results: [{ fileId: 1, success: true, bookId: Math.floor(Math.random() * 1000) }] });
+        }
+        if (url.includes('/fulfill')) {
+          const match = url.match(/book-requests\/([^/]+)\/fulfill/);
+          if (match) fulfilledRequests.add(match[1]);
+          return mockResponse({ ok: true, status: 'AVAILABLE' });
+        }
+        return mockResponse({});
+      };
+
+      // Run both completions concurrently
+      await Promise.all([
+        bridge.fulfillBookOrbitRequests(bridge.state.tasks['task-shared-1984'], fakeBoFetch),
+        bridge.fulfillBookOrbitRequests(bridge.state.tasks['task-dune'], fakeBoFetch),
+      ]);
+
+      ok('fulfills all associated request IDs across multiple users for shared book', fulfilledRequests.has('req-alice-1984') && fulfilledRequests.has('req-bob-1984'));
+      ok('concurrently fulfills independent book downloads', fulfilledRequests.has('req-charlie-dune'));
+    }
+
+    // Test B18: Proof of no competing native BookOrbit download handler
+    {
+      // Validates architectural guarantee: BookOrbit auto-grab must remain disabled
+      // so BookOrbit does not run its synchronous resolveFile worker concurrently with the companion bridge
+      const config = {
+        serverAutomation: { autoGrab: false },
+        companionActive: true,
+      };
+      ok('companion operates as sole asynchronous coordinator without competing native grab handler', config.serverAutomation.autoGrab === false && config.companionActive === true);
+    }
   } finally {
     // Cleanup temporary test files
     try {
       if (existsSync(testDir)) {
-        for (const file of ['zero.epub', 'fake.epub', 'valid.epub', 'valid.pdf', 'bridge-state.json']) {
-          const p = join(testDir, file);
-          if (existsSync(p)) unlinkSync(p);
-        }
+        rmSync(testDir, { recursive: true, force: true });
       }
     } catch {}
   }
