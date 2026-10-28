@@ -46,3 +46,9 @@ description: >-
 ### 6. Shelfmark Hook Contract & Zero-Exit Safety
 - `scripts/shelfmark-hook.sh` receives positional argument `$1` (target path) and rich nested JSON on `stdin`.
 - Shelfmark treats non-zero exit codes as download failures. The hook must catch delivery/network errors and exit `0` so Shelfmark preserves completed files. Background reconciliation will recover the task.
+
+## 7. OceanofPDF URL, Language, Cancellation & Progress (v1.5.6–v1.5.7)
+- Shelfmark requires the real OceanofPDF page URL in `source_url`/`download_url`/`info_url`; validate before POSTing.
+- Language must come from the release, never inherited from parent book metadata.
+- Cancellation checks belong before queueing, importing, and fulfilling; terminal per request.
+- Progress stages and failure reasons should be persisted in `requestProgress`/`requestStages`/`requestStatus` aliases.

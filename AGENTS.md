@@ -39,3 +39,11 @@ When asked to create, sign, or publish a release:
    ```bash
    GH_TOKEN=... gh release create v<new-version> index.mjs --repo esreddy2/bookorbit-plugin-shelfmark --title "..." --notes "..."
    ```
+
+## 5. OceanofPDF, Language, Cancellation & Progress Invariants (v1.5.6–v1.5.7)
+- Preserve and validate the real OceanofPDF page URL (`source_url`/`download_url`/`info_url`); never synthesize from hashed `source_id`.
+- Do not treat parent book language as proof of edition language; unknown stays unknown; reject known mismatches.
+- Do not confuse canonical title equivalents with translated editions.
+- Never claim a release has the request's ISBN without independent evidence.
+- Cancellation is terminal per request; preserve shared downloads for other active requests.
+- Record progress stages and meaningful failure reasons in companion state (`requestProgress` and aliases).
