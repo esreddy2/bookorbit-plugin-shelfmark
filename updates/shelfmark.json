@@ -1,8 +1,8 @@
 {
   "schemaVersion": 1,
   "type": "shelfmark",
-  "version": "1.5.6",
-  "sourceUrl": "https://github.com/esreddy2/bookorbit-plugin-shelfmark/releases/download/v1.5.6/index.mjs",
-  "sha256": "dd9a5960ac41572ed650759adde93c5667e107d2fbd7f89fb73dd423afa57f9c",
-  "signature": "/LuBe37i+9USE3KYKuTBA0M89VnRDjWELq7nLq+vex/pRZECLUsfEcMMHOMxaTJBvqLlBlnbwj/OFpkLuM9qAA=="
+  "version": "1.5.7",
+  "sourceUrl": "https://github.com/esreddy2/bookorbit-plugin-shelfmark/releases/download/v1.5.7/index.mjs",
+  "sha256": "9624254324b1848464f66d4c3ac376512807b39840955a16a729d7aa80073f4e",
+  "signature": "L+GeTwz2nKMuDusi+gupRrnnzwqn1cGxh4hhw5Lf6QlU1MgAxfo5+KSwjLsXL0VxdabV3e5h8AcS8rsS1HegDA=="
 }
