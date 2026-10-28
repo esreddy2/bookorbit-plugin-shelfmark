@@ -15,7 +15,15 @@ import http from 'node:http';
 import crypto from 'node:crypto';
 
 import plugin from './index.mjs';
-import { BridgeService, BookOrbitSocketClient } from './bridge/bridge.mjs';
+import {
+  BridgeService,
+  BookOrbitSocketClient,
+  BookOrbitAuthManager,
+  timingSafeCompare,
+  isJwt,
+  decodeJwtExp,
+  parseShelfmarkStatus,
+} from './bridge/bridge.mjs';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const fixture = (name) => JSON.parse(readFileSync(join(here, 'fixtures', name), 'utf8'));
@@ -100,7 +108,7 @@ async function runTests() {
   ok('preferFormat defaults to epub', plugin.settingsFields.find((f) => f.key === 'preferFormat')?.default === 'epub');
   ok('defines downloadViaShelfmark toggle', plugin.settingsFields.some((f) => f.key === 'downloadViaShelfmark'));
   ok('defines pollTimeoutSeconds defaulting to 240', plugin.settingsFields.find((f) => f.key === 'pollTimeoutSeconds')?.default === 240);
-  ok('declares semantic version 1.5.0', plugin.version === '1.5.0');
+  ok('declares semantic version 1.5.1', plugin.version === '1.5.1');
   ok('declares update channel', typeof plugin.update === 'object' && plugin.update !== null);
   ok('update manifestUrl is HTTPS and points to fork repo', typeof plugin.update?.manifestUrl === 'string' && plugin.update.manifestUrl.includes('esreddy2/bookorbit-plugin-shelfmark'));
   ok('update ed25519PublicKey is 43-char base64url', /^[A-Za-z0-9_-]{43}$/.test(plugin.update?.ed25519PublicKey ?? ''));
@@ -2333,6 +2341,396 @@ async function runTests() {
         companionActive: true,
       };
       ok('companion operates as sole asynchronous coordinator without competing native grab handler', config.serverAutomation.autoGrab === false && config.companionActive === true);
+    }
+
+    // Test B19: First-run backlog safety with BookOrbit pagination ({ items, total })
+    {
+      const b19StateFile = join(testDir, 'bridge-state-b19.json');
+      const bridge = new BridgeService({
+        stateFilePath: b19StateFile,
+        bookorbitUrl: 'http://localhost:8101',
+        shelfmarkUrl: 'http://localhost:8101',
+        shelfmarkApiKey: 'sm-key',
+      });
+
+      let pageFetches = [];
+      const historicalPage1 = [
+        { id: 'req-hist-1', title: 'Old 1', status: 'approved', mediaKind: 'ebook', createdAt: '2026-10-27T10:00:00Z' },
+        { id: 'req-hist-2', title: 'Old 2', status: 'approved', mediaKind: 'ebook', createdAt: '2026-10-27T10:05:00Z' },
+      ];
+      const historicalPage2 = [
+        { id: 'req-hist-3', title: 'Old 3', status: 'approved', mediaKind: 'ebook', createdAt: '2026-10-27T10:10:00Z' },
+      ];
+
+      const fakeFetch = async (url) => {
+        pageFetches.push(url);
+        if (url.includes('/api/v1/admin/book-requests')) {
+          if (url.includes('page=1')) {
+            return mockResponse({ items: historicalPage1, total: 3 });
+          }
+          if (url.includes('page=2')) {
+            return mockResponse({ items: historicalPage2, total: 3 });
+          }
+          return mockResponse({ items: [], total: 3 });
+        }
+        return mockResponse({});
+      };
+
+      // 1. First-run baseline initialization
+      await bridge.initializeBaseline({ fetchFn: fakeFetch });
+      ok('baseline initialization paginates through total count', pageFetches.some((u) => u.includes('page=1')) && pageFetches.some((u) => u.includes('page=2')));
+      ok('records all historical requests into baseline state', bridge.state.baselineRequestIds['req-hist-1'] && bridge.state.baselineRequestIds['req-hist-3']);
+      ok('records baselineEstablishedAt timestamp', Boolean(bridge.state.baselineEstablishedAt));
+
+      // 2. Subsequent processing: approved requests containing both historical and new
+      let queuedReleases = [];
+      const newRequest = {
+        id: 'req-new-1',
+        title: 'New Book',
+        author: 'New Author',
+        status: 'approved',
+        mediaKind: 'ebook',
+        createdAt: new Date(Date.now() + 60000).toISOString(),
+      };
+
+      const processFetch = async (url, opts) => {
+        if (url.includes('/api/v1/admin/book-requests')) {
+          return mockResponse({
+            items: [...historicalPage1, ...historicalPage2, newRequest],
+            total: 4,
+          });
+        }
+        if (url.includes('/api/metadata/search')) {
+          return mockResponse({ books: [{ provider: 'openlibrary', provider_id: 'OL-NB', title: 'New Book', authors: ['New Author'] }] });
+        }
+        if (url.includes('/api/releases') && opts?.method !== 'POST') {
+          return mockResponse([{ id: 'rel-nb-1', source: 'annas', source_id: 'src-nb-1', title: 'New Book', author: 'New Author', format: 'epub' }]);
+        }
+        if (url.includes('/api/releases/download') && opts?.method === 'POST') {
+          queuedReleases.push(JSON.parse(opts.body));
+          return mockResponse({ task_id: 'task-nb-1' });
+        }
+        return mockResponse({});
+      };
+
+      await bridge.processPendingRequests({ fetchFn: processFetch });
+
+      ok('first-run backlog safety ignores all baseline requests', !bridge.state.requests['req-hist-1'] && !bridge.state.requests['req-hist-2'] && !bridge.state.requests['req-hist-3']);
+      ok('first-run backlog safety processes only requests created after baseline', bridge.state.requests['req-new-1'] === 'task-nb-1' && queuedReleases.length === 1 && queuedReleases[0].title === 'New Book');
+    }
+
+    // Test B20: Secure HTTP server with timing-safe auth and 1MB request capping
+    {
+      const bridge = new BridgeService({
+        stateFilePath: testStateFile,
+        secret: 'super-secure-token-12345',
+        host: '127.0.0.1',
+      });
+
+      const server = bridge.createServer(8094, '127.0.0.1');
+      await new Promise((resolve) => server.listen(8094, '127.0.0.1', resolve));
+
+      const sendHttp = (pathname, method, headers, body) => new Promise((resolve) => {
+        const req = http.request({
+          hostname: '127.0.0.1',
+          port: 8094,
+          path: pathname,
+          method,
+          headers,
+        }, (res) => {
+          let resBody = '';
+          res.on('data', (c) => { resBody += c; });
+          res.on('end', () => resolve({ statusCode: res.statusCode, body: resBody }));
+        });
+        req.on('error', (err) => resolve({ error: err }));
+        if (body) req.write(body);
+        req.end();
+      });
+
+      // 1. Unauthenticated requests rejected on /api/queue and /api/reconcile
+      const unauthQueue = await sendHttp('/api/queue', 'POST', { 'Content-Type': 'application/json' }, '{}');
+      const unauthReconcile = await sendHttp('/api/reconcile', 'POST', { 'Content-Type': 'application/json' }, '{}');
+      const unauthWebhook = await sendHttp('/webhook/shelfmark', 'POST', { 'Content-Type': 'application/json' }, '{}');
+
+      ok('rejects unauthenticated POST /api/queue with 401', unauthQueue.statusCode === 401);
+      ok('rejects unauthenticated POST /api/reconcile with 401', unauthReconcile.statusCode === 401);
+      ok('rejects unauthenticated POST /webhook/shelfmark with 401', unauthWebhook.statusCode === 401);
+
+      // 2. Timing-safe comparison validation
+      ok('timing-safe secret validation accepts exact secret', timingSafeCompare('secret-token', 'secret-token'));
+      ok('timing-safe secret validation rejects mismatched secret', !timingSafeCompare('secret-token', 'secret-wrong'));
+      ok('timing-safe secret validation rejects mismatched length safely', !timingSafeCompare('secret-token', 'sec'));
+
+      // 3. Payload size capping (1MB limit)
+      const oversizedPayload = JSON.stringify({ huge: 'x'.repeat(1024 * 1024 + 100) });
+      const cappedRes = await sendHttp('/api/queue', 'POST', {
+        'Content-Type': 'application/json',
+        'X-Bridge-Secret': 'super-secure-token-12345',
+      }, oversizedPayload);
+
+      ok('caps request body size and responds with 413 Payload Too Large', cappedRes.statusCode === 413);
+
+      await new Promise((resolve) => server.close(resolve));
+    }
+
+    // Test B21: Shelfmark v1.5.1 keyed status parsing (complete, downloading, queued, error)
+    {
+      const bridge = new BridgeService({
+        stateFilePath: testStateFile,
+        allowedBaseDirs: [testDir],
+        shelfmarkUrl: 'http://localhost:8102',
+      });
+
+      const validEpub = join(testDir, 'valid.epub');
+
+      // Track active tasks
+      bridge.state.tasks['task-c1'] = { taskId: 'task-c1', title: 'Book C', format: 'epub', status: 'downloading', releaseKey: 'k-c1', requestIds: ['req-c1'], userIds: [] };
+      bridge.state.tasks['task-e1'] = { taskId: 'task-e1', title: 'Book E', format: 'epub', status: 'downloading', releaseKey: 'k-e1', requestIds: ['req-e1'], userIds: [] };
+      bridge.state.tasks['task-d1'] = { taskId: 'task-d1', title: 'Book D', format: 'epub', status: 'queued', releaseKey: 'k-d1', requestIds: ['req-d1'], userIds: [] };
+      bridge.state.releases['k-c1'] = 'task-c1';
+      bridge.state.releases['k-e1'] = 'task-e1';
+      bridge.state.releases['k-d1'] = 'task-d1';
+      bridge.saveState();
+
+      const shelfmarkStatusPayload = {
+        complete: [
+          { id: 'task-c1', title: 'Book C', format: 'epub', target: validEpub },
+        ],
+        downloading: [
+          { id: 'task-d1', title: 'Book D', format: 'epub' },
+        ],
+        queued: [],
+        error: [
+          { id: 'task-e1', title: 'Book E', error: 'Tracker returned 404 not found' },
+        ],
+      };
+
+      const parsed = parseShelfmarkStatus(shelfmarkStatusPayload);
+      ok('parseShelfmarkStatus extracts complete keyed group', parsed.complete.length === 1 && parsed.complete[0].id === 'task-c1');
+      ok('parseShelfmarkStatus extracts downloading keyed group', parsed.downloading.length === 1 && parsed.downloading[0].id === 'task-d1');
+      ok('parseShelfmarkStatus extracts error keyed group', parsed.error.length === 1 && parsed.error[0].id === 'task-e1');
+
+      const fakeSmFetch = async (url) => {
+        if (url.includes('/api/status')) {
+          return mockResponse(shelfmarkStatusPayload);
+        }
+        return mockResponse({});
+      };
+
+      await bridge.reconcile({ fetchFn: fakeSmFetch });
+
+      ok('reconciliation transitions complete group task to completed', bridge.state.tasks['task-c1'].status === 'completed');
+      ok('reconciliation transitions error group task to failed', bridge.state.tasks['task-e1'].status === 'failed' && bridge.state.tasks['task-e1'].error.includes('Tracker returned 404'));
+      ok('reconciliation frees release lock on error group task so retry is permitted', bridge.state.releases['k-e1'] === undefined);
+      ok('reconciliation preserves active downloading task state', bridge.state.tasks['task-d1'].status === 'queued' || bridge.state.tasks['task-d1'].status === 'downloading');
+    }
+
+    // Test B22: No fabricated task IDs & durable uncertain-queue resolution
+    {
+      const bridge = new BridgeService({
+        stateFilePath: testStateFile,
+        shelfmarkUrl: 'http://localhost:8103',
+      });
+
+      let downloadPostCount = 0;
+
+      const fakeFetch = async (url) => {
+        if (url.includes('/api/releases/download')) {
+          downloadPostCount++;
+          // Shelfmark returns 200 with no task ID (e.g. empty object)
+          return mockResponse({});
+        }
+        if (url.includes('/api/status')) {
+          // Status not showing the task yet
+          return mockResponse({ downloading: [], queued: [], complete: [], error: [] });
+        }
+        return mockResponse({});
+      };
+
+      const releaseCand = {
+        title: 'Uncertain Book',
+        format: 'epub',
+        source: 'annas',
+        sourceId: 'src-unc-1',
+      };
+
+      const queueResult = await bridge.queueRelease({
+        requestId: 'req-unc-1',
+        userId: 'alice',
+        release: releaseCand,
+        fetchFn: fakeFetch,
+      });
+
+      ok('never invents fabricated sm-... task ID on empty response', queueResult.taskId === null && queueResult.status === 'uncertain_queue');
+      ok('tracks uncertain queue in state.uncertainQueues', Boolean(bridge.state.uncertainQueues['annas:src-unc-1']));
+      ok('locks release as uncertain to prevent duplicate download POST', bridge.state.releases['annas:src-unc-1'] === 'uncertain');
+
+      // Second call for same release must NOT post duplicate!
+      const retryResult = await bridge.queueRelease({
+        requestId: 'req-unc-2',
+        userId: 'bob',
+        release: releaseCand,
+        fetchFn: fakeFetch,
+      });
+
+      ok('never blindly POSTs duplicate after uncertain result', downloadPostCount === 1 && retryResult.adopted === true);
+
+      // Now Shelfmark status shows real task ID
+      const fakeStatusWithRealTask = async (url) => {
+        if (url.includes('/api/status')) {
+          return mockResponse({
+            downloading: [{ id: 'real-sm-task-777', source_id: 'src-unc-1', title: 'Uncertain Book', format: 'epub' }],
+            queued: [],
+            complete: [],
+            error: [],
+          });
+        }
+        return mockResponse({});
+      };
+
+      await bridge.reconcile({ fetchFn: fakeStatusWithRealTask });
+
+      ok('reconciliation resolves uncertain queue with real Shelfmark task ID', bridge.state.tasks['real-sm-task-777'] && bridge.state.releases['annas:src-unc-1'] === 'real-sm-task-777');
+      ok('clears uncertain queue entry after real task resolution', bridge.state.uncertainQueues['annas:src-unc-1'] === undefined);
+    }
+
+    // Test B23: Real BookOrbit authentication renewal and session lifecycle
+    {
+      let refreshCalls = 0;
+
+      // Fake JWT: header.payload.signature with exp in future
+      const makeJwt = (expOffsetSec) => {
+        const header = Buffer.from(JSON.stringify({ alg: 'HS256', typ: 'JWT' })).toString('base64url');
+        const payload = Buffer.from(JSON.stringify({
+          sub: 'user-service-account',
+          exp: Math.floor(Date.now() / 1000) + expOffsetSec,
+        })).toString('base64url');
+        return `${header}.${payload}.fake_signature`;
+      };
+
+      const freshJwt = makeJwt(3600); // 1h in future
+      const expiringJwt = makeJwt(60); // 1m in future (< 5m buffer)
+
+      const fakeAuthFetch = async (url) => {
+        if (url.includes('/api/v1/auth/refresh')) {
+          refreshCalls++;
+          return mockResponse({
+            token: freshJwt,
+            refreshToken: 'refresh-token-xyz-2',
+            expiresAt: new Date(Date.now() + 3600000).toISOString(),
+          });
+        }
+        return mockResponse({});
+      };
+
+      const authMgr = new BookOrbitAuthManager({
+        url: 'http://localhost:8104',
+        username: 'service_bot',
+        password: 'secure_password',
+        token: expiringJwt,
+        refreshToken: 'initial-refresh',
+        fetchFn: fakeAuthFetch,
+      });
+
+      ok('detects token nearing expiration via decodeJwtExp', authMgr.isTokenExpired() === true);
+
+      const validToken = await authMgr.getValidToken();
+      ok('refreshes session prior to expiration using refresh token', refreshCalls === 1 && validToken === freshJwt);
+      ok('validates JWT format and decodes expiration', isJwt(validToken) && typeof decodeJwtExp(validToken) === 'number');
+      ok('rejects static API keys as valid session JWTs', isJwt('my-static-api-key-12345') === false);
+    }
+
+    // Test B24: Book Dock readiness settlement, already-filed file adoption, and crash recovery
+    {
+      const bridge = new BridgeService({
+        stateFilePath: testStateFile,
+        bookorbitUrl: 'http://localhost:8105',
+        allowedBaseDirs: [testDir],
+        defaultLibraryId: 1,
+        defaultFolderId: 1,
+      });
+
+      const validEpub = join(testDir, 'valid.epub');
+
+      // Scenario 1: Upload initially in 'processing', settles to 'ready_to_file', and finalizes
+      bridge.state.tasks['task-settle'] = {
+        taskId: 'task-settle',
+        title: 'Settling Book',
+        format: 'epub',
+        status: 'completed',
+        filePath: validEpub,
+        dockFileId: null,
+        matchedBookId: null,
+        requestIds: ['req-settle-1'],
+        userIds: [],
+      };
+
+      let checkCount = 0;
+      let finalizeCalled = false;
+      let fulfillCalls = 0;
+
+      const fakeBoFetch = async (url) => {
+        if (url.includes('/api/v1/book-dock/upload')) {
+          return mockResponse({ id: 911, status: 'processing' });
+        }
+        if (url.includes('/api/v1/book-dock/files/911')) {
+          checkCount++;
+          if (checkCount < 3) {
+            return mockResponse({ id: 911, status: 'processing' });
+          }
+          return mockResponse({ id: 911, status: 'ready_to_file' });
+        }
+        if (url.includes('/api/v1/book-dock/finalize')) {
+          finalizeCalled = true;
+          return mockResponse({
+            succeeded: 1,
+            failed: 0,
+            results: [{ fileId: 911, success: true, bookId: 9911 }],
+          });
+        }
+        if (url.includes('/fulfill')) {
+          fulfillCalls++;
+          return mockResponse({ id: 'req-settle-1', status: 'AVAILABLE' });
+        }
+        return mockResponse({});
+      };
+
+      const res = await bridge.fulfillBookOrbitRequests(bridge.state.tasks['task-settle'], fakeBoFetch);
+      ok('waits for file to settle from processing into ready_to_file', checkCount >= 3);
+      ok('finalizes file after ready_to_file reached', finalizeCalled && res.bookId === 9911);
+      ok('fulfills matching request with real matchedBookId', fulfillCalls === 1 && bridge.state.tasks['task-settle'].status === 'fulfilled');
+
+      // Scenario 2: Crash recovery where file was already filed in Book Dock
+      bridge.state.tasks['task-already-filed'] = {
+        taskId: 'task-already-filed',
+        title: 'Already Filed Book',
+        format: 'epub',
+        status: 'completed',
+        filePath: validEpub,
+        dockFileId: 922,
+        matchedBookId: null,
+        requestIds: ['req-filed-1'],
+        userIds: [],
+      };
+
+      let finalizeCalledForFiled = false;
+      const fakeBoFetchAlreadyFiled = async (url) => {
+        if (url.includes('/api/v1/book-dock/files/922')) {
+          return mockResponse({ id: 922, status: 'filed', bookId: 8822 });
+        }
+        if (url.includes('/api/v1/book-dock/finalize')) {
+          finalizeCalledForFiled = true;
+          return mockResponse({ results: [{ fileId: 922, success: true, bookId: 8822 }] });
+        }
+        if (url.includes('/fulfill')) {
+          return mockResponse({ error: 'Request is already fulfilled' }, 400);
+        }
+        return mockResponse({});
+      };
+
+      const resFiled = await bridge.fulfillBookOrbitRequests(bridge.state.tasks['task-already-filed'], fakeBoFetchAlreadyFiled);
+      ok('adopts bookId from already-filed Book Dock record without calling finalize again', !finalizeCalledForFiled && resFiled.bookId === 8822);
+      ok('handles 400 already fulfilled idempotently without failing', resFiled.fulfilled === true && bridge.state.tasks['task-already-filed'].status === 'fulfilled');
     }
   } finally {
     // Cleanup temporary test files

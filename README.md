@@ -204,7 +204,27 @@ BookOrbit computes release scores using its internal scoring matrix (title match
 
 ---
 
-### 5. Update Ownership & Release Signing
+### 5. Asynchronous Event-Driven Companion Architecture (v1.5.1)
+
+To decouple BookOrbit from its synchronous 240s HTTP `resolveFile` deadline for long-running downloads:
+
+1. **Disable Native Auto-Grab in BookOrbit:**  
+   In BookOrbit, navigate to **Settings > System > Automated Processing** (or Downloads) and ensure **Auto Grab is DISABLED**.  
+   *Why?* If auto-grab is enabled, BookOrbit's internal worker immediately calls `resolveFile()` synchronously and cuts the connection after 240 seconds. Disabling auto-grab allows BookOrbit to emit `book-requests:changed` over Socket.IO upon approval, leaving the download, verification, Book Dock import, and request fulfillment to the asynchronous companion bridge. Native Shelfmark release searching and manual candidate browsing in the BookOrbit UI remain fully operational.
+
+2. **First-Run Backlog Safety:**  
+   On first launch, the companion authenticates to BookOrbit and enumerates all pre-existing requests across paginated admin endpoints (`{ items, total }`), establishing a durable baseline in `.bridge-state.json`. Historical requests in this baseline are ignored; only requests approved after companion activation are processed.
+
+3. **Secure Zero-Dependency Companion Service:**  
+   - **Engine.IO / Socket.IO v4 Client:** Listens to `/book-requests` with authenticated session JWTs, handles heartbeats, auto-reconnects, and proactively refreshes expired tokens via `/api/v1/auth/refresh`.
+   - **Timing-Safe HTTP Server:** Binds to `127.0.0.1` (or private Docker network) and requires timing-safe secret validation (`crypto.timingSafeEqual`) on `/webhook/shelfmark`, `/api/queue`, and `/api/reconcile`, capping body sizes at 1MB.
+   - **Keyed Status Groups:** Fully parses Shelfmark v1.5.1 `/api/status` groups (`complete`, `downloading`, `queued`, `error`), freeing locks on errors and tracking genuine task states.
+   - **No Fabricated Task IDs:** If Shelfmark returns 200 without a task ID, the bridge queries `/api/status` or marks the task as `uncertain_queue` using strong release identity, never inventing synthetic IDs or double-POSTing duplicate jobs.
+   - **Genuine Book Dock Settlement:** Awaits `ready_to_file` state, requires `results[].success === true` and valid `bookId`, adopts already-filed files, and fulfills via `POST /api/v1/admin/book-requests/:id/fulfill`.
+
+---
+
+### 6. Update Ownership & Release Signing
 
 This fork is owned and maintained by `esreddy2`. It is cryptographically configured so that BookOrbit will **never** overwrite it with releases from the original upstream repository.
 
@@ -215,6 +235,37 @@ This fork is owned and maintained by `esreddy2`. It is cryptographically configu
 To generate a new signed release after modifying `index.mjs`:
 ```bash
 npm run release [optional-new-version]
+```
+
+---
+
+## CT105 One-Paste Deployment
+
+For Proxmox LXC 105 (CT105) hosting BookOrbit v3.5.0 (`/opt/bookorbit/data/app`) and Shelfmark v1.5.1 (port 8084), run this single block inside the staged repository directory:
+
+```bash
+git fetch origin --tags && \
+git checkout v1.5.1 && \
+mkdir -p /opt/bookorbit/data/app/plugins/indexers/shelfmark && \
+cp index.mjs /opt/bookorbit/data/app/plugins/indexers/shelfmark/index.mjs && \
+chmod 644 /opt/bookorbit/data/app/plugins/indexers/shelfmark/index.mjs && \
+chmod +x scripts/shelfmark-hook.sh && \
+docker restart bookorbit && \
+echo "✅ BookOrbit plugin updated to v1.5.1 and restarted."
+```
+
+To run the companion bridge as a managed background service:
+```bash
+export BOOKORBIT_URL="http://localhost:8080"
+export BOOKORBIT_USERNAME="your_admin_user"
+export BOOKORBIT_PASSWORD="your_admin_password"
+export SHELFMARK_URL="http://localhost:8084"
+export SHELFMARK_API_KEY="your_shelfmark_api_key"
+export BRIDGE_SECRET="your_shared_bridge_secret"
+export BRIDGE_HOST="127.0.0.1"
+export BRIDGE_PORT="8085"
+
+npm run bridge
 ```
 
 ---

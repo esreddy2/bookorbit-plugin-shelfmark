@@ -4,39 +4,47 @@
  * Fully event-driven integration between BookOrbit v3.5.0 and Shelfmark v1.5.1
  * without modifying BookOrbit core:
  *
- * 1. BookOrbit Socket.IO Trigger:
- *    - Authenticates to `/book-requests` namespace with service account JWT.
+ * 1. First-Run Backlog Safety:
+ *    - On first startup, enumerates all existing requests across paginated admin API.
+ *    - Persists durable baseline timestamp and request IDs before starting processing.
+ *    - Only processes requests created after this baseline; never floods historical backlog.
+ *
+ * 2. Real BookOrbit Session Authentication:
+ *    - Authenticates via BookOrbit session APIs (POST /api/v1/auth/login, /api/v1/auth/refresh).
+ *    - Proactively renews session JWT prior to expiration and handles reconnects.
+ *    - Prevents using static API keys as Socket.IO session JWTs.
+ *
+ * 3. BookOrbit Socket.IO Trigger:
+ *    - Authenticates to `/book-requests` gateway with verified session JWT.
  *    - Listens for `book-requests:changed` broadcast events.
- *    - Debounces and serializes fetching of approved ebook requests via admin API.
- *    - Handles session expiration, auto-reconnection, and network resilience.
+ *    - Debounces bursts (500ms) and serializes execution pass with an async mutex lock.
  *
- * 2. Release Search & Ranking:
- *    - Directly reuses corrected plugin search and ranking logic from index.mjs.
- *    - Queues top candidate release strictly once, persisting durable mappings.
+ * 4. Candidate Search & Ranking Reuse:
+ *    - Directly reuses corrected plugin search and ranking from index.mjs.
+ *    - Queues top candidate release once, persisting durable mappings.
  *
- * 3. Shelfmark v1.5.1 Custom Script Hook Integration:
- *    - Handles simultaneous $1 target path and nested stdin JSON payload.
- *    - Zero-exit protection: custom script exits 0 on bridge unavailability so
- *      Shelfmark never marks completed downloads as failed.
+ * 5. No Fabricated Task IDs & Uncertain Queue State:
+ *    - If Shelfmark returns 200 without task ID, immediately queries /api/status.
+ *    - If unconfirmed, tracks in durable `uncertain_queue` state using strong release identity.
+ *    - Never blindly POSTs duplicate jobs after uncertain results; resolves via reconciliation.
  *
- * 4. Symlink-Safe Canonical Path Containment:
- *    - Uses realpath canonicalization to reject directory traversal and null bytes.
- *    - Safely maps container paths to companion mount points.
+ * 6. Correct Shelfmark v1.5.1 Status Parsing:
+ *    - Handles keyed status groups: `complete`, `downloading`, `queued`, `error`.
+ *    - Frees release locks on failed/error tasks and adopts active/completed tasks.
  *
- * 5. Real BookOrbit v3.5.0 Book Dock & Fulfillment:
+ * 7. Secure HTTP Server & Hook Safety:
+ *    - Enforces timing-safe comparison (crypto.timingSafeEqual) on all secret validation.
+ *    - Authenticates /webhook/shelfmark, /api/queue, and /api/reconcile.
+ *    - Caps request body size at 1MB (413 Payload Too Large) and binds to local/private network.
+ *    - Zero-exit protection in shelfmark-hook.sh preserves completed downloads in Shelfmark.
+ *
+ * 8. Real BookOrbit v3.5.0 Book Dock & Fulfillment:
  *    - Ingests file via BookDockController (`POST /api/v1/book-dock/upload`).
- *    - Waits for upload to settle into finalizable state.
- *    - Finalizes into library using request target library/folder ahead of defaults
- *      via BookDockFinalizeService (`POST /api/v1/book-dock/finalize`).
- *    - Strictly checks `results[].success` and `results[].bookId`. If finalization
- *      fails or needs review, NEVER marks the request Available.
- *    - Fulfills via BookRequestAdminController (`POST /api/v1/admin/book-requests/:id/fulfill`)
- *      using real `FulfillBookRequestDto`.
- *    - Survives mid-flight crashes without duplicate uploads.
- *
- * 6. Bounded Periodic Reconciliation:
- *    - Runs at startup and on bounded 15-minute intervals.
- *    - No continuous 5-second polling loops.
+ *    - Awaits genuine finalizable state (`ready_to_file`) or adopts already-`filed` files.
+ *    - Finalizes into library requiring both library and destination folder.
+ *    - Strictly checks `results[].success === true` and valid positive `bookId`.
+ *    - Fulfills via BookRequestAdminController (`POST /api/v1/admin/book-requests/:id/fulfill`).
+ *    - Survives mid-flight crashes without duplicate uploads or duplicate fulfillment.
  *
  * Zero external dependencies — pure Node.js ECMAScript module.
  */
@@ -49,7 +57,7 @@ import crypto from 'node:crypto';
 import plugin from '../index.mjs';
 
 /** Magic byte signatures for supported book formats. */
-const MAGIC_BYTES = {
+export const MAGIC_BYTES = {
   epub: [0x50, 0x4b, 0x03, 0x04], // PK.. (ZIP archive)
   pdf: [0x25, 0x50, 0x44, 0x46],   // %PDF
 };
@@ -62,6 +70,161 @@ export function sanitizeLog(msg) {
     .replace(/(apiKey|api_key|token|secret|password)=([^&\s]+)/gi, '$1=[REDACTED]');
 }
 
+/** Timing-safe string comparison to prevent timing attacks on secrets. */
+export function timingSafeCompare(a, b) {
+  if (typeof a !== 'string' || typeof b !== 'string') return false;
+  const bufA = Buffer.from(a, 'utf8');
+  const bufB = Buffer.from(b, 'utf8');
+  if (bufA.length !== bufB.length) return false;
+  return crypto.timingSafeEqual(bufA, bufB);
+}
+
+/** Checks whether a string conforms to JSON Web Token format (header.payload.signature). */
+export function isJwt(token) {
+  if (!token || typeof token !== 'string') return false;
+  const parts = token.split('.');
+  return parts.length === 3;
+}
+
+/** Decodes the expiration timestamp (ms) from a JWT without external libraries. */
+export function decodeJwtExp(token) {
+  if (!isJwt(token)) return null;
+  const parts = token.split('.');
+  try {
+    const payload = JSON.parse(Buffer.from(parts[1], 'base64url').toString('utf8'));
+    if (typeof payload.exp === 'number') {
+      return payload.exp * 1000;
+    }
+  } catch {}
+  return null;
+}
+
+/**
+ * Parses Shelfmark v1.5.1 /api/status response, supporting keyed groups
+ * (`complete`, `downloading`, `queued`, `error`) and legacy arrays.
+ */
+export function parseShelfmarkStatus(statusJson) {
+  if (!statusJson || typeof statusJson !== 'object') {
+    return { complete: [], downloading: [], queued: [], error: [] };
+  }
+  return {
+    complete: statusJson.complete || statusJson.completed_tasks || [],
+    downloading: statusJson.downloading || statusJson.active_tasks || [],
+    queued: statusJson.queued || statusJson.queued_tasks || [],
+    error: statusJson.error || statusJson.failed_tasks || [],
+  };
+}
+
+/**
+ * Manages BookOrbit v3.5.0 authentication sessions, handling login,
+ * proactive token renewal, session refresh, and JWT validation.
+ */
+export class BookOrbitAuthManager {
+  constructor(options = {}) {
+    this.baseUrl = (options.url || process.env.BOOKORBIT_URL || 'http://localhost:8080').replace(/\/$/, '');
+    this.username = options.username || process.env.BOOKORBIT_USERNAME || '';
+    this.password = options.password || process.env.BOOKORBIT_PASSWORD || '';
+    this.token = options.token || process.env.BOOKORBIT_TOKEN || '';
+    this.refreshToken = options.refreshToken || process.env.BOOKORBIT_REFRESH_TOKEN || '';
+    this.apiKey = options.apiKey || process.env.BOOKORBIT_API_KEY || '';
+    this.expiresAt = options.expiresAt || (this.token ? decodeJwtExp(this.token) : null);
+    this.refreshBufferMs = options.refreshBufferMs || 5 * 60 * 1000; // Refresh 5m before expiry
+    this.fetchFn = options.fetchFn || globalThis.fetch;
+  }
+
+  isTokenExpired() {
+    if (!this.token) return true;
+    if (!this.expiresAt) {
+      this.expiresAt = decodeJwtExp(this.token);
+    }
+    if (!this.expiresAt) return false;
+    return Date.now() >= (this.expiresAt - this.refreshBufferMs);
+  }
+
+  async login() {
+    if (!this.username || !this.password) {
+      if (this.token && isJwt(this.token)) {
+        return this.token;
+      }
+      throw new Error('BookOrbit credentials missing: provide BOOKORBIT_USERNAME and BOOKORBIT_PASSWORD or BOOKORBIT_TOKEN');
+    }
+
+    const payload = this.username.includes('@')
+      ? { email: this.username, password: this.password }
+      : { username: this.username, password: this.password };
+
+    const res = await this.fetchFn(`${this.baseUrl}/api/v1/auth/login`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+
+    if (!res.ok) {
+      const errText = await res.text().catch(() => '');
+      throw new Error(`BookOrbit login failed (HTTP ${res.status}): ${errText}`);
+    }
+
+    const data = await res.json().catch(() => ({}));
+    const newToken = data.token || data.accessToken || data.jwt;
+    if (!newToken) {
+      throw new Error('BookOrbit login succeeded but no token was returned');
+    }
+
+    this.token = newToken;
+    this.refreshToken = data.refreshToken || this.refreshToken;
+    this.expiresAt = data.expiresAt ? new Date(data.expiresAt).getTime() : decodeJwtExp(newToken);
+    return this.token;
+  }
+
+  async refreshSession() {
+    if (this.refreshToken) {
+      try {
+        const res = await this.fetchFn(`${this.baseUrl}/api/v1/auth/refresh`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            ...(this.token ? { 'Authorization': `Bearer ${this.token}` } : {}),
+          },
+          body: JSON.stringify({ refreshToken: this.refreshToken }),
+        });
+
+        if (res.ok) {
+          const data = await res.json().catch(() => ({}));
+          const newToken = data.token || data.accessToken;
+          if (newToken) {
+            this.token = newToken;
+            this.refreshToken = data.refreshToken || this.refreshToken;
+            this.expiresAt = data.expiresAt ? new Date(data.expiresAt).getTime() : decodeJwtExp(newToken);
+            return this.token;
+          }
+        }
+      } catch (err) {
+        console.warn(`[AuthManager] Token refresh request error: ${sanitizeLog(err.message)}`);
+      }
+    }
+
+    if (this.username && this.password) {
+      return this.login();
+    }
+
+    return this.token;
+  }
+
+  async getValidToken() {
+    if (this.isTokenExpired()) {
+      if (this.refreshToken) {
+        try {
+          return await this.refreshSession();
+        } catch {}
+      }
+      if (this.username && this.password) {
+        return await this.login();
+      }
+    }
+    return this.token;
+  }
+}
+
 /**
  * Lightweight, zero-dependency Socket.IO v4 client connecting to BookOrbit's
  * `/book-requests` WebSocket gateway using native Node.js WebSocket.
@@ -71,6 +234,7 @@ export class BookOrbitSocketClient {
     this.baseUrl = (options.url || 'http://localhost:8080').replace(/\/$/, '');
     this.token = options.token || '';
     this.getTokenFn = options.getTokenFn || null;
+    this.authManager = options.authManager || null;
     this.ws = null;
     this.pingTimer = null;
     this.reconnectTimer = null;
@@ -89,13 +253,24 @@ export class BookOrbitSocketClient {
 
   async connect() {
     this.isClosed = false;
-    if (this.getTokenFn) {
+    if (this.authManager) {
+      try {
+        const refreshed = await this.authManager.getValidToken();
+        if (refreshed) this.token = refreshed;
+      } catch (err) {
+        console.warn(`[SocketClient] Auth manager token acquisition failed: ${sanitizeLog(err.message)}`);
+      }
+    } else if (this.getTokenFn) {
       try {
         const refreshed = await this.getTokenFn();
         if (refreshed) this.token = refreshed;
       } catch (err) {
         console.warn(`[SocketClient] Token refresh failed: ${sanitizeLog(err.message)}`);
       }
+    }
+
+    if (this.token && !isJwt(this.token)) {
+      console.warn('[SocketClient] Notice: Configured token is not in JWT format. BookOrbit gateway requires a session JWT.');
     }
 
     const wsProto = this.baseUrl.startsWith('https') ? 'wss' : 'ws';
@@ -109,9 +284,7 @@ export class BookOrbitSocketClient {
       return;
     }
 
-    this.ws.onopen = () => {
-      // Waiting for Engine.IO open packet ('0')
-    };
+    this.ws.onopen = () => {};
 
     this.ws.onmessage = (event) => {
       const data = typeof event.data === 'string' ? event.data : event.data.toString();
@@ -173,6 +346,9 @@ export class BookOrbitSocketClient {
       try { this.ws.close(); } catch {}
       this.isConnected = false;
       this.clearPingTimer();
+      if (this.authManager) {
+        this.authManager.refreshSession().catch(() => {});
+      }
       this.scheduleReconnect();
       return;
     }
@@ -240,6 +416,7 @@ export class BridgeService {
   constructor(options = {}) {
     this.stateFilePath = options.stateFilePath || path.resolve(process.cwd(), '.bridge-state.json');
     this.secret = options.secret || process.env.BRIDGE_SECRET || 'bookorbit-shelfmark-secret';
+    this.host = options.host || process.env.BRIDGE_HOST || '127.0.0.1';
     this.bookorbitUrl = (options.bookorbitUrl || process.env.BOOKORBIT_URL || 'http://localhost:8080').replace(/\/$/, '');
     this.bookorbitApiKey = options.bookorbitApiKey || process.env.BOOKORBIT_API_KEY || '';
     this.bookorbitToken = options.bookorbitToken || process.env.BOOKORBIT_TOKEN || '';
@@ -259,11 +436,25 @@ export class BridgeService {
       '/tmp',
     ];
 
+    // BookOrbit Authentication Session Manager
+    this.authManager = options.authManager || new BookOrbitAuthManager({
+      url: this.bookorbitUrl,
+      username: options.bookorbitUsername || process.env.BOOKORBIT_USERNAME || '',
+      password: options.bookorbitPassword || process.env.BOOKORBIT_PASSWORD || '',
+      token: options.bookorbitToken || process.env.BOOKORBIT_TOKEN || '',
+      refreshToken: options.bookorbitRefreshToken || process.env.BOOKORBIT_REFRESH_TOKEN || '',
+      apiKey: options.bookorbitApiKey || process.env.BOOKORBIT_API_KEY || '',
+      fetchFn: options.fetchFn,
+    });
+
     // In-memory state cache
     this.state = {
-      tasks: {},     // taskId -> TaskRecord
-      requests: {},  // requestId -> taskId
-      releases: {},  // releaseKey -> taskId
+      tasks: {},              // taskId -> TaskRecord
+      requests: {},           // requestId -> taskId
+      releases: {},           // releaseKey -> taskId
+      baselineRequestIds: {}, // requestId -> true
+      baselineEstablishedAt: null,
+      uncertainQueues: {},    // releaseKey -> UncertainRecord
     };
 
     this.reconcileTimer = null;
@@ -286,6 +477,9 @@ export class BridgeService {
           tasks: parsed.tasks || {},
           requests: parsed.requests || {},
           releases: parsed.releases || {},
+          baselineRequestIds: parsed.baselineRequestIds || {},
+          baselineEstablishedAt: parsed.baselineEstablishedAt || null,
+          uncertainQueues: parsed.uncertainQueues || {},
         };
       }
     } catch (err) {
@@ -311,12 +505,78 @@ export class BridgeService {
   }
 
   /**
+   * On first startup, enumerates all pre-existing BookOrbit requests across all
+   * pages to establish a baseline. Historical requests in this baseline are never queued.
+   */
+  async initializeBaseline({ fetchFn = globalThis.fetch } = {}) {
+    if (this.state.baselineEstablishedAt) {
+      return { established: true, count: Object.keys(this.state.baselineRequestIds || {}).length };
+    }
+
+    console.log('[Bridge] First-run: Establishing baseline of existing historical BookOrbit requests...');
+    let token = '';
+    try {
+      token = await this.authManager.getValidToken();
+    } catch {}
+    token = token || this.bookorbitToken || this.bookorbitApiKey;
+
+    const headers = {
+      ...(token ? { 'Authorization': `Bearer ${token}` } : {}),
+      ...(this.bookorbitApiKey ? { 'X-Api-Key': this.bookorbitApiKey } : {}),
+    };
+
+    let page = 1;
+    const limit = 50;
+    let total = Infinity;
+    let count = 0;
+
+    while (count < total) {
+      const url = `${this.bookorbitUrl}/api/v1/admin/book-requests?page=${page}&limit=${limit}`;
+      let res;
+      try {
+        res = await fetchFn(url, { headers });
+      } catch (err) {
+        console.warn(`[Bridge] Failed to fetch baseline page ${page}: ${sanitizeLog(err.message)}`);
+        break;
+      }
+
+      if (!res.ok) {
+        console.warn(`[Bridge] Baseline enumeration returned HTTP ${res.status}`);
+        break;
+      }
+
+      const data = await res.json().catch(() => ({}));
+      const items = Array.isArray(data) ? data : data.items || [];
+      if (typeof data.total === 'number') {
+        total = data.total;
+      }
+
+      if (items.length === 0) break;
+
+      for (const item of items) {
+        if (item.id) {
+          this.state.baselineRequestIds[item.id] = true;
+          count++;
+        }
+      }
+
+      if (count >= total) break;
+      page++;
+    }
+
+    this.state.baselineEstablishedAt = new Date().toISOString();
+    this.saveState();
+    console.log(`[Bridge] First-run baseline established with ${count} existing requests. Historical backlog will not be processed.`);
+    return { established: true, count };
+  }
+
+  /**
    * Translates Shelfmark container path to local filesystem path with
    * symlink-safe canonical path containment.
    */
   resolvePath(rawPath) {
     if (!rawPath || typeof rawPath !== 'string') return null;
-    if (rawPath.includes('\0')) return null; // Reject null bytes
+    if (rawPath.includes('\0')) return null;
 
     let candidate = rawPath;
     if (this.shelfmarkPathPrefix && this.localPathPrefix && candidate.startsWith(this.shelfmarkPathPrefix)) {
@@ -431,24 +691,23 @@ export class BridgeService {
    * Connects to BookOrbit Socket.IO gateway and hooks into book-requests:changed.
    */
   startSocketListener() {
-    if (!this.bookorbitToken && !this.bookorbitApiKey) {
-      console.warn('[Bridge] No BookOrbit token/API key configured. Socket.IO listener disabled.');
-      return;
-    }
-
     this.socketClient = new BookOrbitSocketClient({
       url: this.bookorbitUrl,
       token: this.bookorbitToken || this.bookorbitApiKey,
+      authManager: this.authManager,
+      getTokenFn: async () => {
+        return this.authManager.getValidToken();
+      },
     });
 
     this.socketClient.onConnect(() => {
       console.log('[Bridge] Connected to BookOrbit /book-requests Socket.IO gateway.');
-      this.triggerProcessPendingRequests(0); // Check on connect
+      this.triggerProcessPendingRequests(0);
     });
 
     this.socketClient.onChange(() => {
       console.log('[Bridge] Received book-requests:changed broadcast from BookOrbit.');
-      this.triggerProcessPendingRequests(500); // Debounced 500ms
+      this.triggerProcessPendingRequests(500);
     });
 
     this.socketClient.connect();
@@ -477,96 +736,141 @@ export class BridgeService {
     this.isProcessingRequests = true;
 
     try {
-      const boHeaders = {
-        'Authorization': `Bearer ${this.bookorbitToken || this.bookorbitApiKey}`,
-        'X-Api-Key': this.bookorbitApiKey || this.bookorbitToken,
-      };
-
-      // 1. Fetch approved requests from BookOrbit BookRequestAdminController
-      const url = `${this.bookorbitUrl}/api/v1/admin/book-requests?status=approved&limit=100`;
-      const res = await fetchFn(url, { headers: boHeaders });
-      if (!res.ok) {
-        if (res.status === 401 || res.status === 403) {
-          console.warn('[Bridge] Admin API unauthorized. Check service account token/permissions.');
-        }
-        return;
+      if (!this.state.baselineEstablishedAt) {
+        await this.initializeBaseline({ fetchFn });
       }
 
-      const data = await res.json().catch(() => ({}));
-      const requests = Array.isArray(data) ? data : data.items || [];
+      let token = '';
+      try {
+        token = await this.authManager.getValidToken();
+      } catch {}
+      token = token || this.bookorbitToken || this.bookorbitApiKey;
 
-      for (const req of requests) {
-        // Only process approved ebook requests; ignore settled (available, cancelled, rejected)
-        if (req.status !== 'approved') continue;
-        if (req.mediaKind && req.mediaKind !== 'ebook') continue;
+      const boHeaders = {
+        ...(token ? { 'Authorization': `Bearer ${token}` } : {}),
+        ...(this.bookorbitApiKey ? { 'X-Api-Key': this.bookorbitApiKey } : {}),
+      };
 
-        // Skip if already tracked
-        if (this.state.requests[req.id]) {
-          const existingTask = this.state.tasks[this.state.requests[req.id]];
-          if (existingTask && existingTask.status !== 'failed') {
+      let page = 1;
+      const limit = 50;
+      let total = Infinity;
+
+      while ((page - 1) * limit < total) {
+        const url = `${this.bookorbitUrl}/api/v1/admin/book-requests?status=approved&page=${page}&limit=${limit}`;
+        let res;
+        try {
+          res = await fetchFn(url, { headers: boHeaders });
+        } catch (err) {
+          console.warn(`[Bridge] Failed to fetch approved requests page ${page}: ${sanitizeLog(err.message)}`);
+          break;
+        }
+
+        if (!res.ok) {
+          if (res.status === 401 || res.status === 403) {
+            console.warn('[Bridge] Admin API unauthorized. Check service account token/permissions.');
+          }
+          break;
+        }
+
+        const data = await res.json().catch(() => ({}));
+        const requests = Array.isArray(data) ? data : data.items || [];
+        if (typeof data.total === 'number') {
+          total = data.total;
+        } else if (Array.isArray(data)) {
+          total = requests.length < limit ? (page - 1) * limit + requests.length : Infinity;
+        }
+
+        if (requests.length === 0) break;
+
+        for (const req of requests) {
+          // 1. Skip if part of historical baseline
+          if (this.state.baselineRequestIds && this.state.baselineRequestIds[req.id]) {
             continue;
+          }
+          if (req.createdAt && this.state.baselineEstablishedAt) {
+            if (new Date(req.createdAt).getTime() <= new Date(this.state.baselineEstablishedAt).getTime()) {
+              continue;
+            }
+          }
+
+          // 2. Only process approved ebook requests; ignore settled (available, cancelled, rejected)
+          if (req.status !== 'approved') continue;
+          if (req.mediaKind && req.mediaKind !== 'ebook') continue;
+
+          // 3. Skip if already tracked
+          if (this.state.requests[req.id]) {
+            const existingTaskId = this.state.requests[req.id];
+            if (existingTaskId === 'uncertain') {
+              continue;
+            }
+            const existingTask = this.state.tasks[existingTaskId];
+            if (existingTask && existingTask.status !== 'failed') {
+              continue;
+            }
+          }
+
+          // 4. Search releases using corrected plugin logic
+          const query = {
+            title: req.title,
+            author: req.author || (Array.isArray(req.authors) ? req.authors[0] : ''),
+            isbn13: req.isbn13 || (Array.isArray(req.isbn13s) ? req.isbn13s[0] : undefined),
+            mediaKind: 'ebook',
+          };
+
+          const config = {
+            baseUrl: this.shelfmarkUrl,
+            settings: {
+              apiKey: this.shelfmarkApiKey,
+              preferFormat: 'epub',
+            },
+          };
+
+          const host = {
+            fetch: async (fetchUrl, opts = {}) => {
+              const smHeaders = { ...(opts.headers || {}) };
+              if (this.shelfmarkApiKey) {
+                smHeaders['Authorization'] = `Bearer ${this.shelfmarkApiKey}`;
+                smHeaders['X-Api-Key'] = this.shelfmarkApiKey;
+              }
+              return fetchFn(fetchUrl, { ...opts, headers: smHeaders });
+            },
+            logger: { log: () => {}, warn: () => {}, error: () => {} },
+            buildSearchText: (q) => [q.title, q.author].filter(Boolean).join(' ').trim(),
+            fail: () => {},
+          };
+
+          let searchResults = [];
+          try {
+            searchResults = await plugin.search(query, config, host);
+          } catch (err) {
+            console.warn(`[Bridge] Plugin search error for "${query.title}": ${sanitizeLog(err.message)}`);
+            continue;
+          }
+
+          if (!searchResults || searchResults.length === 0) {
+            console.log(`[Bridge] No valid releases found for approved request ${req.id} ("${query.title}")`);
+            continue;
+          }
+
+          // 5. Select top-ranked candidate and queue to Shelfmark
+          const bestRelease = searchResults[0];
+          try {
+            await this.queueRelease({
+              requestId: req.id,
+              userId: req.requesterUserId || req.userId,
+              release: bestRelease,
+              libraryId: req.targetLibraryId || this.defaultLibraryId,
+              folderId: req.targetFolderId || this.defaultFolderId,
+              fetchFn,
+            });
+            console.log(`[Bridge] Queued release for request ${req.id} ("${bestRelease.title}")`);
+          } catch (err) {
+            console.error(`[Bridge] Failed to queue release for request ${req.id}: ${sanitizeLog(err.message)}`);
           }
         }
 
-        // 2. Search releases using corrected plugin logic
-        const query = {
-          title: req.title,
-          author: req.author || (Array.isArray(req.authors) ? req.authors[0] : ''),
-          isbn13: req.isbn13 || (Array.isArray(req.isbn13s) ? req.isbn13s[0] : undefined),
-          mediaKind: 'ebook',
-        };
-
-        const config = {
-          baseUrl: this.shelfmarkUrl,
-          settings: {
-            apiKey: this.shelfmarkApiKey,
-            preferFormat: 'epub',
-          },
-        };
-
-        // Host adapter routing calls to Shelfmark API
-        const host = {
-          fetch: async (fetchUrl, opts = {}) => {
-            const smHeaders = { ...(opts.headers || {}) };
-            if (this.shelfmarkApiKey) {
-              smHeaders['Authorization'] = `Bearer ${this.shelfmarkApiKey}`;
-              smHeaders['X-Api-Key'] = this.shelfmarkApiKey;
-            }
-            return fetchFn(fetchUrl, { ...opts, headers: smHeaders });
-          },
-          logger: { log: () => {}, warn: () => {}, error: () => {} },
-          buildSearchText: (q) => [q.title, q.author].filter(Boolean).join(' ').trim(),
-          fail: () => {},
-        };
-
-        let searchResults = [];
-        try {
-          searchResults = await plugin.search(query, config, host);
-        } catch (err) {
-          console.warn(`[Bridge] Plugin search error for "${query.title}": ${sanitizeLog(err.message)}`);
-          continue;
-        }
-
-        if (!searchResults || searchResults.length === 0) {
-          console.log(`[Bridge] No valid releases found for approved request ${req.id} ("${query.title}")`);
-          continue;
-        }
-
-        // 3. Select top-ranked candidate and queue to Shelfmark
-        const bestRelease = searchResults[0];
-        try {
-          await this.queueRelease({
-            requestId: req.id,
-            userId: req.requesterUserId || req.userId,
-            release: bestRelease,
-            libraryId: req.targetLibraryId || this.defaultLibraryId,
-            folderId: req.targetFolderId || this.defaultFolderId,
-            fetchFn,
-          });
-          console.log(`[Bridge] Queued release for request ${req.id} ("${bestRelease.title}")`);
-        } catch (err) {
-          console.error(`[Bridge] Failed to queue release for request ${req.id}: ${sanitizeLog(err.message)}`);
-        }
+        page++;
+        if (requests.length < limit) break;
       }
     } finally {
       this.isProcessingRequests = false;
@@ -575,6 +879,7 @@ export class BridgeService {
 
   /**
    * Queues a release exactly once. If already queued or completed, adopts existing task.
+   * If Shelfmark returns an uncertain response without a task ID, tracks in uncertain_queue state.
    */
   async queueRelease({ requestId, userId, release, libraryId, folderId, shelfmarkUrl, apiKey, fetchFn = globalThis.fetch }) {
     if (!requestId) throw new Error('requestId is required');
@@ -584,8 +889,16 @@ export class BridgeService {
     const smKey = apiKey || this.shelfmarkApiKey;
     const releaseKey = this.getReleaseKey(release);
 
-    // 1. Check if release already tracked
+    // 1. Check if release already tracked or in uncertain queue
     const existingTaskId = this.state.releases[releaseKey];
+    if (existingTaskId === 'uncertain') {
+      return {
+        status: 'uncertain_queue',
+        taskId: null,
+        adopted: true,
+      };
+    }
+
     if (existingTaskId && this.state.tasks[existingTaskId]) {
       const existing = this.state.tasks[existingTaskId];
 
@@ -651,17 +964,59 @@ export class BridgeService {
     if (res.ok) {
       const json = await res.json().catch(() => ({}));
       taskId = json.task_id || json.id || null;
+
+      if (!taskId) {
+        // Shelfmark returned 200 without task ID. Correlate with /api/status.
+        const statusRes = await fetchFn(`${smUrl}/api/status`, { headers });
+        if (statusRes.ok) {
+          const statusJson = await statusRes.json().catch(() => ({}));
+          const parsed = parseShelfmarkStatus(statusJson);
+          const candidates = [...parsed.downloading, ...parsed.queued, ...parsed.complete];
+          const matched = candidates.find((t) => {
+            const sid = t.source_id || t.release?.source_id;
+            return sid && sid === downloadPayload.source_id;
+          }) || candidates.find((t) => {
+            const titleMatch = (t.title || '').trim().toLowerCase() === (downloadPayload.title || '').trim().toLowerCase();
+            const formatMatch = (t.format || '').toLowerCase() === (downloadPayload.format || '').toLowerCase();
+            return titleMatch && formatMatch;
+          });
+          if (matched) {
+            taskId = matched.id || matched.task_id;
+          }
+        }
+
+        if (!taskId) {
+          // Record durable uncertain-queue state. Never fabricate an ID!
+          const now = new Date().toISOString();
+          this.state.uncertainQueues[releaseKey] = {
+            releaseKey,
+            requestId,
+            userId,
+            release: downloadPayload,
+            libraryId: libraryId ?? this.defaultLibraryId,
+            folderId: folderId ?? this.defaultFolderId,
+            queuedAt: now,
+            status: 'uncertain_queue',
+          };
+          this.state.releases[releaseKey] = 'uncertain';
+          this.state.requests[requestId] = 'uncertain';
+          this.saveState();
+
+          return {
+            status: 'uncertain_queue',
+            taskId: null,
+            adopted: false,
+          };
+        }
+      }
     } else if (res.status === 500) {
       const text = await res.text().catch(() => '');
       if (text.includes('already in the download queue') || text.includes('already exists')) {
         const statusRes = await fetchFn(`${smUrl}/api/status`, { headers });
         if (statusRes.ok) {
           const statusJson = await statusRes.json().catch(() => ({}));
-          const candidates = [
-            ...(statusJson.active_tasks || []),
-            ...(statusJson.queued_tasks || []),
-            ...(statusJson.completed_tasks || []),
-          ];
+          const parsed = parseShelfmarkStatus(statusJson);
+          const candidates = [...parsed.downloading, ...parsed.queued, ...parsed.complete];
           const matched = candidates.find((t) => {
             const sid = t.source_id || t.release?.source_id;
             return sid && sid === downloadPayload.source_id;
@@ -681,10 +1036,6 @@ export class BridgeService {
     } else {
       const text = await res.text().catch(() => '');
       throw new Error(`Shelfmark download failed (HTTP ${res.status}): ${text}`);
-    }
-
-    if (!taskId) {
-      taskId = `sm-${crypto.randomBytes(8).toString('hex')}`;
     }
 
     // 3. Persist new task record
@@ -729,7 +1080,7 @@ export class BridgeService {
    */
   async handleWebhook(payload, authHeader, fetchFn = globalThis.fetch) {
     const incomingSecret = (authHeader || '').replace(/^Bearer\s+/i, '').trim();
-    if (incomingSecret !== this.secret) {
+    if (!timingSafeCompare(incomingSecret, this.secret)) {
       return { ok: false, statusCode: 401, error: 'Unauthorized: Invalid bridge secret' };
     }
 
@@ -788,7 +1139,7 @@ export class BridgeService {
 
     // Import & fulfill BookOrbit requests
     let fulfillResult = null;
-    if (this.bookorbitUrl && (this.bookorbitApiKey || this.bookorbitToken)) {
+    if (this.bookorbitUrl) {
       fulfillResult = await this.fulfillBookOrbitRequests(task, fetchFn);
     }
 
@@ -808,25 +1159,32 @@ export class BridgeService {
    * Imports completed file into BookOrbit and fulfills matching requests using
    * real BookOrbit v3.5.0 controllers and DTOs:
    * 1. Ingest via Book Dock: POST /api/v1/book-dock/upload
-   * 2. Wait for upload to reach finalizable state
+   * 2. Wait for upload to reach genuinely finalizable state (ready_to_file) or adopt already-filed file
    * 3. Finalize into Library: POST /api/v1/book-dock/finalize with library and folder
    * 4. Fulfill Book Request: POST /api/v1/admin/book-requests/:id/fulfill
    */
   async fulfillBookOrbitRequests(task, fetchFn = globalThis.fetch) {
     const boUrl = this.bookorbitUrl;
-    const authHeader = `Bearer ${this.bookorbitToken || this.bookorbitApiKey}`;
+    let token = '';
+    try {
+      token = await this.authManager.getValidToken();
+    } catch {}
+    token = token || this.bookorbitToken || this.bookorbitApiKey;
+
     const headers = {
-      'Authorization': authHeader,
-      'X-Api-Key': this.bookorbitApiKey || this.bookorbitToken,
+      ...(token ? { 'Authorization': `Bearer ${token}` } : {}),
+      ...(this.bookorbitApiKey ? { 'X-Api-Key': this.bookorbitApiKey } : {}),
     };
 
-    // Reuse existing dockFileId if previously uploaded before restart
     let bookDockFileId = task.dockFileId || null;
     let matchedBookId = task.matchedBookId || null;
 
     // Step 1: Ingest file into Book Dock if not already uploaded
     if (!bookDockFileId) {
       try {
+        if (!task.filePath) {
+          throw new Error('Task filePath is missing');
+        }
         const fileName = path.basename(task.filePath);
         const fileData = fs.readFileSync(task.filePath);
 
@@ -866,24 +1224,39 @@ export class BridgeService {
       return { fulfilled: false, error: 'Book Dock file ID could not be obtained' };
     }
 
-    // Step 2: Wait for upload to reach a finalizable state (not processing)
+    // Step 2: Wait for upload to reach a genuinely finalizable state (ready_to_file) or adopt already-filed file
+    let isAlreadyFinalized = false;
     try {
-      let isReady = false;
-      for (let attempt = 0; attempt < 10; attempt++) {
+      for (let attempt = 0; attempt < 15; attempt++) {
         const checkRes = await fetchFn(`${boUrl}/api/v1/book-dock/files/${bookDockFileId}`, { headers });
         if (checkRes.ok) {
           const fileInfo = await checkRes.json().catch(() => ({}));
-          if (fileInfo.status && fileInfo.status !== 'processing' && fileInfo.status !== 'ingesting') {
-            isReady = true;
+          const fileStatus = (fileInfo.status || '').toLowerCase();
+          if (fileStatus === 'filed' || fileStatus === 'finalized') {
+            isAlreadyFinalized = true;
+            if (fileInfo.bookId && typeof fileInfo.bookId === 'number') {
+              matchedBookId = fileInfo.bookId;
+              task.matchedBookId = matchedBookId;
+              this.saveState();
+            }
             break;
+          }
+          if (fileStatus === 'ready_to_file') {
+            break;
+          }
+          if (fileStatus === 'error' || fileStatus === 'failed') {
+            task.status = 'finalization_failed';
+            task.error = fileInfo.error || fileInfo.message || 'Book Dock file reported error state';
+            this.saveState();
+            return { fulfilled: false, error: task.error };
           }
         }
         await new Promise((r) => setTimeout(r, 100));
       }
     } catch {}
 
-    // Step 3: Finalize into Target Library & Destination Folder
-    if (!matchedBookId) {
+    // Step 3: Finalize into Target Library & Destination Folder if not already finalized
+    if (!matchedBookId && !isAlreadyFinalized) {
       try {
         const finalizePayload = {
           fileIds: [bookDockFileId],
@@ -908,8 +1281,8 @@ export class BridgeService {
         const finalizeJson = await finalizeRes.json().catch(() => ({}));
         const resultItem = finalizeJson.results?.find((r) => r.fileId === bookDockFileId) || finalizeJson.results?.[0];
 
-        // CRITICAL: Strictly verify results[].success and results[].bookId
-        const isSuccess = Boolean(resultItem) && resultItem.success !== false && (resultItem.success === true || finalizeJson.success === true) && Boolean(resultItem.bookId);
+        // CRITICAL: Strictly require results[].success === true and valid positive bookId
+        const isSuccess = Boolean(resultItem) && resultItem.success === true && typeof resultItem.bookId === 'number' && resultItem.bookId > 0;
         if (!resultItem || !isSuccess) {
           task.status = 'finalization_failed';
           task.error = resultItem?.message || 'Finalization returned failed or needs review';
@@ -926,6 +1299,13 @@ export class BridgeService {
         this.saveState();
         return { fulfilled: false, error: task.error };
       }
+    }
+
+    if (!matchedBookId) {
+      task.status = 'finalization_failed';
+      task.error = 'Finalization did not yield a valid BookOrbit book ID';
+      this.saveState();
+      return { fulfilled: false, error: task.error };
     }
 
     // Step 4: Fulfill Book Requests via BookRequestAdminController
@@ -946,6 +1326,13 @@ export class BridgeService {
 
         if (fulfillRes.ok) {
           fulfilledCount++;
+        } else if (fulfillRes.status === 400) {
+          const errText = await fulfillRes.text().catch(() => '');
+          if (errText.includes('already fulfilled') || errText.includes('already AVAILABLE')) {
+            fulfilledCount++;
+          } else {
+            console.error(`[Bridge] Failed to fulfill request ${reqId} (HTTP ${fulfillRes.status}): ${errText}`);
+          }
         } else {
           console.error(`[Bridge] Failed to fulfill request ${reqId} (HTTP ${fulfillRes.status})`);
         }
@@ -970,18 +1357,18 @@ export class BridgeService {
   }
 
   /**
-   * Bounded reconciliation strategy to catch missed webhook events.
+   * Bounded reconciliation strategy to catch missed webhook events and resolve uncertain queues.
    * Runs periodically (e.g. every 15m) without continuous 5s polling.
    */
   async reconcile({ fetchFn = globalThis.fetch } = {}) {
     // 1. Reconcile pending BookOrbit requests
-    if (this.bookorbitUrl && (this.bookorbitApiKey || this.bookorbitToken)) {
+    if (this.bookorbitUrl) {
       await this.processPendingRequests({ fetchFn }).catch((err) => {
         console.warn(`[Bridge] Reconciliation request scan error: ${sanitizeLog(err.message)}`);
       });
     }
 
-    // 2. Reconcile completed Shelfmark downloads
+    // 2. Reconcile Shelfmark downloads via /api/status
     const smUrl = this.shelfmarkUrl;
     const headers = {};
     if (this.shelfmarkApiKey) {
@@ -998,26 +1385,73 @@ export class BridgeService {
       return { ok: false, error: err.message };
     }
 
+    const parsedStatus = parseShelfmarkStatus(statusData);
+    let updatedCount = 0;
+    const now = new Date().toISOString();
+
+    // 3. Resolve uncertain queues using parsed status groups
+    if (this.state.uncertainQueues && Object.keys(this.state.uncertainQueues).length > 0) {
+      const candidates = [...parsedStatus.downloading, ...parsedStatus.queued, ...parsedStatus.complete];
+      for (const [rKey, unrec] of Object.entries(this.state.uncertainQueues)) {
+        const matched = candidates.find((t) => {
+          const sid = t.source_id || t.release?.source_id;
+          return sid && sid === unrec.release?.source_id;
+        }) || candidates.find((t) => {
+          const titleMatch = (t.title || '').trim().toLowerCase() === (unrec.release?.title || '').trim().toLowerCase();
+          const formatMatch = (t.format || '').toLowerCase() === (unrec.release?.format || '').toLowerCase();
+          return titleMatch && formatMatch;
+        });
+
+        if (matched) {
+          const realTaskId = matched.id || matched.task_id;
+          const isComplete = parsedStatus.complete.some((c) => (c.id || c.task_id) === realTaskId);
+          const taskRecord = {
+            taskId: realTaskId,
+            releaseKey: rKey,
+            title: unrec.release?.title,
+            author: unrec.release?.author,
+            format: unrec.release?.format || 'epub',
+            source: unrec.release?.source,
+            sourceId: unrec.release?.source_id,
+            libraryId: unrec.libraryId,
+            folderId: unrec.folderId,
+            shelfmarkUrl: smUrl,
+            status: isComplete ? 'completed' : 'downloading',
+            filePath: null,
+            dockFileId: null,
+            matchedBookId: null,
+            requestIds: [unrec.requestId],
+            userIds: unrec.userId ? [unrec.userId] : [],
+            createdAt: unrec.queuedAt,
+            updatedAt: now,
+          };
+          this.state.tasks[realTaskId] = taskRecord;
+          this.state.releases[rKey] = realTaskId;
+          this.state.requests[unrec.requestId] = realTaskId;
+          delete this.state.uncertainQueues[rKey];
+          updatedCount++;
+        }
+      }
+    }
+
+    // 4. Correlate tracked active/queued tasks against complete and error groups
     const completedMap = new Map();
-    for (const t of statusData.completed_tasks || []) {
+    for (const t of parsedStatus.complete) {
       const id = t.id || t.task_id;
       if (id) completedMap.set(id, t);
     }
 
     const failedMap = new Map();
-    for (const t of statusData.failed_tasks || []) {
+    for (const t of parsedStatus.error) {
       const id = t.id || t.task_id;
       if (id) failedMap.set(id, t);
     }
-
-    let updatedCount = 0;
-    const now = new Date().toISOString();
 
     for (const task of Object.values(this.state.tasks)) {
       if (task.status === 'queued' || task.status === 'downloading') {
         if (completedMap.has(task.taskId)) {
           const smTask = completedMap.get(task.taskId);
-          const candidatePath = smTask.download_path || smTask.file_path || smTask.target || task.filePath;
+          const candidatePath = smTask.download_path || smTask.file_path || smTask.target || smTask.paths?.target || smTask.final_paths?.[0] || task.filePath;
           if (candidatePath) {
             const verify = this.verifyFile(candidatePath, task.format);
             if (verify.ok) {
@@ -1027,14 +1461,14 @@ export class BridgeService {
               task.updatedAt = now;
               updatedCount++;
 
-              if (this.bookorbitUrl && (this.bookorbitApiKey || this.bookorbitToken)) {
+              if (this.bookorbitUrl) {
                 await this.fulfillBookOrbitRequests(task, fetchFn);
               }
             }
           }
         } else if (failedMap.has(task.taskId)) {
           task.status = 'failed';
-          task.error = failedMap.get(task.taskId)?.error || 'Shelfmark reported failure';
+          task.error = failedMap.get(task.taskId)?.error || failedMap.get(task.taskId)?.message || 'Shelfmark reported failure';
           task.updatedAt = now;
           if (task.releaseKey && this.state.releases[task.releaseKey] === task.taskId) {
             delete this.state.releases[task.releaseKey];
@@ -1086,19 +1520,50 @@ export class BridgeService {
 
   /**
    * Starts HTTP server for webhook and queueing APIs.
+   * Enforces timing-safe secret validation, request body size limits,
+   * and local/private network binding.
    */
-  createServer(port = 8085) {
+  createServer(port = 8085, host = this.host) {
     const server = http.createServer(async (req, res) => {
       const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
 
+      // Helper to read and cap body size at 1MB
+      const readCappedBody = (cb) => {
+        let body = '';
+        let bodyLen = 0;
+        const maxLen = 1024 * 1024; // 1 MB
+        let aborted = false;
+
+        req.on('data', (chunk) => {
+          if (aborted) return;
+          bodyLen += chunk.length;
+          if (bodyLen > maxLen) {
+            aborted = true;
+            res.writeHead(413, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ ok: false, error: 'Payload Too Large' }));
+            req.destroy();
+            return;
+          }
+          body += chunk;
+        });
+
+        req.on('end', () => {
+          if (!aborted) cb(body);
+        });
+      };
+
+      // Helper for timing-safe auth verification
+      const checkAuth = () => {
+        const authHeader = req.headers['x-bridge-secret'] || (req.headers['authorization'] || '').replace(/^Bearer\s+/i, '').trim();
+        return timingSafeCompare(authHeader, this.secret);
+      };
+
       // Webhook endpoint: POST /webhook/shelfmark
       if (req.method === 'POST' && url.pathname === '/webhook/shelfmark') {
-        let body = '';
-        req.on('data', (chunk) => { body += chunk; });
-        req.on('end', async () => {
+        readCappedBody(async (body) => {
+          const authHeader = req.headers['x-bridge-secret'] || req.headers['authorization'];
           try {
             const payload = body ? JSON.parse(body) : {};
-            const authHeader = req.headers['x-bridge-secret'] || req.headers['authorization'];
             const result = await this.handleWebhook(payload, authHeader);
             res.writeHead(result.statusCode || 200, { 'Content-Type': 'application/json' });
             res.end(JSON.stringify(result));
@@ -1112,9 +1577,12 @@ export class BridgeService {
 
       // Queue endpoint: POST /api/queue
       if (req.method === 'POST' && url.pathname === '/api/queue') {
-        let body = '';
-        req.on('data', (chunk) => { body += chunk; });
-        req.on('end', async () => {
+        if (!checkAuth()) {
+          res.writeHead(401, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: 'Unauthorized: Invalid bridge secret' }));
+          return;
+        }
+        readCappedBody(async (body) => {
           try {
             const payload = body ? JSON.parse(body) : {};
             const result = await this.queueRelease(payload);
@@ -1130,6 +1598,11 @@ export class BridgeService {
 
       // Reconcile endpoint: POST /api/reconcile
       if (req.method === 'POST' && url.pathname === '/api/reconcile') {
+        if (!checkAuth()) {
+          res.writeHead(401, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: 'Unauthorized: Invalid bridge secret' }));
+          return;
+        }
         try {
           const result = await this.reconcile();
           res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -1148,6 +1621,8 @@ export class BridgeService {
           status: 'healthy',
           tasksCount: Object.keys(this.state.tasks).length,
           requestsCount: Object.keys(this.state.requests).length,
+          baselineCount: Object.keys(this.state.baselineRequestIds || {}).length,
+          uncertainCount: Object.keys(this.state.uncertainQueues || {}).length,
           socketConnected: this.socketClient ? this.socketClient.isConnected : false,
         }));
         return;
@@ -1164,11 +1639,14 @@ export class BridgeService {
 // Standalone execution entrypoint
 if (process.argv[1] && path.resolve(process.argv[1]) === path.resolve(new URL(import.meta.url).pathname)) {
   const port = process.env.BRIDGE_PORT ? parseInt(process.env.BRIDGE_PORT, 10) : 8085;
-  const bridge = new BridgeService();
+  const host = process.env.BRIDGE_HOST || '127.0.0.1';
+  const bridge = new BridgeService({ host });
   bridge.startReconciliation();
   bridge.startSocketListener();
-  const server = bridge.createServer(port);
-  server.listen(port, () => {
-    console.log(`[Bridge] BookOrbit ↔ Shelfmark Companion Bridge running on port ${port}`);
+  const server = bridge.createServer(port, host);
+  server.listen(port, host, () => {
+    console.log(`[Bridge] BookOrbit ↔ Shelfmark Companion Bridge running on ${host}:${port}`);
+    console.log('[Bridge] Notice: Ensure BookOrbit auto-grab is DISABLED in Settings > Automated Processing > Auto Grab.');
+    console.log('[Bridge] Native Shelfmark indexer searches and manual grab remain active; the companion handles approved request queueing and fulfillment asynchronously.');
   });
 }
