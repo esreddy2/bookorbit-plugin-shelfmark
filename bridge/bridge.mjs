@@ -164,6 +164,61 @@ export function parsePositiveInt(val) {
 }
 
 /**
+ * Authoritatively verifies whether two release or edition descriptors are compatible.
+ * Enforces strict matching on normalized title, author, publication year, format, and ISBN.
+ * Distinct publication years or conflicting authors/ISBNs are rejected as distinct editions.
+ */
+export function areEditionsCompatible(a, b) {
+  if (!a || !b) return false;
+
+  const titleA = (a.title || a.bookTitle || '').trim().toLowerCase();
+  const titleB = (b.title || b.bookTitle || '').trim().toLowerCase();
+  if (titleA && titleB && titleA !== titleB) {
+    return false;
+  }
+
+  const authorA = (a.author || (Array.isArray(a.authors) ? a.authors[0] : '') || '').trim().toLowerCase();
+  const authorB = (b.author || (Array.isArray(b.authors) ? b.authors[0] : '') || '').trim().toLowerCase();
+  if (authorA && authorB && authorA !== authorB) {
+    const cleanA = authorA.replace(/[^a-z0-9]/g, '');
+    const cleanB = authorB.replace(/[^a-z0-9]/g, '');
+    if (cleanA !== cleanB && !cleanA.includes(cleanB) && !cleanB.includes(cleanA)) {
+      const tokensA = authorA.split(/[^a-z0-9]+/).filter((t) => t.length > 1);
+      const tokensB = authorB.split(/[^a-z0-9]+/).filter((t) => t.length > 1);
+      const setA = new Set(tokensA);
+      const setB = new Set(tokensB);
+      const allAInB = tokensA.length > 0 && tokensA.every((t) => setB.has(t));
+      const allBInA = tokensB.length > 0 && tokensB.every((t) => setA.has(t));
+      if (!allAInB && !allBInA) {
+        return false;
+      }
+    }
+  }
+
+  const fmtA = (a.format || '').trim().toLowerCase();
+  const fmtB = (b.format || '').trim().toLowerCase();
+  if (fmtA && fmtB && fmtA !== fmtB) {
+    return false;
+  }
+
+  // Publication year: distinct years indicate distinct editions!
+  const yearA = parsePositiveInt(a.year || a.publicationYear || a.publishedYear);
+  const yearB = parsePositiveInt(b.year || b.publicationYear || b.publishedYear);
+  if (yearA && yearB && yearA !== yearB) {
+    return false;
+  }
+
+  // ISBN: distinct ISBNs indicate distinct editions!
+  const isbnA = (a.isbn13 || a.isbn || '').replace(/[^0-9X]/gi, '');
+  const isbnB = (b.isbn13 || b.isbn || '').replace(/[^0-9X]/gi, '');
+  if (isbnA && isbnB && isbnA !== isbnB) {
+    return false;
+  }
+
+  return true;
+}
+
+/**
  * Manages BookOrbit v3.5.0 authentication sessions, handling login,
  * proactive token renewal, session refresh, and JWT validation.
  */
@@ -504,6 +559,8 @@ export class BridgeService {
     this.fileVisibilityAttempts = options.fileVisibilityAttempts ?? 10;
     this.fileVisibilityDelayMs = options.fileVisibilityDelayMs ?? 200;
     this.fileVisibilityBackoff = options.fileVisibilityBackoff ?? 1.5;
+    this.releaseFailureCooldownMs = options.releaseFailureCooldownMs ?? (60 * 60 * 1000); // 1 hour cooldown
+    this.maxSourceAttempts = options.maxSourceAttempts ?? 3; // Maximum bounded attempts per request
 
     // Path translation & containment
     this.shelfmarkPathPrefix = options.shelfmarkPathPrefix || process.env.SHELFMARK_PATH_PREFIX || '';
@@ -534,6 +591,8 @@ export class BridgeService {
       baselineRequestIds: {}, // requestId -> true
       baselineEstablishedAt: null,
       uncertainQueues: {},    // releaseKey -> UncertainRecord
+      failedReleases: {},     // releaseKey -> { releaseKey, source, sourceId, failedAt, error }
+      requestSourceAttempts: {}, // requestId -> count
     };
 
     this.reconcileTimer = null;
@@ -559,6 +618,8 @@ export class BridgeService {
           baselineRequestIds: parsed.baselineRequestIds || {},
           baselineEstablishedAt: parsed.baselineEstablishedAt || null,
           uncertainQueues: parsed.uncertainQueues || {},
+          failedReleases: parsed.failedReleases || {},
+          requestSourceAttempts: parsed.requestSourceAttempts || {},
         };
       }
     } catch (err) {
@@ -755,7 +816,8 @@ export class BridgeService {
     }
     const title = (release.title || '').trim().toLowerCase();
     const format = (release.format || '').trim().toLowerCase();
-    return `${title}::${format}`;
+    const year = release.year || release.publicationYear || release.publishedYear || '';
+    return year ? `${title}::${year}::${format}` : `${title}::${format}`;
   }
 
   /**
@@ -957,6 +1019,7 @@ export class BridgeService {
           const query = {
             title: req.title,
             author: req.author || (Array.isArray(req.authors) ? req.authors[0] : ''),
+            year: req.year || req.publicationYear || req.publishedYear || undefined,
             isbn13: req.isbn13 || (Array.isArray(req.isbn13s) ? req.isbn13s[0] : undefined),
             mediaKind: 'ebook',
           };
@@ -996,8 +1059,29 @@ export class BridgeService {
             continue;
           }
 
-          // 5. Select top-ranked candidate and queue to Shelfmark
-          const bestRelease = searchResults[0];
+          // 5. Filter releases for edition compatibility and filter out recently failed releases
+          const eligibleReleases = searchResults.filter((rel) => {
+            if (!areEditionsCompatible(req, rel)) {
+              return false;
+            }
+            const rKey = this.getReleaseKey(rel);
+            if (rKey && this.state.failedReleases && this.state.failedReleases[rKey]) {
+              const failedRecord = this.state.failedReleases[rKey];
+              const timeSinceFail = Date.now() - new Date(failedRecord.failedAt).getTime();
+              if (timeSinceFail < this.releaseFailureCooldownMs) {
+                return false;
+              }
+            }
+            return true;
+          });
+
+          if (eligibleReleases.length === 0) {
+            console.log(`[Bridge] No eligible edition-compatible releases found for approved request ${req.id} ("${query.title}")`);
+            continue;
+          }
+
+          // 6. Select top-ranked eligible candidate and queue to Shelfmark
+          const bestRelease = eligibleReleases[0];
           try {
             await this.queueRelease({
               requestId: req.id,
@@ -1010,6 +1094,19 @@ export class BridgeService {
             console.log(`[Bridge] Queued release for request ${req.id} ("${bestRelease.title}")`);
           } catch (err) {
             console.error(`[Bridge] Failed to queue release for request ${req.id}: ${sanitizeLog(err.message)}`);
+            const rKey = this.getReleaseKey(bestRelease);
+            if (rKey) {
+              this.state.failedReleases[rKey] = {
+                releaseKey: rKey,
+                source: bestRelease.source,
+                sourceId: bestRelease.sourceId,
+                failedAt: new Date().toISOString(),
+                error: err.message,
+              };
+            }
+            const attempts = (this.state.requestSourceAttempts[req.id] || 0) + 1;
+            this.state.requestSourceAttempts[req.id] = attempts;
+            this.saveState();
           }
         }
 
@@ -1046,6 +1143,11 @@ export class BridgeService {
     if (existingTaskId && this.state.tasks[existingTaskId]) {
       const existing = this.state.tasks[existingTaskId];
 
+      // Safe edition verification before adopting existing task
+      if (!areEditionsCompatible(existing, release)) {
+        throw new Error(`Incompatible edition for existing task ${existingTaskId}: requested "${release.title}" (${release.year || 'unknown year'}) vs task "${existing.title}" (${existing.year || 'unknown year'})`);
+      }
+
       this.state.requests[requestId] = existingTaskId;
       if (!existing.requestIds.includes(requestId)) {
         existing.requestIds.push(requestId);
@@ -1059,6 +1161,11 @@ export class BridgeService {
       if ((existing.status === 'completed' || existing.status === 'fulfilled') && existing.filePath) {
         const verify = this.verifyFile(existing.filePath, existing.format);
         if (verify.ok) {
+          if (existing.matchedBookId && this.bookorbitUrl) {
+            this.fulfillBookOrbitRequests(existing, fetchFn).catch((err) => {
+              console.warn(`[Bridge] Fulfillment error on adopted task ${existingTaskId}: ${sanitizeLog(err.message)}`);
+            });
+          }
           return {
             status: 'completed',
             taskId: existingTaskId,
@@ -1182,13 +1289,51 @@ export class BridgeService {
       throw new Error(`Shelfmark download failed (HTTP ${res.status}): ${text}`);
     }
 
-    // 3. Persist new task record
+    // 3. Check if taskId already exists (safe adoption and merging instead of overwriting)
     const now = new Date().toISOString();
+    if (this.state.tasks[taskId]) {
+      const existing = this.state.tasks[taskId];
+      if (!areEditionsCompatible(existing, release)) {
+        throw new Error(`Incompatible edition for existing task ${taskId}: requested "${release.title}" (${release.year || 'unknown year'}) vs task "${existing.title}" (${existing.year || 'unknown year'})`);
+      }
+
+      this.state.requests[requestId] = taskId;
+      if (!existing.requestIds.includes(requestId)) {
+        existing.requestIds.push(requestId);
+      }
+      if (userId && !existing.userIds.includes(userId)) {
+        existing.userIds.push(userId);
+      }
+      if (releaseKey && !this.state.releases[releaseKey]) {
+        this.state.releases[releaseKey] = taskId;
+      }
+      existing.updatedAt = now;
+      this.saveState();
+
+      if (existing.matchedBookId && this.bookorbitUrl) {
+        this.fulfillBookOrbitRequests(existing, fetchFn).catch((err) => {
+          console.warn(`[Bridge] Fulfillment error on adopted task ${taskId}: ${sanitizeLog(err.message)}`);
+        });
+      }
+
+      return {
+        status: existing.status,
+        taskId,
+        adopted: true,
+        filePath: existing.filePath,
+        reused: Boolean(existing.matchedBookId),
+      };
+    }
+
+    // 4. Persist new task record
     const taskRecord = {
       taskId,
       releaseKey,
       title: downloadPayload.title || release.title,
       author: downloadPayload.author || release.author,
+      year: parsePositiveInt(release.year || release.publicationYear || downloadPayload.year) || null,
+      isbn: release.isbn13 || release.isbn || downloadPayload.isbn || null,
+      language: release.language || downloadPayload.language || null,
       format: (downloadPayload.format || release.format || 'epub').toLowerCase(),
       source: downloadPayload.source,
       sourceId: downloadPayload.source_id,
@@ -1201,6 +1346,9 @@ export class BridgeService {
       matchedBookId: null,
       requestIds: [requestId],
       userIds: userId ? [userId] : [],
+      requestFulfillments: {},
+      fulfilledRequestIds: [],
+      unfulfilledRequestIds: [requestId],
       createdAt: now,
       updatedAt: now,
     };
@@ -1330,37 +1478,116 @@ export class BridgeService {
   }
 
   /**
-   * Imports completed file into BookOrbit and fulfills matching requests using
-   * real BookOrbit v3.5.0 controllers and DTOs:
-   * 1. Ingest via Book Dock: POST /api/v1/book-dock/upload
-   * 2. Wait for upload to reach genuinely finalizable state (ready_to_file) or adopt already-filed file
-   * 3. Finalize into Library: POST /api/v1/book-dock/finalize with library and folder
-   * 4. Fulfill Book Request: POST /api/v1/admin/book-requests/:id/fulfill
+   * Uploads file directly into BookOrbit Library:
+   * POST /api/v1/libraries/:id/upload?folderId=:folderId
+   * Accepts multipart/form-data with file field "file".
    */
-  async fulfillBookOrbitRequests(task, fetchFn = globalThis.fetch) {
+  async uploadDirectToLibrary(task, targetLibraryId, targetFolderId, headers, fetchFn = globalThis.fetch) {
     const boUrl = this.bookorbitUrl;
-    let token = '';
-    try {
-      token = await this.authManager.getValidToken();
-    } catch {}
-    token = token || this.bookorbitToken || this.bookorbitApiKey;
+    let uploadUrl = `${boUrl}/api/v1/libraries/${targetLibraryId}/upload`;
+    if (targetFolderId) {
+      uploadUrl += `?folderId=${targetFolderId}`;
+    }
 
-    const headers = {
-      ...(token ? { 'Authorization': `Bearer ${token}` } : {}),
-      ...(this.bookorbitApiKey ? { 'X-Api-Key': this.bookorbitApiKey } : {}),
+    const fileName = path.basename(task.filePath);
+    const fileData = fs.readFileSync(task.filePath);
+
+    const boundary = `----BookOrbitDirectBoundary${Date.now()}`;
+    const multipartBody = Buffer.concat([
+      Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="${fileName}"\r\nContent-Type: application/octet-stream\r\n\r\n`),
+      fileData,
+      Buffer.from(`\r\n--${boundary}--\r\n`),
+    ]);
+
+    const uploadHeaders = {
+      ...headers,
+      'Content-Type': `multipart/form-data; boundary=${boundary}`,
     };
 
-    let bookDockFileId = task.dockFileId || null;
-    let matchedBookId = parsePositiveInt(task.matchedBookId) || null;
-    let readyToFinalize = Boolean(matchedBookId);
-    let isAlreadyFinalized = Boolean(matchedBookId);
+    let uploadRes;
+    try {
+      uploadRes = await fetchFn(uploadUrl, {
+        method: 'POST',
+        headers: uploadHeaders,
+        body: multipartBody,
+      });
+    } catch (err) {
+      return { error: `Network error during direct library upload: ${err.message}`, networkError: true };
+    }
 
-    // Step 1: Ingest file into Book Dock if not already uploaded and not already finalized
-    if (!bookDockFileId && !matchedBookId) {
-      try {
-        if (!task.filePath) {
-          throw new Error('Task filePath is missing');
+    if (uploadRes.status === 404) {
+      return { notFound: true };
+    }
+
+    if (uploadRes.ok) {
+      const data = await uploadRes.json().catch(() => ({}));
+      const bookId = parsePositiveInt(data.id || data.bookId || data.book?.id);
+      if (!bookId) {
+        // Empty response or missing book ID (e.g. unhandled route in mocks): fall back to Book Dock
+        return { notFound: true };
+      }
+      return { success: true, bookId };
+    }
+
+    if (uploadRes.status === 409) {
+      // Conflict: Book already exists. Inspect whether it is genuinely the same edition.
+      const conflictData = await uploadRes.json().catch(() => ({}));
+      const existingBook = conflictData.existingBook || conflictData.book || conflictData;
+      let existingBookId = parsePositiveInt(conflictData.id || conflictData.bookId || existingBook?.id);
+
+      if (existingBook && (existingBook.title || existingBook.name)) {
+        if (areEditionsCompatible(task, existingBook)) {
+          if (existingBookId) {
+            return { success: true, bookId: existingBookId, adoptedFromConflict: true };
+          }
+        } else {
+          return {
+            conflict: true,
+            error: `Direct upload conflict (409): existing book "${existingBook.title || existingBook.name}" (${existingBook.year || 'unknown year'}) is an incompatible edition with requested "${task.title}" (${task.year || 'unknown year'})`,
+          };
         }
+      }
+
+      if (existingBookId) {
+        try {
+          const bookRes = await fetchFn(`${boUrl}/api/v1/books/${existingBookId}`, { headers });
+          if (bookRes.ok) {
+            const fetchedBook = await bookRes.json().catch(() => ({}));
+            if (areEditionsCompatible(task, fetchedBook)) {
+              return { success: true, bookId: existingBookId, adoptedFromConflict: true };
+            } else {
+              return {
+                conflict: true,
+                error: `Direct upload conflict (409): verified existing book ${existingBookId} is an incompatible edition`,
+              };
+            }
+          }
+        } catch {}
+      }
+
+      return {
+        conflict: true,
+        error: `Direct upload conflict (409): could not authoritatively verify edition compatibility of existing book`,
+      };
+    }
+
+    const errText = await uploadRes.text().catch(() => '');
+    return { error: `Direct upload failed (HTTP ${uploadRes.status}): ${errText}` };
+  }
+
+  /**
+   * Uploads file via Book Dock fallback:
+   * POST /api/v1/book-dock/upload -> wait ready_to_file -> POST /api/v1/book-dock/finalize
+   */
+  async uploadViaBookDock(task, targetLibraryId, targetFolderId, headers, fetchFn = globalThis.fetch) {
+    const boUrl = this.bookorbitUrl;
+    let bookDockFileId = task.dockFileId || null;
+    let readyToFinalize = false;
+    let isAlreadyFinalized = false;
+    let matchedBookId = null;
+
+    if (!bookDockFileId) {
+      try {
         const fileName = path.basename(task.filePath);
         const fileData = fs.readFileSync(task.filePath);
 
@@ -1392,19 +1619,19 @@ export class BridgeService {
           this.saveState();
         } else {
           const errText = await uploadRes.text().catch(() => '');
-          return { fulfilled: false, error: `Book Dock upload failed (HTTP ${uploadRes.status}): ${errText}` };
+          return { success: false, error: `Book Dock upload failed (HTTP ${uploadRes.status}): ${errText}` };
         }
       } catch (err) {
-        return { fulfilled: false, error: `Book Dock upload error: ${err.message}` };
+        return { success: false, error: `Book Dock upload error: ${err.message}` };
       }
     }
 
-    if (!bookDockFileId && !matchedBookId) {
-      return { fulfilled: false, error: 'Book Dock file ID could not be obtained' };
+    if (!bookDockFileId) {
+      return { success: false, error: 'Book Dock file ID could not be obtained' };
     }
 
-    // Step 2: Wait for upload to reach a genuinely finalizable state (ready_to_file) or adopt already-filed file
-    if (!readyToFinalize && !matchedBookId) {
+    // Wait for upload to reach ready_to_file
+    if (!readyToFinalize) {
       try {
         for (let attempt = 0; attempt < this.dockReadinessAttempts; attempt++) {
           const checkRes = await fetchFn(`${boUrl}/api/v1/book-dock/files/${bookDockFileId}`, { headers });
@@ -1416,14 +1643,9 @@ export class BridgeService {
               if (bId) {
                 isAlreadyFinalized = true;
                 matchedBookId = bId;
-                task.matchedBookId = matchedBookId;
-                this.saveState();
                 break;
               } else {
-                task.status = 'finalization_failed';
-                task.error = 'Book Dock file reported filed but missing valid bookId';
-                this.saveState();
-                return { fulfilled: false, error: task.error };
+                return { success: false, finalizationFailed: true, error: 'Book Dock file reported filed but missing valid bookId' };
               }
             }
             if (fileStatus === 'ready_to_file') {
@@ -1431,10 +1653,7 @@ export class BridgeService {
               break;
             }
             if (fileStatus === 'error' || fileStatus === 'failed') {
-              task.status = 'finalization_failed';
-              task.error = fileInfo.error || fileInfo.message || 'Book Dock file reported error state';
-              this.saveState();
-              return { fulfilled: false, error: task.error };
+              return { success: false, finalizationFailed: true, error: fileInfo.error || fileInfo.message || 'Book Dock file reported error state' };
             }
           }
           await new Promise((r) => setTimeout(r, this.dockReadinessIntervalMs));
@@ -1444,27 +1663,18 @@ export class BridgeService {
       }
     }
 
-    // Fail closed: Never finalize a still-processing file!
     if (!readyToFinalize && !isAlreadyFinalized && !matchedBookId) {
-      task.status = 'finalization_failed';
-      task.error = `Book Dock file ${bookDockFileId} timed out waiting for ready_to_file state (still processing)`;
-      this.saveState();
-      return { fulfilled: false, error: task.error };
+      return { success: false, finalizationFailed: true, error: `Book Dock file ${bookDockFileId} timed out waiting for ready_to_file state (still processing)` };
     }
 
-    // Step 3: Finalize into Target Library & Destination Folder if not already finalized
+    // Finalize into Library
     if (!matchedBookId && !isAlreadyFinalized) {
-      const rawLibraryId = task.libraryId ?? this.defaultLibraryId;
-      const rawFolderId = task.folderId ?? this.defaultFolderId;
-
-      const targetLibraryId = parsePositiveInt(rawLibraryId);
-      const targetFolderId = parsePositiveInt(rawFolderId);
-
       if (!targetLibraryId || !targetFolderId) {
-        task.status = 'finalization_failed';
-        task.error = `Finalization requires a library and a folder: destination library or folder ID is unconfigured or invalid (library: ${rawLibraryId}, folder: ${rawFolderId})`;
-        this.saveState();
-        return { fulfilled: false, error: task.error };
+        return {
+          success: false,
+          finalizationFailed: true,
+          error: `Finalization requires a library and a folder: destination library or folder ID is unconfigured or invalid (library: ${targetLibraryId}, folder: ${targetFolderId})`,
+        };
       }
 
       try {
@@ -1482,33 +1692,125 @@ export class BridgeService {
 
         if (!finalizeRes.ok) {
           const errText = await finalizeRes.text().catch(() => '');
-          task.status = 'finalization_failed';
-          task.error = `Book Dock finalize HTTP ${finalizeRes.status}: ${errText}`;
-          this.saveState();
-          return { fulfilled: false, error: task.error };
+          return { success: false, finalizationFailed: true, error: `Book Dock finalize HTTP ${finalizeRes.status}: ${errText}` };
         }
 
         const finalizeJson = await finalizeRes.json().catch(() => ({}));
         const resultItem = finalizeJson.results?.find((r) => r.fileId === bookDockFileId) || finalizeJson.results?.[0];
 
-        // CRITICAL: Strictly require results[].success === true and valid positive bookId
         const resultBookId = parsePositiveInt(resultItem?.bookId);
         const isSuccess = Boolean(resultItem) && resultItem.success === true && Boolean(resultBookId);
         if (!resultItem || !isSuccess) {
-          task.status = 'finalization_failed';
-          task.error = resultItem?.message || 'Finalization returned failed or needs review';
-          this.saveState();
-          return { fulfilled: false, error: task.error };
+          return { success: false, finalizationFailed: true, error: resultItem?.message || 'Finalization returned failed or needs review' };
         }
 
         matchedBookId = resultBookId;
-        task.matchedBookId = matchedBookId;
-        this.saveState();
       } catch (err) {
+        return { success: false, finalizationFailed: true, error: `Book Dock finalize error: ${err.message}` };
+      }
+    }
+
+    if (!matchedBookId) {
+      return { success: false, finalizationFailed: true, error: 'Finalization did not yield a valid BookOrbit book ID' };
+    }
+
+    return { success: true, bookId: matchedBookId, dockFileId: bookDockFileId };
+  }
+
+  /**
+   * Imports completed file into BookOrbit and fulfills matching requests using
+   * real BookOrbit v3.5.0 controllers and DTOs:
+   * 1. Direct library upload (POST /api/v1/libraries/:id/upload?folderId=:folderId),
+   *    falling back to Book Dock staging if direct upload is 404
+   * 2. Persists matchedBookId before attempting fulfillment so uploads are never repeated
+   * 3. Fulfills Book Requests independently per request ID (POST /api/v1/admin/book-requests/:id/fulfill)
+   */
+  async fulfillBookOrbitRequests(task, fetchFn = globalThis.fetch) {
+    const boUrl = this.bookorbitUrl;
+    let token = '';
+    try {
+      token = await this.authManager.getValidToken();
+    } catch {}
+    token = token || this.bookorbitToken || this.bookorbitApiKey;
+
+    const headers = {
+      ...(token ? { 'Authorization': `Bearer ${token}` } : {}),
+      ...(this.bookorbitApiKey ? { 'X-Api-Key': this.bookorbitApiKey } : {}),
+    };
+
+    let matchedBookId = parsePositiveInt(task.matchedBookId) || null;
+
+    // Step 1: Import file into Library if not already uploaded/matched
+    if (!matchedBookId) {
+      if (!task.filePath) {
         task.status = 'finalization_failed';
-        task.error = `Book Dock finalize error: ${err.message}`;
+        task.error = 'Task filePath is missing';
         this.saveState();
         return { fulfilled: false, error: task.error };
+      }
+
+      const rawLibraryId = task.libraryId ?? this.defaultLibraryId;
+      const rawFolderId = task.folderId ?? this.defaultFolderId;
+
+      const targetLibraryId = parsePositiveInt(rawLibraryId);
+      const targetFolderId = parsePositiveInt(rawFolderId);
+
+      // If dockFileId already exists on task, continue Book Dock staging directly
+      if (task.dockFileId) {
+        const dockResult = await this.uploadViaBookDock(task, targetLibraryId, targetFolderId, headers, fetchFn);
+        if (!dockResult.success || !dockResult.bookId) {
+          if (dockResult.finalizationFailed) {
+            task.status = 'finalization_failed';
+            task.error = dockResult.error;
+            this.saveState();
+          }
+          return { fulfilled: false, error: dockResult.error };
+        }
+        matchedBookId = dockResult.bookId;
+        task.matchedBookId = matchedBookId;
+        task.uploadMethod = 'book_dock';
+        task.updatedAt = new Date().toISOString();
+        this.saveState(); // PERSISTED IMMEDIATELY BEFORE FULFILLMENT!
+      } else {
+        // Try direct library upload first if library and folder are configured
+        let directResult = { notFound: true };
+        if (targetLibraryId && targetFolderId) {
+          directResult = await this.uploadDirectToLibrary(task, targetLibraryId, targetFolderId, headers, fetchFn);
+        }
+        if (directResult.success && directResult.bookId) {
+          matchedBookId = directResult.bookId;
+          task.matchedBookId = matchedBookId;
+          task.uploadMethod = 'direct';
+          task.updatedAt = new Date().toISOString();
+          this.saveState(); // PERSISTED IMMEDIATELY BEFORE FULFILLMENT!
+        } else if (directResult.conflict) {
+          task.status = 'finalization_failed';
+          task.error = directResult.error;
+          this.saveState();
+          return { fulfilled: false, error: task.error };
+        } else if (directResult.notFound) {
+          // Direct upload endpoint returned 404 or unsupported -> fall back to Book Dock flow
+          const dockResult = await this.uploadViaBookDock(task, targetLibraryId, targetFolderId, headers, fetchFn);
+          if (!dockResult.success || !dockResult.bookId) {
+            if (dockResult.finalizationFailed) {
+              task.status = 'finalization_failed';
+              task.error = dockResult.error;
+              this.saveState();
+            }
+            return { fulfilled: false, error: dockResult.error };
+          }
+          matchedBookId = dockResult.bookId;
+          task.matchedBookId = matchedBookId;
+          task.dockFileId = dockResult.dockFileId;
+          task.uploadMethod = 'book_dock';
+          task.updatedAt = new Date().toISOString();
+          this.saveState(); // PERSISTED IMMEDIATELY BEFORE FULFILLMENT!
+        } else {
+          task.status = directResult.networkError ? 'uncertain_upload' : 'finalization_failed';
+          task.error = directResult.error;
+          this.saveState();
+          return { fulfilled: false, error: task.error };
+        }
       }
     }
 
@@ -1519,13 +1821,22 @@ export class BridgeService {
       return { fulfilled: false, error: task.error };
     }
 
-    // Step 4: Fulfill Book Requests via BookRequestAdminController
+    // Step 2: Fulfill Book Requests independently per request ID
+    if (!task.requestFulfillments || task.status === 'completed') {
+      task.requestFulfillments = {};
+    }
+
     let fulfilledCount = 0;
     for (const reqId of task.requestIds) {
+      if (task.requestFulfillments[reqId]?.fulfilled) {
+        fulfilledCount++;
+        continue;
+      }
+
       try {
         const fulfillDto = {
           matchedBookId,
-          bookDockFileId,
+          ...(task.dockFileId ? { bookDockFileId: task.dockFileId } : {}),
           note: `Automatically fulfilled via Shelfmark task ${task.taskId}`,
         };
 
@@ -1536,34 +1847,91 @@ export class BridgeService {
         });
 
         if (fulfillRes.ok) {
+          task.requestFulfillments[reqId] = {
+            fulfilled: true,
+            status: fulfillRes.status,
+            fulfilledAt: new Date().toISOString(),
+          };
           fulfilledCount++;
         } else if (fulfillRes.status === 400) {
           const errText = await fulfillRes.text().catch(() => '');
+          const sanitizedErr = sanitizeLog(errText);
           if (errText.includes('already fulfilled') || errText.includes('already AVAILABLE')) {
+            task.requestFulfillments[reqId] = {
+              fulfilled: true,
+              status: 400,
+              alreadyFulfilled: true,
+              fulfilledAt: new Date().toISOString(),
+            };
             fulfilledCount++;
+          } else if (errText.includes('status') || errText.includes('invalid state') || errText.includes('not in approved state')) {
+            task.requestFulfillments[reqId] = {
+              fulfilled: false,
+              status: 400,
+              errorType: 'invalid_request_state',
+              error: sanitizedErr,
+            };
+            console.warn(`[Bridge] Request ${reqId} fulfillment rejected (invalid state): ${sanitizedErr}`);
           } else {
-            console.error(`[Bridge] Failed to fulfill request ${reqId} (HTTP ${fulfillRes.status}): ${errText}`);
+            task.requestFulfillments[reqId] = {
+              fulfilled: false,
+              status: 400,
+              errorType: 'bad_request',
+              error: sanitizedErr,
+            };
+            console.error(`[Bridge] Failed to fulfill request ${reqId} (HTTP 400): ${sanitizedErr}`);
           }
+        } else if (fulfillRes.status === 403 || fulfillRes.status === 404) {
+          const errText = await fulfillRes.text().catch(() => '');
+          const sanitizedErr = sanitizeLog(errText);
+          const isInaccessible = errText.toLowerCase().includes('inaccessible') || errText.toLowerCase().includes('not found');
+          task.requestFulfillments[reqId] = {
+            fulfilled: false,
+            status: fulfillRes.status,
+            errorType: isInaccessible ? 'inaccessible_book' : 'unauthorized_or_not_found',
+            error: sanitizedErr,
+          };
+          console.error(`[Bridge] Request ${reqId} fulfillment error (HTTP ${fulfillRes.status}): ${sanitizedErr}`);
         } else {
-          console.error(`[Bridge] Failed to fulfill request ${reqId} (HTTP ${fulfillRes.status})`);
+          const errText = await fulfillRes.text().catch(() => '');
+          task.requestFulfillments[reqId] = {
+            fulfilled: false,
+            status: fulfillRes.status,
+            errorType: 'transient_server_error',
+            error: sanitizeLog(errText),
+          };
+          console.error(`[Bridge] Request ${reqId} fulfillment server error (HTTP ${fulfillRes.status})`);
         }
       } catch (err) {
+        task.requestFulfillments[reqId] = {
+          fulfilled: false,
+          status: 0,
+          errorType: 'network_error',
+          error: sanitizeLog(err.message),
+        };
         console.error(`[Bridge] Failed to fulfill BookOrbit request ${reqId}: ${sanitizeLog(err.message)}`);
       }
     }
 
-    const isFulfilled = fulfilledCount > 0;
-    if (isFulfilled) {
+    task.fulfilledRequestIds = task.requestIds.filter((id) => task.requestFulfillments[id]?.fulfilled);
+    task.unfulfilledRequestIds = task.requestIds.filter((id) => !task.requestFulfillments[id]?.fulfilled);
+
+    const allFulfilled = task.requestIds.length > 0 && task.unfulfilledRequestIds.length === 0;
+    if (allFulfilled) {
       task.status = 'fulfilled';
-      task.updatedAt = new Date().toISOString();
-      this.saveState();
+    } else if (task.fulfilledRequestIds.length > 0) {
+      task.status = 'partially_fulfilled';
     }
+    task.updatedAt = new Date().toISOString();
+    this.saveState();
 
     return {
-      fulfilled: isFulfilled,
+      fulfilled: allFulfilled,
       count: fulfilledCount,
       bookId: matchedBookId,
-      dockFileId: bookDockFileId,
+      dockFileId: task.dockFileId || null,
+      fulfilledRequestIds: task.fulfilledRequestIds,
+      unfulfilledRequestIds: task.unfulfilledRequestIds,
     };
   }
 
@@ -1718,14 +2086,43 @@ export class BridgeService {
         if (task.releaseKey && this.state.releases[task.releaseKey] === task.taskId) {
           delete this.state.releases[task.releaseKey];
         }
+        if (task.releaseKey) {
+          this.state.failedReleases[task.releaseKey] = {
+            releaseKey: task.releaseKey,
+            source: task.source,
+            sourceId: task.sourceId,
+            failedAt: now,
+            error: task.error,
+          };
+        }
+
+        // Bounded selection of alternative eligible sources/releases
+        for (const reqId of (task.requestIds || [])) {
+          if (!task.requestFulfillments || !task.requestFulfillments[reqId]?.fulfilled) {
+            const attempts = (this.state.requestSourceAttempts[reqId] || 0) + 1;
+            this.state.requestSourceAttempts[reqId] = attempts;
+            if (attempts < this.maxSourceAttempts) {
+              delete this.state.requests[reqId];
+              this.triggerProcessPendingRequests(100);
+            } else {
+              console.warn(`[Bridge] Request ${reqId} reached max source attempts (${attempts}/${this.maxSourceAttempts}). Halting retries.`);
+            }
+          }
+        }
         updatedCount++;
-      } else if (task.status === 'completed' || task.status === 'finalization_failed') {
-        // Task was completed and verified, but Book Dock finalization or fulfillment failed mid-flight
-        if (task.filePath && this.bookorbitUrl) {
-          const verify = this.verifyFile(task.filePath, task.format);
-          if (verify.ok) {
+      } else if (task.status === 'completed' || task.status === 'finalization_failed' || task.status === 'partially_fulfilled' || task.status === 'uncertain_upload') {
+        // Task completed or partially fulfilled mid-flight; retry fulfillment
+        if (this.bookorbitUrl) {
+          if (task.matchedBookId) {
+            // Already uploaded! Retry fulfillment for unfulfilled requests directly without re-uploading
             await this.fulfillBookOrbitRequests(task, fetchFn);
             updatedCount++;
+          } else if (task.filePath) {
+            const verify = this.verifyFile(task.filePath, task.format);
+            if (verify.ok) {
+              await this.fulfillBookOrbitRequests(task, fetchFn);
+              updatedCount++;
+            }
           }
         }
       }

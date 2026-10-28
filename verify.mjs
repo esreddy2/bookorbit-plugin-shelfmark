@@ -25,6 +25,7 @@ import {
   parseShelfmarkStatus,
   normalizeTaskGroup,
   parsePositiveInt,
+  areEditionsCompatible,
 } from './bridge/bridge.mjs';
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -110,7 +111,7 @@ async function runTests() {
   ok('preferFormat defaults to epub', plugin.settingsFields.find((f) => f.key === 'preferFormat')?.default === 'epub');
   ok('defines downloadViaShelfmark toggle', plugin.settingsFields.some((f) => f.key === 'downloadViaShelfmark'));
   ok('defines pollTimeoutSeconds defaulting to 240', plugin.settingsFields.find((f) => f.key === 'pollTimeoutSeconds')?.default === 240);
-  ok('declares semantic version 1.5.3', plugin.version === '1.5.3');
+  ok('declares semantic version 1.5.4', plugin.version === '1.5.4');
   ok('declares update channel', typeof plugin.update === 'object' && plugin.update !== null);
   ok('update manifestUrl is HTTPS and points to fork repo', typeof plugin.update?.manifestUrl === 'string' && plugin.update.manifestUrl.includes('esreddy2/bookorbit-plugin-shelfmark'));
   ok('update ed25519PublicKey is 43-char base64url', /^[A-Za-z0-9_-]{43}$/.test(plugin.update?.ed25519PublicKey ?? ''));
@@ -3451,6 +3452,264 @@ async function runTests() {
       ok('client does NOT send unsolicited PING 2 packets', !wsClientSentPackets.includes('2'));
 
       socketClient.close();
+      bridge.stop();
+    }
+
+    // Test B29: Direct Upload, Task ID Collision Safety, Edition Respect & Source Retry
+    console.log('\n--- 12. Direct Upload, Task Collision Safety, Independent Fulfillment & Edition Compatibility ---');
+    {
+      const b29StateFile = join(testDir, '.bridge-b29-state.json');
+      const bridge = new BridgeService({
+        stateFilePath: b29StateFile,
+        allowedBaseDirs: [testDir],
+        defaultLibraryId: 10,
+        defaultFolderId: 20,
+        releaseFailureCooldownMs: 1000,
+        maxSourceAttempts: 3,
+      });
+
+      // 1. areEditionsCompatible validation
+      const frankenstein1818 = { title: 'Frankenstein', author: 'Mary Shelley', year: 1818, format: 'epub' };
+      const frankenstein2015 = { title: 'Frankenstein', author: 'Mary Shelley', year: 2015, format: 'epub' };
+      const frankenstein1818Dup = { title: 'Frankenstein', author: 'Mary Wollstonecraft Shelley', year: 1818, format: 'epub' };
+      const frankensteinAudio = { title: 'Frankenstein', author: 'Mary Shelley', year: 1818, format: 'mp3' };
+      const diffIsbnA = { title: 'Frankenstein', author: 'Mary Shelley', isbn: '9780141439471' };
+      const diffIsbnB = { title: 'Frankenstein', author: 'Mary Shelley', isbn: '9780199537150' };
+
+      ok('areEditionsCompatible matches same title, author and year', areEditionsCompatible(frankenstein1818, frankenstein1818Dup));
+      ok('areEditionsCompatible rejects distinct publication years (Frankenstein 1818 vs 2015)', !areEditionsCompatible(frankenstein1818, frankenstein2015));
+      ok('areEditionsCompatible rejects incompatible formats (epub vs mp3)', !areEditionsCompatible(frankenstein1818, frankensteinAudio));
+      ok('areEditionsCompatible rejects distinct ISBNs', !areEditionsCompatible(diffIsbnA, diffIsbnB));
+
+      // 2. Safe task adoption & collision prevention (Request #37 and #44)
+      const smMockFetch = async (url) => {
+        if (url.includes('/api/releases/download')) {
+          return mockResponse({ task_id: 'sm-task-animal-farm' });
+        }
+        return mockResponse({});
+      };
+
+      const relAF = {
+        title: 'Animal Farm',
+        author: 'George Orwell',
+        format: 'epub',
+        guid: JSON.stringify({ source: 'annas', source_id: 'af-guid-1' }),
+      };
+
+      // First queue for request #37
+      await bridge.queueRelease({
+        requestId: 37,
+        userId: 1,
+        release: relAF,
+        fetchFn: smMockFetch,
+      });
+
+      ok('request #37 queued with task sm-task-animal-farm', bridge.state.tasks['sm-task-animal-farm']?.requestIds.includes(37));
+
+      // Second queue for request #44 for same release
+      await bridge.queueRelease({
+        requestId: 44,
+        userId: 2,
+        release: relAF,
+        fetchFn: smMockFetch,
+      });
+
+      const adoptedTask = bridge.state.tasks['sm-task-animal-farm'];
+      ok('task ID collision safe adoption preserves both request #37 and #44', adoptedTask.requestIds.includes(37) && adoptedTask.requestIds.includes(44));
+      ok('both users tracked on adopted task', adoptedTask.userIds.includes(1) && adoptedTask.userIds.includes(2));
+
+      // Incompatible edition with same task ID throws and does not overwrite
+      let threwIncompatible = false;
+      try {
+        await bridge.queueRelease({
+          requestId: 99,
+          userId: 3,
+          release: { title: '1984', author: 'George Orwell', format: 'epub', guid: JSON.stringify({ source: 'annas', source_id: 'af-guid-1' }) },
+          fetchFn: smMockFetch,
+        });
+      } catch (err) {
+        threwIncompatible = true;
+      }
+      ok('incompatible edition with colliding task ID rejects safely without overwriting', threwIncompatible && bridge.state.tasks['sm-task-animal-farm'].title === 'Animal Farm');
+
+      // Create valid EPUB for B29 file verification
+      const validEpub = join(testDir, 'B29Book.epub');
+      writeFileSync(validEpub, Buffer.concat([Buffer.from([0x50, 0x4b, 0x03, 0x04]), Buffer.alloc(100)]));
+
+      // 3. Direct library upload to POST /api/v1/libraries/:id/upload?folderId=:folderId
+      const directUploadTask = 'task-direct-upload-1';
+      bridge.state.tasks[directUploadTask] = {
+        taskId: directUploadTask,
+        title: 'Brave New World',
+        author: 'Aldous Huxley',
+        format: 'epub',
+        status: 'completed',
+        filePath: validEpub,
+        libraryId: 10,
+        folderId: 20,
+        matchedBookId: null,
+        requestIds: [44, 36],
+        userIds: [1, 2],
+      };
+
+      let directUploadUrlCalled = null;
+      let fulfillCalls = [];
+      const fakeBoDirectSuccess = async (url, opts) => {
+        if (url.includes('/api/v1/libraries/10/upload?folderId=20')) {
+          directUploadUrlCalled = url;
+          return mockResponse({ id: 13, title: 'Brave New World' });
+        }
+        if (url.includes('/admin/book-requests/44/fulfill')) {
+          fulfillCalls.push(44);
+          return mockResponse({ id: 44, status: 'AVAILABLE' });
+        }
+        if (url.includes('/admin/book-requests/36/fulfill')) {
+          fulfillCalls.push(36);
+          return {
+            ok: false,
+            status: 400,
+            json: async () => ({ error: 'Request is not in approved state' }),
+            text: async () => 'Request is not in approved state',
+          };
+        }
+        return mockResponse({});
+      };
+
+      const directRes = await bridge.fulfillBookOrbitRequests(bridge.state.tasks[directUploadTask], fakeBoDirectSuccess);
+      ok('direct library upload uses POST /api/v1/libraries/:id/upload?folderId=:folderId', directUploadUrlCalled !== null);
+      ok('successful upload persists returned book ID 13 immediately', bridge.state.tasks[directUploadTask].matchedBookId === 13);
+      ok('request #44 fulfilled with 200 recorded in requestFulfillments', bridge.state.tasks[directUploadTask].requestFulfillments[44]?.fulfilled === true);
+      ok('request #36 failure recorded with detailed errorType', bridge.state.tasks[directUploadTask].requestFulfillments[36]?.errorType === 'invalid_request_state');
+      ok('partial fulfillment transitions task to partially_fulfilled rather than fulfilled', bridge.state.tasks[directUploadTask].status === 'partially_fulfilled');
+
+      // 4. Fulfillment failure never causes another file upload
+      let directUploadCalledAgain = false;
+      const fakeBoRetryOnlyFulfillment = async (url) => {
+        if (url.includes('/upload')) {
+          directUploadCalledAgain = true;
+          return mockResponse({});
+        }
+        if (url.includes('/admin/book-requests/36/fulfill')) {
+          fulfillCalls.push(36);
+          return mockResponse({ id: 36, status: 'AVAILABLE' });
+        }
+        return mockResponse({});
+      };
+
+      await bridge.fulfillBookOrbitRequests(bridge.state.tasks[directUploadTask], fakeBoRetryOnlyFulfillment);
+      ok('fulfillment retry does NOT call direct upload again when matchedBookId is already preserved', !directUploadCalledAgain);
+      ok('unfulfilled request #36 was retried and succeeded', bridge.state.tasks[directUploadTask].requestFulfillments[36]?.fulfilled === true);
+      ok('all requests fulfilled transitions task to fulfilled', bridge.state.tasks[directUploadTask].status === 'fulfilled');
+
+      // 5. Direct upload HTTP 409 Conflict handling
+      const conflictTaskCompatible = 'task-conflict-compat';
+      bridge.state.tasks[conflictTaskCompatible] = {
+        taskId: conflictTaskCompatible,
+        title: 'Nineteen Eighty-Four',
+        author: 'George Orwell',
+        year: 1949,
+        format: 'epub',
+        status: 'completed',
+        filePath: validEpub,
+        libraryId: 10,
+        folderId: 20,
+        matchedBookId: null,
+        requestIds: [50],
+        userIds: [1],
+      };
+
+      const fakeBo409Compat = async (url) => {
+        if (url.includes('/upload')) {
+          return {
+            ok: false,
+            status: 409,
+            json: async () => ({
+              error: 'Conflict',
+              id: 15,
+              existingBook: { id: 15, title: 'Nineteen Eighty-Four', author: 'George Orwell', year: 1949, format: 'epub' },
+            }),
+            text: async () => 'Conflict',
+          };
+        }
+        if (url.includes('/fulfill')) return mockResponse({ id: 50, status: 'AVAILABLE' });
+        return mockResponse({});
+      };
+
+      const res409Compat = await bridge.fulfillBookOrbitRequests(bridge.state.tasks[conflictTaskCompatible], fakeBo409Compat);
+      ok('direct upload 409 conflict authoritatively adopts compatible existing book ID 15', res409Compat.bookId === 15 && bridge.state.tasks[conflictTaskCompatible].matchedBookId === 15);
+
+      // Incompatible 409 conflict: fails safely without adopting
+      const conflictTaskIncompat = 'task-conflict-incompat';
+      bridge.state.tasks[conflictTaskIncompat] = {
+        taskId: conflictTaskIncompat,
+        title: 'Frankenstein',
+        author: 'Mary Shelley',
+        year: 1818,
+        format: 'epub',
+        status: 'completed',
+        filePath: validEpub,
+        libraryId: 10,
+        folderId: 20,
+        matchedBookId: null,
+        requestIds: [51],
+        userIds: [1],
+      };
+
+      const fakeBo409Incompat = async (url) => {
+        if (url.includes('/upload')) {
+          return {
+            ok: false,
+            status: 409,
+            json: async () => ({
+              error: 'Conflict',
+              id: 99,
+              existingBook: { id: 99, title: 'Frankenstein', author: 'Mary Shelley', year: 2015, format: 'epub' },
+            }),
+            text: async () => 'Conflict',
+          };
+        }
+        return mockResponse({});
+      };
+
+      const res409Incompat = await bridge.fulfillBookOrbitRequests(bridge.state.tasks[conflictTaskIncompat], fakeBo409Incompat);
+      ok('direct upload 409 conflict rejects incompatible edition safely without adopting', res409Incompat.fulfilled === false && bridge.state.tasks[conflictTaskIncompat].status === 'finalization_failed');
+
+      // 6. Source failure tracking, cooldown, and bounded retry
+      const failTaskId = 'task-failed-source-1';
+      const failReleaseKey = 'oceanofpdf:fail-1984';
+      bridge.state.releases[failReleaseKey] = failTaskId;
+      bridge.state.tasks[failTaskId] = {
+        taskId: failTaskId,
+        releaseKey: failReleaseKey,
+        title: '1984',
+        author: 'George Orwell',
+        format: 'epub',
+        source: 'oceanofpdf',
+        sourceId: 'fail-1984',
+        status: 'queued',
+        requestIds: [77],
+      };
+
+      const statusWithSourceFailure = {
+        complete: {},
+        downloading: {},
+        queued: {},
+        error: {
+          [failTaskId]: { id: failTaskId, title: '1984', error: 'OceanofPDF source unreachable' },
+        },
+      };
+
+      await bridge.reconcile({
+        fetchFn: async (url) => {
+          if (url.includes('/api/status')) return mockResponse(statusWithSourceFailure);
+          return mockResponse({});
+        },
+      });
+
+      ok('Shelfmark source failure records failedRelease with timestamp and error', bridge.state.failedReleases[failReleaseKey]?.error.includes('OceanofPDF source unreachable'));
+      ok('unfulfilled request 77 tracks attempt count 1', bridge.state.requestSourceAttempts[77] === 1);
+      ok('failed release lock freed so alternative selection is permitted', bridge.state.releases[failReleaseKey] === undefined);
+
       bridge.stop();
     }
   } finally {

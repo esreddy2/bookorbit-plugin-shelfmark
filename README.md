@@ -204,7 +204,7 @@ BookOrbit computes release scores using its internal scoring matrix (title match
 
 ---
 
-### 5. Asynchronous Event-Driven Companion Architecture (v1.5.3)
+### 5. Asynchronous Event-Driven Companion Architecture (v1.5.4)
 
 To decouple BookOrbit from its synchronous 240s HTTP `resolveFile` deadline for long-running downloads:
 
@@ -242,20 +242,20 @@ npm run release [optional-new-version]
 
 ---
 
-## CT105 One-Paste Deployment
+## Production One-Paste Deployment
 
-For Proxmox LXC 105 (CT105) hosting BookOrbit v3.5.0 (`/opt/bookorbit/data/app`) and Shelfmark v1.5.1 (port 8084), run this single block inside the staged repository directory:
+For containerized environments hosting BookOrbit v3.5.0 (`/opt/bookorbit/data/app`) and Shelfmark v1.5.1 (port 8084), run this single block inside the staged repository directory:
 
 ```bash
 git fetch origin --tags && \
-git checkout v1.5.3 && \
+git checkout v1.5.4 && \
 mkdir -p /opt/bookorbit/data/app/plugins/indexers/shelfmark && \
 cp index.mjs /opt/bookorbit/data/app/plugins/indexers/shelfmark/index.mjs && \
 cp -r bridge /opt/bookorbit/data/app/plugins/indexers/shelfmark/ && \
 chmod 644 /opt/bookorbit/data/app/plugins/indexers/shelfmark/index.mjs && \
 chmod +x scripts/shelfmark-hook.sh && \
 docker restart bookorbit && \
-echo "✅ BookOrbit plugin updated to v1.5.3 and restarted."
+echo "✅ BookOrbit plugin updated to v1.5.4 and restarted."
 ```
 
 To run the companion bridge as a managed background service:
