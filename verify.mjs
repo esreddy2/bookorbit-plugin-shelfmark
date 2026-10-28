@@ -41,6 +41,10 @@ function makeHost(handler) {
     calls,
     fetch: async (url, options = {}) => {
       calls.push({ url, options });
+      // Enforce BookOrbit v3.5.0 PluginRequestInit contract: signal is NOT supported
+      if ('signal' in options && options.signal !== undefined) {
+        throw new Error('PluginRequestInit contract violation: "signal" property must not be passed to host.fetch()');
+      }
       return handler(url, options);
     },
     logger: {
@@ -50,6 +54,10 @@ function makeHost(handler) {
     },
     buildSearchText: (q) => [q.title, q.author].filter(Boolean).join(' ').trim(),
     fail: (code, message) => {
+      const validCodes = ['unauthorized', 'throttled', 'timeout', 'unreachable', 'unsupportedMedium', 'error'];
+      if (!validCodes.includes(code)) {
+        throw new Error(`INVALID_BOOKORBIT_FAILURE_CODE: "${code}" is not supported by BookOrbit!`);
+      }
       const err = new Error(message);
       err.code = code;
       return err;
@@ -89,7 +97,7 @@ async function runTests() {
   ok('preferFormat defaults to epub', plugin.settingsFields.find((f) => f.key === 'preferFormat')?.default === 'epub');
   ok('defines downloadViaShelfmark toggle', plugin.settingsFields.some((f) => f.key === 'downloadViaShelfmark'));
   ok('defines pollTimeoutSeconds defaulting to 240', plugin.settingsFields.find((f) => f.key === 'pollTimeoutSeconds')?.default === 240);
-  ok('declares semantic version 1.3.0', plugin.version === '1.3.0');
+  ok('declares semantic version 1.3.1', plugin.version === '1.3.1');
   ok('declares update channel', typeof plugin.update === 'object' && plugin.update !== null);
   ok('update manifestUrl is HTTPS and points to fork repo', typeof plugin.update?.manifestUrl === 'string' && plugin.update.manifestUrl.includes('esreddy2/bookorbit-plugin-shelfmark'));
   ok('update ed25519PublicKey is 43-char base64url', /^[A-Za-z0-9_-]{43}$/.test(plugin.update?.ed25519PublicKey ?? ''));
@@ -1053,7 +1061,7 @@ async function runTests() {
     }
 
     const resB = await promiseB;
-    ok('cancelled concurrent caller rejects immediately with cancelled error', errA?.code === 'cancelled');
+    ok('cancelled concurrent caller rejects immediately with valid error code', errA?.code === 'error' && errA?.message?.includes('cancelled'));
     ok('uncancelled concurrent caller succeeds and receives download URL', resB?.url?.includes('id=shared-task-xyz'));
     ok('concurrent requests only submitted a single download job to Shelfmark', postCount === 1);
   }
@@ -1126,6 +1134,331 @@ async function runTests() {
     }
 
     ok('no API credentials exposed in errors (redacted)', !credErr.message.includes(secretKey) && credErr.message.includes('[REDACTED]'));
+  }
+
+  console.log('\n--- 5. Host Deadlines, Error Classification & Search Optimization ---');
+  {
+    // Test 23: Simulated 240s host deadline (AbortSignal.timeout) classifies as timeout
+    const host = makeHost((url) => {
+      if (url.includes('/api/status')) return mockResponse({ active: { 't1': { id: 't1' } } });
+      if (url.includes('/api/releases/download')) return mockResponse({ task_id: 't1' });
+      return mockResponse({});
+    });
+
+    const timeoutController = new AbortController();
+    const timeoutErr = new Error('The operation was aborted due to timeout');
+    timeoutErr.name = 'TimeoutError';
+    timeoutController.abort(timeoutErr);
+
+    let caughtTimeout = null;
+    try {
+      await plugin.resolveFile({
+        guid: JSON.stringify({ source: 'annas', source_id: 'host-to-src', format: 'epub' }),
+        title: 'Host Timeout Book',
+        format: 'epub',
+      }, baseConfig({ settings: { pollIntervalMs: 10 } }), host, timeoutController.signal);
+    } catch (err) {
+      caughtTimeout = err;
+    }
+
+    ok('simulated host deadline (AbortSignal.timeout) classifies as timeout', caughtTimeout?.code === 'timeout');
+  }
+
+  {
+    // Test 24: User cancellation classifies as error (not cancelled, not timeout)
+    const host = makeHost((url) => {
+      if (url.includes('/api/status')) return mockResponse({ active: { 't1': { id: 't1' } } });
+      if (url.includes('/api/releases/download')) return mockResponse({ task_id: 't1' });
+      return mockResponse({});
+    });
+
+    const userController = new AbortController();
+    userController.abort(); // Standard user cancel
+
+    let caughtUser = null;
+    try {
+      await plugin.resolveFile({
+        guid: JSON.stringify({ source: 'annas', source_id: 'user-cancel-src', format: 'epub' }),
+        title: 'User Cancel Book',
+        format: 'epub',
+      }, baseConfig({ settings: { pollIntervalMs: 10 } }), host, userController.signal);
+    } catch (err) {
+      caughtUser = err;
+    }
+
+    ok('user cancellation classifies as error (not cancelled, not timeout)', caughtUser?.code === 'error' && caughtUser.message.includes('cancelled'));
+  }
+
+  {
+    // Test 25: Cancellation before queueing aborts without issuing HTTP requests
+    const host = makeHost(() => mockResponse({}));
+    const preAborted = new AbortController();
+    preAborted.abort();
+
+    let preErr = null;
+    try {
+      await plugin.resolveFile({
+        guid: JSON.stringify({ source: 'annas', source_id: 'pre-src', format: 'epub' }),
+        title: 'Pre-aborted Book',
+        format: 'epub',
+      }, baseConfig(), host, preAborted.signal);
+    } catch (err) {
+      preErr = err;
+    }
+
+    ok('cancellation before queueing aborts cleanly without HTTP calls', preErr?.code === 'error' && host.calls.length === 0);
+  }
+
+  {
+    // Test 26: Cancellation during queueing
+    let postStarted = false;
+    const cancelController = new AbortController();
+    const host = makeHost(async (url, options) => {
+      if (url.includes('/api/status')) return mockResponse({});
+      if (url.includes('/api/releases/download')) {
+        postStarted = true;
+        // Trigger abort while POST is processing
+        cancelController.abort();
+        await new Promise((r) => setTimeout(r, 20));
+        return mockResponse({ task_id: 'post-cancel-task' });
+      }
+      return mockResponse({});
+    });
+
+    let queueCancelErr = null;
+    try {
+      await plugin.resolveFile({
+        guid: JSON.stringify({ source: 'annas', source_id: 'post-cancel-src', format: 'epub' }),
+        title: 'Queue Cancel Book',
+        format: 'epub',
+      }, baseConfig({ settings: { pollIntervalMs: 10 } }), host, cancelController.signal);
+    } catch (err) {
+      queueCancelErr = err;
+    }
+
+    ok('cancellation during queueing aborts and rejects caller cleanly', queueCancelErr?.code === 'error' && postStarted);
+  }
+
+  {
+    // Test 27: Cancellation during polling
+    const pollCancelController = new AbortController();
+    let pollCount = 0;
+    const host = makeHost((url) => {
+      if (url.includes('/api/releases/download')) return mockResponse({ task_id: 'poll-cancel-task' });
+      if (url.includes('/api/status')) {
+        pollCount += 1;
+        if (pollCount >= 2) {
+          pollCancelController.abort();
+        }
+        return mockResponse({ active: { 'poll-cancel-task': { id: 'poll-cancel-task', status: 'downloading' } } });
+      }
+      return mockResponse({});
+    });
+
+    let pollCancelErr = null;
+    try {
+      await plugin.resolveFile({
+        guid: JSON.stringify({ source: 'annas', source_id: 'poll-cancel-src', format: 'epub' }),
+        title: 'Poll Cancel Book',
+        format: 'epub',
+      }, baseConfig({ settings: { pollIntervalMs: 10 } }), host, pollCancelController.signal);
+    } catch (err) {
+      pollCancelErr = err;
+    }
+
+    ok('cancellation during polling aborts and cleans up cleanly', pollCancelErr?.code === 'error' && pollCount >= 2);
+  }
+
+  {
+    // Test 28: Simulated 90s search deadline (AbortSignal.timeout) classifies as timeout when 0 results
+    const host = makeHost(() => mockResponse({ books: [] }));
+    const searchTimeoutCtrl = new AbortController();
+    const sTimeoutErr = new Error('Search deadline expired');
+    sTimeoutErr.name = 'TimeoutError';
+    searchTimeoutCtrl.abort(sTimeoutErr);
+
+    let searchToErr = null;
+    try {
+      await plugin.search({ title: 'Search Timeout Book', author: 'Author' }, baseConfig(), host, searchTimeoutCtrl.signal);
+    } catch (err) {
+      searchToErr = err;
+    }
+
+    ok('simulated 90s search deadline classifies as timeout when 0 results', searchToErr?.code === 'timeout');
+  }
+
+  {
+    // Test 29: Search stops expensive fallback queries once sufficient high-confidence results exist
+    let releaseQueries = 0;
+    const host = makeHost((url) => {
+      if (url.includes('/api/metadata/search')) {
+        return mockResponse({
+          books: [
+            { provider: 'openlibrary', provider_id: 'OL1', title: 'Dune', authors: ['Frank Herbert'] },
+            { provider: 'openlibrary', provider_id: 'OL2', title: 'Dune Messiah', authors: ['Frank Herbert'] },
+          ],
+        });
+      }
+      if (url.includes('/api/releases')) {
+        releaseQueries += 1;
+        return mockResponse({
+          releases: [
+            { source: 'aa', source_id: 'rel1', title: 'Dune (Frank Herbert) [EPUB]', format: 'epub', size_bytes: 1000 },
+            { source: 'aa', source_id: 'rel2', title: 'Dune (Frank Herbert) [EPUB]', format: 'epub', size_bytes: 2000 },
+            { source: 'aa', source_id: 'rel3', title: 'Dune (Frank Herbert) [EPUB]', format: 'epub', size_bytes: 3000 },
+          ],
+        });
+      }
+      return mockResponse({});
+    });
+
+    const results = await plugin.search({ title: 'Dune', author: 'Frank Herbert' }, baseConfig(), host);
+    ok('search early stopping: stops querying variations once sufficient results exist', results.length >= 3 && releaseQueries === 1);
+  }
+
+  {
+    // Test 30: Search preserves validated results when subsequent variation query fails
+    let releaseQueryCount = 0;
+    const host = makeHost((url) => {
+      if (url.includes('/api/metadata/search')) {
+        return mockResponse({
+          books: [
+            { provider: 'openlibrary', provider_id: 'OL-A', title: 'Brave New World', authors: ['Aldous Huxley'] },
+            { provider: 'openlibrary', provider_id: 'OL-B', title: 'Brave New World Revisited', authors: ['Aldous Huxley'] },
+          ],
+        });
+      }
+      if (url.includes('/api/releases')) {
+        releaseQueryCount += 1;
+        if (releaseQueryCount === 1) {
+          // First query returns 1 valid release
+          return mockResponse({
+            releases: [
+              { source: 'aa', source_id: 'bnw1', title: 'Brave New World [EPUB]', format: 'epub', size_bytes: 500000 },
+            ],
+          });
+        }
+        // Second query fails with 500
+        return mockResponse({ error: 'Cloudflare bypasser timed out' }, 500);
+      }
+      return mockResponse({});
+    });
+
+    const results = await plugin.search({ title: 'Brave New World', author: 'Aldous Huxley' }, baseConfig(), host);
+    ok('search preserves validated results when subsequent variation query fails', results.length === 1 && results[0].format === 'epub');
+  }
+
+  {
+    // Test 31: Duplicate queue HTTP 500 adopts task by title/format/source when source_id is omitted
+    const host = makeHost((url, options) => {
+      if (options.method === 'POST') {
+        return mockResponse({ error: 'Release is already in the download queue' }, 500);
+      }
+      if (url.includes('/api/status')) {
+        return mockResponse({
+          active: {
+            'task-uuid-8899': {
+              id: 'task-uuid-8899',
+              title: '1984',
+              format: 'epub',
+              source: 'annas_archive',
+              status: 'downloading',
+            },
+          },
+        });
+      }
+      return mockResponse({});
+    });
+
+    const result = await plugin.resolveFile({
+      guid: JSON.stringify({ source: 'annas_archive', source_id: 'unindexed-md5', title: '1984', format: 'epub' }),
+      title: '1984',
+      format: 'epub',
+    }, baseConfig({ settings: { pollTimeoutSeconds: 0.1, pollIntervalMs: 10 } }), host).catch((e) => e);
+
+    // It adopted task-uuid-8899 and timed out waiting for it
+    ok('duplicate queue HTTP 500 adopts task by title and format when source_id is omitted', result?.message?.includes('task: task-uuid-8899'));
+  }
+
+  {
+    // Test 32: Retry after download timeout adopts active in-progress task without submitting duplicate POST
+    let postAttempted = false;
+    const host = makeHost((url, options) => {
+      if (options.method === 'POST') {
+        postAttempted = true;
+        return mockResponse({ task_id: 'long-task-42' });
+      }
+      if (url.includes('/api/status')) {
+        // Shelfmark has long-task-42 still running in active queue
+        return mockResponse({
+          active: {
+            'long-task-42': {
+              source_id: 'retry-src-id',
+              source: 'annas',
+              title: 'Long Book',
+              format: 'epub',
+              status: 'downloading',
+            },
+          },
+        });
+      }
+      return mockResponse({});
+    });
+
+    const result = await plugin.resolveFile({
+      guid: JSON.stringify({ source: 'annas', source_id: 'retry-src-id', format: 'epub' }),
+      title: 'Long Book',
+      format: 'epub',
+    }, baseConfig({ settings: { pollTimeoutSeconds: 0.1, pollIntervalMs: 10 } }), host).catch((e) => e);
+
+    ok('re-request after download timeout adopts active in-progress task without duplicate POST', !postAttempted && result?.message?.includes('task: long-task-42'));
+  }
+
+  {
+    // Test 33: View files / inspection simulation: repeated resolveFile calls reuse task idempotently
+    let postCount = 0;
+    let downloadCompleted = false;
+
+    const host = makeHost((url, options) => {
+      if (options.method === 'POST') {
+        postCount += 1;
+        downloadCompleted = true; // Task completes in Shelfmark after queueing
+        return mockResponse({ task_id: 'inspect-task-1' });
+      }
+      if (url.includes('/api/status')) {
+        if (downloadCompleted) {
+          return mockResponse({
+            completed: {
+              'inspect-task-1': {
+                id: 'inspect-task-1',
+                source_id: 'inspect-src-1',
+                source: 'annas',
+                title: 'Inspected Book',
+                format: 'epub',
+                status: 'completed',
+              },
+            },
+          });
+        }
+        return mockResponse({});
+      }
+      if (url.includes('/api/localdownload')) return mockResponse('book-content', 200);
+      return mockResponse({});
+    });
+
+    const release = {
+      guid: JSON.stringify({ source: 'annas', source_id: 'inspect-src-1', format: 'epub' }),
+      title: 'Inspected Book',
+      format: 'epub',
+    };
+
+    // Step 1: User clicks "View files" (triggers resolveFile, which queues and finishes download)
+    const inspectResult = await plugin.resolveFile(release, baseConfig({ settings: { pollIntervalMs: 10 } }), host);
+
+    // Step 2: User clicks "Download release" (triggers resolveFile again; must reuse existing completed task)
+    const downloadResult = await plugin.resolveFile(release, baseConfig({ settings: { pollIntervalMs: 10 } }), host);
+
+    ok('View files inspection and subsequent grab reuse task idempotently without re-queueing', postCount === 1 && inspectResult.url === downloadResult.url);
   }
 
   console.log(`\nResults: ${pass} passed, ${fail} failed.\n`);

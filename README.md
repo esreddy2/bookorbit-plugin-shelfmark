@@ -12,13 +12,15 @@ This plugin enables BookOrbit to search book releases across sources configured 
 ## Features
 
 - **Native BookOrbit Request Integration:** Fully compliant with BookOrbit's indexer plugin specification (`apiVersion: 1`). Searches and downloads are triggered through BookOrbit Requests on demand—no standalone background daemons and no continuous polling.
-- **Duplicate Queue Protection & Task Adoption (v1.3.0):**
+- **Duplicate Queue Protection & Task Adoption (v1.3.1):**
   - Pre-inspects Shelfmark's active, queued, and completed tasks before queueing.
   - Reuses completed downloads immediately after validating file presence via `/api/localdownload`, without re-downloading.
   - If a download is already in progress, safely adopts and monitors it without submitting a duplicate job.
-  - Automatically recovers from Shelfmark's `Release is already in the download queue` (500) error by refreshing status and adopting the tracked task.
-  - **Single-Flight Concurrency with Independent Cancellation:** Multiple concurrent callers for the same release share a single background download worker. If one caller aborts, remaining callers continue uninterrupted.
+  - Multi-tier adoption recovers from Shelfmark's `Release is already in the download queue` (500) error even when `source_id` is omitted by Shelfmark, correlating by title, format, and source.
+  - **Single-Flight Concurrency with Independent Cancellation:** Multiple concurrent callers for the same release share a single background download worker. If one caller aborts, remaining callers continue uninterrupted. Settled state microtask desynchronization is eliminated.
   - **Historical Task Isolation:** Failed tasks from previous attempts are snapshotted and never contaminate newly observed downloads. Exact task IDs strictly override title matching.
+  - **BookOrbit API Contract & Error Classification:** Replaced invalid `'cancelled'` failure codes with valid BookOrbit `PluginSearchFailure` codes (`timeout`, `error`). Strictly respects `PluginRequestInit` contract by never passing unsupported `signal` to `host.fetch()`.
+  - **Search Optimization & Early Stopping:** Prioritizes best metadata matches and halts expensive provider queries once sufficient high-confidence releases are found, preventing search timeouts. Preserves validated releases if optional secondary queries fail.
 - **Robust Metadata Search & Equivalence:**
   - Full compliance with BookOrbit v3.5.0's `PluginReleaseQuery` contract, supporting `isbn13` and `isbn13s` arrays.
   - Normalizes inverted author names with life dates (`"Orwell, George, 1903-1950"` → `"George Orwell"`), preventing zero-result failures on direct download providers like OceanofPDF and Anna's Archive.

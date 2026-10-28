@@ -12,7 +12,7 @@
  * Single-file and dependency-free following BookOrbit's indexer plugin specification.
  */
 
-const USER_AGENT = 'BookOrbit-Shelfmark-Plugin/1.3.0';
+const USER_AGENT = 'BookOrbit-Shelfmark-Plugin/1.3.1';
 
 /** Fallback maximum number of releases to return per search. */
 const MAX_RESULTS = 25;
@@ -34,7 +34,7 @@ const KNOWN_TITLE_EQUIVALENTS = new Map([
 
 export default {
   apiVersion: 1,
-  version: '1.3.0',
+  version: '1.3.1',
   update: {
     manifestUrl: 'https://raw.githubusercontent.com/esreddy2/bookorbit-plugin-shelfmark/main/updates/shelfmark.json',
     ed25519PublicKey: '-0aHVhXqg7cGaDchc2p1Y8tDnn8A7cJ0WREKspNv5Bc',
@@ -102,10 +102,9 @@ export default {
       const headers = makeHeaders(config);
 
       // Verify basic connectivity and health endpoint
-      const response = await host.fetch(`${baseUrl}/api/health`, {
+      const response = await safeHostFetch(host, `${baseUrl}/api/health`, {
         headers,
-        signal,
-      });
+      }, signal);
 
       if (response.status === 401 || response.status === 403) {
         return {
@@ -122,10 +121,9 @@ export default {
       }
 
       // Check if status endpoint is accessible
-      const statusRes = await host.fetch(`${baseUrl}/api/status`, {
+      const statusRes = await safeHostFetch(host, `${baseUrl}/api/status`, {
         headers,
-        signal,
-      });
+      }, signal);
 
       if (statusRes.status === 401 || statusRes.status === 403) {
         return {
@@ -183,6 +181,12 @@ export default {
     const maxResults = query.limit || MAX_RESULTS;
     const releases = [];
     const seenReleaseKeys = new Set();
+    const queriedKeys = new Set();
+
+    const searchStartTime = Date.now();
+    // BookOrbit v3.5.0 default search timeout is 90 seconds. Reserve a 15-second safety margin
+    // to return validated results before host severs the connection.
+    const SEARCH_BUDGET_MS = 75000;
 
     // Helper to add release without duplicates or fabricated attributes
     const addRelease = (rel, book) => {
@@ -247,6 +251,28 @@ export default {
       });
     };
 
+    // Helper to check if search has enough high-confidence results to stop expensive queries early
+    const hasSufficientResults = () => {
+      if (releases.length >= 3) {
+        const matchingPref = releases.filter((r) => r.format === preferredFormat);
+        if (matchingPref.length >= 2 || releases.length >= 5) {
+          return true;
+        }
+      }
+      return false;
+    };
+
+    // Helper to rank and slice releases for return
+    const rankAndSlice = () => {
+      return releases
+        .sort((a, b) => {
+          const rankDiff = rankFormat(a.format, preferredFormat) - rankFormat(b.format, preferredFormat);
+          if (rankDiff !== 0) return rankDiff;
+          return (b.sizeBytes || 0) - (a.sizeBytes || 0);
+        })
+        .slice(0, maxResults);
+    };
+
     // Step 1: Query Shelfmark metadata search
     let books = [];
     let providerError = null;
@@ -257,7 +283,7 @@ export default {
     metadataUrl.searchParams.set('limit', '25');
 
     try {
-      const metaRes = await host.fetch(metadataUrl.href, { headers, signal });
+      const metaRes = await safeHostFetch(host, metadataUrl.href, { headers }, signal);
       if (metaRes.ok) {
         const metaData = await metaRes.json().catch(() => ({ books: [] }));
         books = Array.isArray(metaData.books) ? metaData.books : [];
@@ -267,7 +293,10 @@ export default {
         providerError = `Metadata search returned HTTP ${metaRes.status}`;
       }
     } catch (err) {
-      if (signal?.aborted) return [];
+      if (signal?.aborted) {
+        if (releases.length > 0) return rankAndSlice();
+        throw classifyAbort(signal, host, 'Search was cancelled.');
+      }
       if (err.code) throw err;
       providerError = err.message;
     }
@@ -278,13 +307,13 @@ export default {
       const equivalents = KNOWN_TITLE_EQUIVALENTS.get(normTitle);
       if (equivalents) {
         for (const eq of equivalents) {
-          if (signal?.aborted) break;
+          if (signal?.aborted || Date.now() - searchStartTime >= SEARCH_BUDGET_MS) break;
           const altMetaUrl = new URL(`${baseUrl}/api/metadata/search`);
           altMetaUrl.searchParams.set('query', eq);
           altMetaUrl.searchParams.set('content_type', 'ebook');
           altMetaUrl.searchParams.set('limit', '25');
           try {
-            const altRes = await host.fetch(altMetaUrl.href, { headers, signal });
+            const altRes = await safeHostFetch(host, altMetaUrl.href, { headers }, signal);
             if (altRes.ok) {
               const altData = await altRes.json().catch(() => ({ books: [] }));
               if (Array.isArray(altData.books) && altData.books.length > 0) {
@@ -306,7 +335,7 @@ export default {
       isbnMetaUrl.searchParams.set('content_type', 'ebook');
       isbnMetaUrl.searchParams.set('limit', '10');
       try {
-        const isbnRes = await host.fetch(isbnMetaUrl.href, { headers, signal });
+        const isbnRes = await safeHostFetch(host, isbnMetaUrl.href, { headers }, signal);
         if (isbnRes.ok) {
           const isbnData = await isbnRes.json().catch(() => ({ books: [] }));
           if (Array.isArray(isbnData.books) && isbnData.books.length > 0) {
@@ -326,12 +355,13 @@ export default {
     });
 
     if (validBooks.length > 0) {
-      // Sort valid books by match quality
+      // Sort valid books by match quality: prioritize best metadata match
       validBooks.sort((a, b) => scoreBookMatch(b, searchTitle, searchAuthor) - scoreBookMatch(a, searchTitle, searchAuthor));
 
-      // Query releases across top matching books
+      // Loop through top books (prioritizing the best match), breaking early as soon as sufficient results found
       for (const book of validBooks.slice(0, 3)) {
-        if (signal?.aborted) break;
+        if (hasSufficientResults()) break;
+        if (signal?.aborted || Date.now() - searchStartTime >= SEARCH_BUDGET_MS) break;
 
         const bookTitle = book.title || searchTitle;
         const coreTitle = extractCoreTitle(bookTitle);
@@ -340,19 +370,15 @@ export default {
         );
         const isbn = extractIsbn(book, query);
 
-        // Build list of title variations to query for release providers
-        const titlesToQuery = [coreTitle];
-
-        // If the user's search title differs from book's core title, also query user's search title
-        // e.g. user searched "1984", but Open Library matched "Nineteen Eighty-Four"
-        if (searchTitle) {
-          const coreSearch = extractCoreTitle(searchTitle);
-          if (normalizeString(coreSearch) !== normalizeString(coreTitle)) {
-            titlesToQuery.push(coreSearch);
-          }
+        // Build list of titles to query: prioritize most promising title first!
+        const titlesToQuery = [];
+        const primaryTitle = searchTitle ? extractCoreTitle(searchTitle) : coreTitle;
+        if (primaryTitle) titlesToQuery.push(primaryTitle);
+        if (coreTitle && normalizeString(coreTitle) !== normalizeString(primaryTitle)) {
+          titlesToQuery.push(coreTitle);
         }
 
-        // Check known confident equivalents (e.g. "1984" <-> "Nineteen Eighty-Four")
+        // Known title equivalents only added as fallback if needed
         const normCore = normalizeString(coreTitle);
         const normSearch = normalizeString(searchTitle);
         const eqSet = new Set([
@@ -366,7 +392,12 @@ export default {
         }
 
         for (const queryTitle of titlesToQuery) {
-          if (signal?.aborted) break;
+          if (hasSufficientResults()) break;
+          if (signal?.aborted || Date.now() - searchStartTime >= SEARCH_BUDGET_MS) break;
+
+          const queryKey = `${book.provider_id || ''}:${queryTitle.toLowerCase()}:${naturalAuthor.toLowerCase()}:${isbn || ''}`;
+          if (queriedKeys.has(queryKey)) continue;
+          queriedKeys.add(queryKey);
 
           const releasesUrl = new URL(`${baseUrl}/api/releases`);
           releasesUrl.searchParams.set('provider', book.provider || 'openlibrary');
@@ -385,7 +416,7 @@ export default {
 
           let relRes;
           try {
-            relRes = await host.fetch(releasesUrl.href, { headers, signal });
+            relRes = await safeHostFetch(host, releasesUrl.href, { headers }, signal);
           } catch (err) {
             if (signal?.aborted) break;
             continue;
@@ -426,7 +457,7 @@ export default {
           }
         }
       }
-    } else if (searchTitle || searchIsbn) {
+    } else if ((searchTitle || searchIsbn) && releases.length === 0) {
       // Step 2 Fallback: Direct search via /api/releases if metadata returned zero matches or failed
       const directTitles = searchTitle ? [extractCoreTitle(searchTitle)] : [''];
       if (searchTitle) {
@@ -443,7 +474,12 @@ export default {
       const queryIsbn = extractIsbn(null, query);
 
       for (const queryTitle of directTitles) {
-        if (signal?.aborted) break;
+        if (hasSufficientResults()) break;
+        if (signal?.aborted || Date.now() - searchStartTime >= SEARCH_BUDGET_MS) break;
+
+        const queryKey = `direct:${queryTitle.toLowerCase()}:${naturalSearchAuthor.toLowerCase()}:${queryIsbn || ''}`;
+        if (queriedKeys.has(queryKey)) continue;
+        queriedKeys.add(queryKey);
 
         const directRelUrl = new URL(`${baseUrl}/api/releases`);
         if (queryTitle) {
@@ -461,7 +497,7 @@ export default {
         }
 
         try {
-          const directRelRes = await host.fetch(directRelUrl.href, { headers, signal });
+          const directRelRes = await safeHostFetch(host, directRelUrl.href, { headers }, signal);
           if (directRelRes.ok) {
             const directData = await directRelRes.json().catch(() => ({ releases: [] }));
             const directReleases = Array.isArray(directData)
@@ -487,23 +523,28 @@ export default {
             }
           }
         } catch (err) {
-          if (signal?.aborted) return [];
-          if (providerError) {
+          if (signal?.aborted) {
+            if (releases.length > 0) return rankAndSlice();
+            throw classifyAbort(signal, host, 'Search was cancelled.');
+          }
+          if (providerError && releases.length === 0) {
             throw host.fail('unreachable', `Shelfmark search failed: ${providerError}`);
           }
         }
       }
     }
 
-    // Rank results based on preferred format and completeness
-    return releases
-      .sort((a, b) => {
-        const rankDiff = rankFormat(a.format, preferredFormat) - rankFormat(b.format, preferredFormat);
-        if (rankDiff !== 0) return rankDiff;
-        // Secondary sort: prefer releases with reported size
-        return (b.sizeBytes || 0) - (a.sizeBytes || 0);
-      })
-      .slice(0, maxResults);
+    // Check deadline / cancellation state
+    if (signal?.aborted) {
+      if (releases.length > 0) return rankAndSlice();
+      throw classifyAbort(signal, host, 'Search was cancelled.');
+    }
+
+    if (Date.now() - searchStartTime >= SEARCH_BUDGET_MS && releases.length === 0) {
+      throw host.fail('timeout', `Shelfmark search timed out for "${searchTitle}".`);
+    }
+
+    return rankAndSlice();
   },
 
   /**
@@ -516,6 +557,10 @@ export default {
    * @returns {Promise<{url: string, fileName: string, sizeBytes?: number, format?: string, headers?: object}>}
    */
   async resolveFile(release, config, host, signal) {
+    if (signal?.aborted) {
+      throw classifyAbort(signal, host, 'Download resolution was cancelled before execution.');
+    }
+
     const baseUrl = cleanUrl(config.baseUrl);
     const headers = makeHeaders(config);
     const apiKey = config.settings?.apiKey;
@@ -565,7 +610,7 @@ export default {
     // Multiple concurrent callers for the same release subscribe to a single background worker.
     // If one caller cancels, other callers continue uninterrupted.
     let entry = inFlightResolutions.get(releaseKey);
-    if (entry && entry.controller.signal.aborted) {
+    if (entry && (entry.settled || entry.controller.signal.aborted)) {
       inFlightResolutions.delete(releaseKey);
       entry = null;
     }
@@ -573,7 +618,7 @@ export default {
     if (!entry) {
       const controller = new AbortController();
       const subscribers = new Set();
-      entry = { controller, subscribers };
+      entry = { controller, subscribers, settled: false };
       inFlightResolutions.set(releaseKey, entry);
 
       doResolveFile(
@@ -589,16 +634,23 @@ export default {
         controller.signal
       )
         .then((result) => {
+          entry.settled = true;
+          inFlightResolutions.delete(releaseKey);
           for (const sub of entry.subscribers) {
+            sub.signal?.removeEventListener?.('abort', sub.onAbort);
             try { sub.resolve(result); } catch (_) {}
           }
         })
         .catch((err) => {
+          entry.settled = true;
+          inFlightResolutions.delete(releaseKey);
           for (const sub of entry.subscribers) {
+            sub.signal?.removeEventListener?.('abort', sub.onAbort);
             try { sub.reject(err); } catch (_) {}
           }
         })
         .finally(() => {
+          entry.settled = true;
           if (inFlightResolutions.get(releaseKey) === entry) {
             inFlightResolutions.delete(releaseKey);
           }
@@ -606,13 +658,33 @@ export default {
     }
 
     return new Promise((resolve, reject) => {
+      if (entry.settled) {
+        // In the rare event entry settled between retrieval and promise creation
+        inFlightResolutions.delete(releaseKey);
+        // Start a fresh resolution for this caller
+        return resolve(
+          doResolveFile(
+            release,
+            payload,
+            resolvedFormat,
+            fileName,
+            baseUrl,
+            headers,
+            apiKey,
+            config,
+            host,
+            signal
+          )
+        );
+      }
+
       const sub = { resolve, reject, signal };
       entry.subscribers.add(sub);
 
       const onAbort = () => {
         entry.subscribers.delete(sub);
         signal?.removeEventListener?.('abort', onAbort);
-        reject(host.fail('cancelled', 'Download resolution was cancelled.'));
+        reject(classifyAbort(signal, host, 'Download resolution was cancelled.'));
         if (entry.subscribers.size === 0) {
           entry.controller.abort();
           if (inFlightResolutions.get(releaseKey) === entry) {
@@ -620,6 +692,8 @@ export default {
           }
         }
       };
+
+      sub.onAbort = onAbort;
 
       if (signal?.aborted) {
         onAbort();
@@ -654,14 +728,13 @@ async function doResolveFile(release, payload, resolvedFormat, fileName, baseUrl
   const isFileServable = async (taskId) => {
     const checkUrl = buildLocalDownloadUrl(baseUrl, taskId, apiKey);
     try {
-      let res = await host.fetch(checkUrl, { method: 'HEAD', headers, signal });
+      let res = await safeHostFetch(host, checkUrl, { method: 'HEAD', headers }, signal);
       if (res.status === 405 || !res.ok) {
         // Fallback to GET range check if HEAD is not supported by endpoint
-        res = await host.fetch(checkUrl, {
+        res = await safeHostFetch(host, checkUrl, {
           method: 'GET',
           headers: { ...headers, Range: 'bytes=0-0' },
-          signal,
-        });
+        }, signal);
       }
       return res.ok;
     } catch (err) {
@@ -681,7 +754,7 @@ async function doResolveFile(release, payload, resolvedFormat, fileName, baseUrl
   // Step 1: Pre-queue inspection of /api/status.
   // Snapshot existing tasks across active, queued, completed, and failed queues.
   try {
-    const statusRes = await host.fetch(`${baseUrl}/api/status`, { headers, signal });
+    const statusRes = await safeHostFetch(host, `${baseUrl}/api/status`, { headers }, signal);
     if (statusRes.ok) {
       const statusData = await statusRes.json().catch(() => ({}));
       const activeTasks = {
@@ -704,9 +777,14 @@ async function doResolveFile(release, payload, resolvedFormat, fileName, baseUrl
       preExistingFailedIds = new Set(Object.keys(failedTasks));
 
       // 1A. Check if an exact matching task is already active/queued -> adopt it!
-      const matchingActive = Object.entries(activeTasks).filter(([id, task]) =>
+      let matchingActive = Object.entries(activeTasks).filter(([id, task]) =>
         matchStrongTask(id, task, payload, resolvedFormat)
       );
+      if (matchingActive.length === 0) {
+        matchingActive = Object.entries(activeTasks).filter(([id, task]) =>
+          matchTaskByDetails(task, payload, resolvedFormat)
+        );
+      }
 
       if (matchingActive.length === 1) {
         queuedTaskId = matchingActive[0][0];
@@ -719,9 +797,14 @@ async function doResolveFile(release, payload, resolvedFormat, fileName, baseUrl
 
       // 1B. If not active, check if an exact matching task is already completed -> reuse if file is present!
       if (!queuedTaskId) {
-        const matchingCompleted = Object.entries(completedTasks).filter(([id, task]) =>
+        let matchingCompleted = Object.entries(completedTasks).filter(([id, task]) =>
           matchStrongTask(id, task, payload, resolvedFormat)
         );
+        if (matchingCompleted.length === 0) {
+          matchingCompleted = Object.entries(completedTasks).filter(([id, task]) =>
+            matchTaskByDetails(task, payload, resolvedFormat)
+          );
+        }
 
         if (matchingCompleted.length === 1) {
           const completedId = matchingCompleted[0][0];
@@ -740,7 +823,7 @@ async function doResolveFile(release, payload, resolvedFormat, fileName, baseUrl
     }
   } catch (statusErr) {
     if (signal?.aborted) {
-      throw host.fail('cancelled', 'Download resolution was cancelled.');
+      throw classifyAbort(signal, host, 'Download resolution was cancelled.');
     }
     if (statusErr.code) throw statusErr;
   }
@@ -749,18 +832,17 @@ async function doResolveFile(release, payload, resolvedFormat, fileName, baseUrl
   if (!queuedTaskId) {
     let queueRes;
     try {
-      queueRes = await host.fetch(`${baseUrl}/api/releases/download`, {
+      queueRes = await safeHostFetch(host, `${baseUrl}/api/releases/download`, {
         method: 'POST',
         headers: {
           ...headers,
           'Content-Type': 'application/json',
         },
         body: JSON.stringify(payload),
-        signal,
-      });
+      }, signal);
     } catch (err) {
       if (signal?.aborted) {
-        throw host.fail('cancelled', 'Download request was cancelled.');
+        throw classifyAbort(signal, host, 'Download request was cancelled.');
       }
       throw host.fail('unreachable', `Could not trigger download in Shelfmark: ${sanitizeError(err.message, apiKey)}`);
     }
@@ -777,7 +859,7 @@ async function doResolveFile(release, payload, resolvedFormat, fileName, baseUrl
 
       if (isDuplicateQueue) {
         // Shelfmark duplicate-queue error: refresh status and try to adopt existing task
-        const refreshedRes = await host.fetch(`${baseUrl}/api/status`, { headers, signal }).catch(() => null);
+        const refreshedRes = await safeHostFetch(host, `${baseUrl}/api/status`, { headers }, signal).catch(() => null);
         if (refreshedRes && refreshedRes.ok) {
           const refData = await refreshedRes.json().catch(() => ({}));
           const activeTasks = {
@@ -795,15 +877,27 @@ async function doResolveFile(release, payload, resolvedFormat, fileName, baseUrl
             ...(refData.failed || {}),
           };
 
-          const matchedActive = Object.entries(activeTasks).filter(([id, task]) =>
+          let matchedActive = Object.entries(activeTasks).filter(([id, task]) =>
             matchStrongTask(id, task, payload, resolvedFormat)
           );
+          if (matchedActive.length === 0) {
+            matchedActive = Object.entries(activeTasks).filter(([id, task]) =>
+              matchTaskByDetails(task, payload, resolvedFormat)
+            );
+          }
+
           if (matchedActive.length === 1) {
             queuedTaskId = matchedActive[0][0];
           } else {
-            const matchedCompleted = Object.entries(completedTasks).filter(([id, task]) =>
+            let matchedCompleted = Object.entries(completedTasks).filter(([id, task]) =>
               matchStrongTask(id, task, payload, resolvedFormat)
             );
+            if (matchedCompleted.length === 0) {
+              matchedCompleted = Object.entries(completedTasks).filter(([id, task]) =>
+                matchTaskByDetails(task, payload, resolvedFormat)
+              );
+            }
+
             if (matchedCompleted.length === 1) {
               const compId = matchedCompleted[0][0];
               const fileOk = await isFileServable(compId);
@@ -816,9 +910,14 @@ async function doResolveFile(release, payload, resolvedFormat, fileName, baseUrl
               );
             } else {
               // Check if a failed task is tracked by Shelfmark for this release
-              const matchedFailed = Object.entries(failedTasks).filter(([id, task]) =>
+              let matchedFailed = Object.entries(failedTasks).filter(([id, task]) =>
                 matchStrongTask(id, task, payload, resolvedFormat)
               );
+              if (matchedFailed.length === 0) {
+                matchedFailed = Object.entries(failedTasks).filter(([id, task]) =>
+                  matchTaskByDetails(task, payload, resolvedFormat)
+                );
+              }
               if (matchedFailed.length === 1) {
                 const [failedId, failedTask] = matchedFailed[0];
                 throw host.fail(
@@ -851,23 +950,23 @@ async function doResolveFile(release, payload, resolvedFormat, fileName, baseUrl
 
   while (Date.now() - startTime < timeoutSec * 1000) {
     if (signal?.aborted) {
-      throw host.fail('cancelled', 'Download resolution was cancelled.');
+      throw classifyAbort(signal, host, 'Download resolution was cancelled.');
     }
 
     await sleep(pollDelay, signal);
 
     if (signal?.aborted) {
-      throw host.fail('cancelled', 'Download resolution was cancelled.');
+      throw classifyAbort(signal, host, 'Download resolution was cancelled.');
     }
 
     pollDelay = Math.min(Math.round(pollDelay * backoffFactor), maxDelay);
 
     let statusRes;
     try {
-      statusRes = await host.fetch(`${baseUrl}/api/status`, { headers, signal });
+      statusRes = await safeHostFetch(host, `${baseUrl}/api/status`, { headers }, signal);
     } catch (pollErr) {
       if (signal?.aborted) {
-        throw host.fail('cancelled', 'Download resolution was cancelled.');
+        throw classifyAbort(signal, host, 'Download resolution was cancelled.');
       }
       continue;
     }
@@ -1350,6 +1449,7 @@ function sleep(ms, signal) {
     let timer;
     const onAbort = () => {
       clearTimeout(timer);
+      signal?.removeEventListener?.('abort', onAbort);
       resolve();
     };
     timer = setTimeout(() => {
@@ -1360,21 +1460,90 @@ function sleep(ms, signal) {
   });
 }
 
-function raceWithSignal(promise, signal, host) {
-  if (!signal) return promise;
-  if (signal.aborted) return Promise.reject(host.fail('cancelled', 'Download resolution was cancelled.'));
+/**
+ * Checks whether an AbortSignal was triggered by a timeout (e.g. AbortSignal.timeout(ms)).
+ */
+function isTimeoutSignal(signal) {
+  if (!signal?.aborted) return false;
+  const reason = signal.reason;
+  if (!reason) return false;
+  if (reason.name === 'TimeoutError') return true;
+  const str = String(reason.message || reason).toLowerCase();
+  return str.includes('timeout') || str.includes('timed out');
+}
+
+/**
+ * Classifies an abort event into BookOrbit's valid failure codes (timeout vs error).
+ * Note: 'cancelled' is NOT a valid BookOrbit PluginSearchFailure code.
+ */
+function classifyAbort(signal, host, fallbackMessage = 'Operation was cancelled.') {
+  if (isTimeoutSignal(signal)) {
+    return host.fail('timeout', 'Operation timed out before completion.');
+  }
+  return host.fail('error', fallbackMessage);
+}
+
+/**
+ * Wrapper for BookOrbit's host.fetch that strictly conforms to PluginRequestInit
+ * (which does not accept signal) while properly racing with the cancellation signal
+ * and ensuring abort listeners are cleaned up immediately.
+ */
+function safeHostFetch(host, url, options = {}, signal) {
+  if (signal?.aborted) {
+    return Promise.reject(classifyAbort(signal, host, 'Request was aborted before execution.'));
+  }
+
+  const fetchOpts = {};
+  if (options.method) fetchOpts.method = options.method;
+  if (options.headers) fetchOpts.headers = options.headers;
+  if (options.body) fetchOpts.body = options.body;
+
+  const fetchPromise = host.fetch(url, fetchOpts);
+  if (!signal) return fetchPromise;
+
   return new Promise((resolve, reject) => {
-    const onAbort = () => reject(host.fail('cancelled', 'Download resolution was cancelled.'));
+    let settled = false;
+    const onAbort = () => {
+      if (settled) return;
+      settled = true;
+      reject(classifyAbort(signal, host, 'Request was cancelled during execution.'));
+    };
+
     signal.addEventListener('abort', onAbort, { once: true });
-    promise.then(
+
+    fetchPromise.then(
       (res) => {
+        if (settled) return;
+        settled = true;
         signal.removeEventListener('abort', onAbort);
         resolve(res);
       },
       (err) => {
+        if (settled) return;
+        settled = true;
         signal.removeEventListener('abort', onAbort);
         reject(err);
       }
     );
   });
+}
+
+/**
+ * Matches an active or completed task by details (title, format, source)
+ * when task ID is not a direct match or source_id is omitted by Shelfmark.
+ */
+function matchTaskByDetails(task, payload, resolvedFormat) {
+  if (!task || !payload) return false;
+  const taskTitle = task.title || task.book_title || '';
+  const targetTitle = payload.title || '';
+  if (!taskTitle || !targetTitle || !isTitleMatch(taskTitle, targetTitle)) return false;
+
+  const taskFmt = (task.format || '').toLowerCase().replace(/^\./, '');
+  if (taskFmt && resolvedFormat && taskFmt !== resolvedFormat.toLowerCase()) return false;
+
+  const taskSource = (task.source || '').toLowerCase();
+  const payloadSource = (payload.source || '').toLowerCase();
+  if (taskSource && payloadSource && taskSource !== payloadSource) return false;
+
+  return true;
 }
