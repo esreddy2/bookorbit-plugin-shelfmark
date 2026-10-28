@@ -12,7 +12,17 @@ This plugin enables BookOrbit to search book releases across sources configured 
 ## Features
 
 - **Native BookOrbit Request Integration:** Fully compliant with BookOrbit's indexer plugin specification (`apiVersion: 1`). Searches and downloads are triggered through BookOrbit Requests on demand—no standalone background daemons and no continuous polling.
-- **Duplicate Queue Protection & Task Adoption (v1.3.1):**
+- **Event-Driven Asynchronous Companion Bridge (v1.4.0):**
+  - Optional zero-dependency companion bridge (`npm run bridge` via `bridge/bridge.mjs`) decoupling downloads from BookOrbit's synchronous 240s HTTP `resolveFile` deadline.
+  - Integrates with Shelfmark v1.5.1's `CUSTOM_SCRIPT` hook (`scripts/shelfmark-hook.sh`), supporting both `CUSTOM_SCRIPT_JSON_PAYLOAD=true` (stdin) and path argument (`$1`) modes.
+  - Persists atomic durable mappings (`.bridge-state.json`) between BookOrbit request IDs, selected releases, and Shelfmark task IDs across restarts.
+  - Queues releases strictly once, preventing duplicate downloads across multiple users.
+  - Verifies completed files on disk before notifying BookOrbit (existence, size, and EPUB/PDF magic byte signatures).
+  - Eliminates tight 5s polling loops with a bounded 15-minute background reconciliation strategy.
+- **Authentic Release Identification & Derivative Noise Rejection (v1.4.0):**
+  - Preserves authentic metadata `bookTitle` instead of blindly substituting `searchTitle`, preventing false 100% match scores for unauthorized adaptations.
+  - Strictly rejects graphic novels, graded readers (Oxford Bookworms, Penguin Readers, Stage/Level 1-6), abridgments, simplified editions, and multi-work collections (e.g. *Animal Farm & 1984* bundles when only one novel was requested).
+- **Duplicate Queue Protection & Task Adoption:**
   - Pre-inspects Shelfmark's active, queued, and completed tasks before queueing.
   - Reuses completed downloads immediately after validating file presence via `/api/localdownload`, without re-downloading.
   - If a download is already in progress, safely adopts and monitors it without submitting a duplicate job.
@@ -32,7 +42,7 @@ This plugin enables BookOrbit to search book releases across sources configured 
   - Enforces strict author validation: rejects derivative adaptations by conflicting authors (e.g. Michael Dean adaptation of Orwell) and derivative study guides/summaries.
 - **Accurate Release Metadata & Scoring Integrity:**
   - Emits authentic `isbn`, `sizeBytes`, `format`, and `language` without fabrication.
-  - Aligns `bookTitle` with requested `searchTitle` so BookOrbit's title similarity scoring algorithm awards full title match score.
+  - Preserves authentic metadata bookTitle and cleans core release titles without fabricating metadata or manipulating titles.
   - Never fabricates `freeleech: true` or artificial file counts.
   - Deduplicates identical releases across providers without collapsing distinct editions.
 - **EPUB and PDF Support:** Prioritizes EPUB by default while fully supporting PDF downloads. (Audiobook support has been removed to streamline deployment).

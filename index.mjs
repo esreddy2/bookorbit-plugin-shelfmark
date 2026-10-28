@@ -12,7 +12,7 @@
  * Single-file and dependency-free following BookOrbit's indexer plugin specification.
  */
 
-const USER_AGENT = 'BookOrbit-Shelfmark-Plugin/1.3.1';
+const USER_AGENT = 'BookOrbit-Shelfmark-Plugin/1.4.0';
 
 /** Fallback maximum number of releases to return per search. */
 const MAX_RESULTS = 25;
@@ -34,7 +34,7 @@ const KNOWN_TITLE_EQUIVALENTS = new Map([
 
 export default {
   apiVersion: 1,
-  version: '1.3.1',
+  version: '1.4.0',
   update: {
     manifestUrl: 'https://raw.githubusercontent.com/esreddy2/bookorbit-plugin-shelfmark/main/updates/shelfmark.json',
     ed25519PublicKey: '-0aHVhXqg7cGaDchc2p1Y8tDnn8A7cJ0WREKspNv5Bc',
@@ -225,8 +225,10 @@ export default {
       // Extract authentic ISBN
       const authenticIsbn = extractIsbn(book, query) || (rel.isbn ? String(rel.isbn).trim() : null);
 
-      // Book title: align with requested searchTitle to ensure BookOrbit title similarity scoring succeeds
-      const bookTitle = searchTitle || book?.title || rel.title;
+      // Authentic book title:
+      // Preserves authentic metadata book title or cleaned core release title.
+      // Do NOT blindly substitute searchTitle when the release represents a different edition or title.
+      const bookTitle = book?.title || extractCoreTitle(rel.title) || rel.title;
 
       releases.push({
         guid: JSON.stringify(payload),
@@ -1201,12 +1203,14 @@ function extractIsbn(book, query) {
 }
 
 /**
- * Detects derivative / study guide / summary noise that should not match book titles.
+ * Detects derivative, adaptation, graded reader, graphic novel, collection,
+ * or study guide / summary noise that should not be matched to single-work book queries.
  */
 function isNoiseDerivative(candidateTitle, requestedTitle) {
   const normCand = normalizeString(candidateTitle);
   const normReq = normalizeString(requestedTitle);
   const noiseMarkers = [
+    // Study guides & summaries
     'summary of',
     'study guide',
     'cliffsnotes',
@@ -1219,15 +1223,50 @@ function isNoiseDerivative(candidateTitle, requestedTitle) {
     'teachers guide',
     'lesson plans',
     'activity guide',
+    // Adaptations & abridgments
     'adapted by',
     'retold by',
     'simplified edition',
+    'abridged',
+    // Graded readers
+    'graded reader',
+    'oxford bookworms',
+    'penguin active reading',
+    'penguin readers',
+    'macmillan readers',
+    // Graphic novels & comics
+    'graphic novel',
+    'comic book',
+    'illustrated novel',
+    // Collections & boxed sets
+    'complete works',
+    'box set',
+    'boxed set',
+    'omnibus',
+    'anthology',
   ];
   for (const marker of noiseMarkers) {
     if (normCand.includes(marker) && !normReq.includes(marker)) {
       return true;
     }
   }
+
+  // Graded reader stage / level markers: e.g. "stage 1", "level 3"
+  if (/\b(?:stage|level)\s*[1-6]\b/i.test(candidateTitle) && !/\b(?:stage|level)\s*[1-6]\b/i.test(requestedTitle)) {
+    return true;
+  }
+
+  // Multi-work collections (e.g. "Animal Farm & 1984" when user searched only one of them)
+  const hasAnimalFarm = normCand.includes('animal farm');
+  const has1984 = normCand.includes('1984') || normCand.includes('nineteen eighty four');
+  if (hasAnimalFarm && has1984) {
+    const reqHasBoth =
+      normReq.includes('animal farm') && (normReq.includes('1984') || normReq.includes('nineteen eighty four'));
+    if (!reqHasBoth) {
+      return true;
+    }
+  }
+
   return false;
 }
 

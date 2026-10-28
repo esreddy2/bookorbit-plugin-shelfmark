@@ -7,12 +7,15 @@
  * Run with: node verify.mjs
  */
 
-import { readFileSync } from 'node:fs';
+import { readFileSync, writeFileSync, unlinkSync, mkdirSync, existsSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { execFile } from 'node:child_process';
+import http from 'node:http';
 import crypto from 'node:crypto';
 
 import plugin from './index.mjs';
+import { BridgeService } from './bridge/bridge.mjs';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const fixture = (name) => JSON.parse(readFileSync(join(here, 'fixtures', name), 'utf8'));
@@ -97,7 +100,7 @@ async function runTests() {
   ok('preferFormat defaults to epub', plugin.settingsFields.find((f) => f.key === 'preferFormat')?.default === 'epub');
   ok('defines downloadViaShelfmark toggle', plugin.settingsFields.some((f) => f.key === 'downloadViaShelfmark'));
   ok('defines pollTimeoutSeconds defaulting to 240', plugin.settingsFields.find((f) => f.key === 'pollTimeoutSeconds')?.default === 240);
-  ok('declares semantic version 1.3.1', plugin.version === '1.3.1');
+  ok('declares semantic version 1.4.0', plugin.version === '1.4.0');
   ok('declares update channel', typeof plugin.update === 'object' && plugin.update !== null);
   ok('update manifestUrl is HTTPS and points to fork repo', typeof plugin.update?.manifestUrl === 'string' && plugin.update.manifestUrl.includes('esreddy2/bookorbit-plugin-shelfmark'));
   ok('update ed25519PublicKey is 43-char base64url', /^[A-Za-z0-9_-]{43}$/.test(plugin.update?.ed25519PublicKey ?? ''));
@@ -452,6 +455,36 @@ async function runTests() {
   }
 
   {
+    // Test 5F-1: Strict rejection of adaptations, graded readers, graphic novels, and collections (Animal Farm & 1984)
+    const host = makeHost((url) => {
+      if (url.includes('/api/metadata/search')) {
+        return mockResponse({
+          books: [
+            { provider: 'openlibrary', provider_id: 'OL-AF', title: 'Animal Farm', authors: ['George Orwell'] },
+          ],
+        });
+      }
+      if (url.includes('/api/releases')) {
+        return mockResponse([
+          { id: 'rel-gn', source_id: 's-gn', source: 'annas', title: 'Animal Farm: The Graphic Novel', format: 'epub', author: 'George Orwell' },
+          { id: 'rel-gr', source_id: 's-gr', source: 'annas', title: 'Animal Farm (Oxford Bookworms Library, Stage 3)', format: 'epub', author: 'George Orwell' },
+          { id: 'rel-col', source_id: 's-col', source: 'annas', title: 'Animal Farm & 1984 (Collector Edition)', format: 'epub', author: 'George Orwell' },
+          { id: 'rel-simp', source_id: 's-simp', source: 'annas', title: 'Animal Farm (Simplified Edition)', format: 'epub', author: 'George Orwell' },
+          { id: 'rel-auth', source_id: 's-auth', source: 'annas', title: 'Animal Farm (Penguin Classics)', format: 'epub', author: 'George Orwell' },
+        ]);
+      }
+      return mockResponse([]);
+    });
+
+    const res = await plugin.search({ title: 'Animal Farm', author: 'George Orwell', mediaKind: 'ebook' }, baseConfig(), host);
+    ok('rejects graphic novel adaptation for Animal Farm', !res.some((r) => r.title.includes('Graphic Novel')));
+    ok('rejects graded reader adaptation for Animal Farm', !res.some((r) => r.title.includes('Stage 3') || r.title.includes('Bookworms')));
+    ok('rejects multi-work collection bundle (Animal Farm & 1984)', !res.some((r) => r.title.includes('1984')));
+    ok('rejects simplified edition adaptation for Animal Farm', !res.some((r) => r.title.includes('Simplified Edition')));
+    ok('preserves authentic canonical edition of Animal Farm', res.some((r) => r.title.includes('Penguin Classics') && r.bookTitle === 'Animal Farm'));
+  }
+
+  {
     // Test 5F: Release scoring data integrity (bookTitle matches searchTitle, authentic metadata)
     const host = makeHost((url) => {
       if (url.includes('/api/metadata/search')) {
@@ -485,7 +518,7 @@ async function runTests() {
     });
 
     const res = await plugin.search({ title: '1984', author: 'George Orwell', mediaKind: 'ebook' }, baseConfig(), host);
-    ok('aligns candidate bookTitle with requested searchTitle to ensure BookOrbit title match score', res.length === 1 && res[0].bookTitle === '1984');
+    ok('preserves authentic metadata bookTitle rather than substituting searchTitle', res.length === 1 && res[0].bookTitle === 'Nineteen Eighty-Four');
     ok('preserves authentic sizeBytes, language, format, and isbn without fabrication', res[0].sizeBytes === 450000 && res[0].language === 'English' && res[0].isbn === '9780451524935' && res[0].freeleech === null);
   }
 
@@ -1459,6 +1492,318 @@ async function runTests() {
     const downloadResult = await plugin.resolveFile(release, baseConfig({ settings: { pollIntervalMs: 10 } }), host);
 
     ok('View files inspection and subsequent grab reuse task idempotently without re-queueing', postCount === 1 && inspectResult.url === downloadResult.url);
+  }
+
+  // --- 6. Asynchronous Event-Driven Companion Bridge & Hook Tests ---
+  console.log('\n--- 6. Asynchronous Event-Driven Companion Bridge & Hook Tests ---');
+
+  const testDir = join(here, 'fixtures', 'bridge_test_' + Date.now());
+  mkdirSync(testDir, { recursive: true });
+  const testStateFile = join(testDir, 'bridge-state.json');
+
+  try {
+    // Test B1: Durable state persistence across restarts
+    {
+      const bridge1 = new BridgeService({ stateFilePath: testStateFile });
+      let smPostCount = 0;
+      const fakeFetch = async (url, opts) => {
+        if (opts?.method === 'POST') {
+          smPostCount++;
+          return mockResponse({ task_id: 'sm-task-restart-1' });
+        }
+        return mockResponse({});
+      };
+
+      const qRes = await bridge1.queueRelease({
+        requestId: 'bo-req-101',
+        userId: 'user-alice',
+        release: { source: 'annas', sourceId: 'src-restart-1', title: '1984', format: 'epub', author: 'George Orwell' },
+        fetchFn: fakeFetch,
+      });
+
+      ok('bridge queues new release and persists task mapping', qRes.status === 'queued' && qRes.taskId === 'sm-task-restart-1' && smPostCount === 1);
+
+      // Simulate restart: create new BridgeService instance reading from the same state file
+      const bridge2 = new BridgeService({ stateFilePath: testStateFile });
+      const recoveredTask = bridge2.state.tasks['sm-task-restart-1'];
+      ok('bridge recovers state after restart', recoveredTask && recoveredTask.requestIds.includes('bo-req-101') && recoveredTask.userIds.includes('user-alice'));
+    }
+
+    // Test B2: Single queue deduplication across multi-user requests
+    {
+      const bridge = new BridgeService({ stateFilePath: testStateFile });
+      let smPostCount = 0;
+      const fakeFetch = async (url, opts) => {
+        if (opts?.method === 'POST') {
+          smPostCount++;
+          return mockResponse({ task_id: 'sm-task-dedup-1' });
+        }
+        return mockResponse({});
+      };
+
+      const rel = { source: 'annas', sourceId: 'src-dedup-1', title: 'Animal Farm', format: 'epub', author: 'George Orwell' };
+
+      // Alice queues release
+      const q1 = await bridge.queueRelease({
+        requestId: 'req-alice-1',
+        userId: 'user-alice',
+        release: rel,
+        fetchFn: fakeFetch,
+      });
+
+      // Bob concurrently requests the same release
+      const q2 = await bridge.queueRelease({
+        requestId: 'req-bob-1',
+        userId: 'user-bob',
+        release: rel,
+        fetchFn: fakeFetch,
+      });
+
+      ok('bridge queues release exactly once across multiple users', smPostCount === 1 && q1.status === 'queued' && q2.status === 'in_progress' && q1.taskId === q2.taskId);
+      const tracked = bridge.state.tasks[q1.taskId];
+      ok('bridge tracks all requesting users and request IDs on single task', tracked.requestIds.includes('req-alice-1') && tracked.requestIds.includes('req-bob-1') && tracked.userIds.includes('user-alice') && tracked.userIds.includes('user-bob'));
+    }
+
+    // Test B3: Adopts in-progress task when Shelfmark returns HTTP 500 duplicate queue error
+    {
+      const bridge = new BridgeService({ stateFilePath: testStateFile });
+      const fakeFetch = async (url, opts) => {
+        if (opts?.method === 'POST') {
+          return mockResponse({ error: 'Release is already in the download queue' }, 500);
+        }
+        if (url.includes('/api/status')) {
+          return mockResponse({
+            active_tasks: [
+              { id: 'task-adopted-500', source_id: 'src-dup-500', source: 'annas', title: 'Brave New World', format: 'epub' },
+            ],
+          });
+        }
+        return mockResponse({});
+      };
+
+      const qRes = await bridge.queueRelease({
+        requestId: 'req-dup-1',
+        release: { source: 'annas', sourceId: 'src-dup-500', title: 'Brave New World', format: 'epub' },
+        fetchFn: fakeFetch,
+      });
+
+      ok('bridge recovers from Shelfmark 500 duplicate queue error by adopting active task', qRes.taskId === 'task-adopted-500');
+    }
+
+    // Test B4: Webhook authentication (HTTP 401 on bad secret, HTTP 200 on valid secret)
+    {
+      const bridge = new BridgeService({ stateFilePath: testStateFile, secret: 'correct-secret' });
+      const unauth = await bridge.handleWebhook({ task_id: 't-1' }, 'wrong-secret');
+      ok('bridge rejects webhook with invalid secret (401)', unauth.statusCode === 401 && !unauth.ok);
+
+      const auth = await bridge.handleWebhook({ task_id: 't-nonexistent' }, 'correct-secret');
+      ok('bridge accepts webhook with valid secret (200)', auth.statusCode === 200 && auth.ok);
+    }
+
+    // Test B5: File verification (rejects missing, 0-byte, and invalid magic bytes)
+    {
+      const bridge = new BridgeService({ stateFilePath: testStateFile, secret: 'test-secret' });
+      const missingFile = join(testDir, 'does-not-exist.epub');
+      const zeroByteFile = join(testDir, 'zero.epub');
+      const fakeEpubFile = join(testDir, 'fake.epub');
+      const validEpubFile = join(testDir, 'valid.epub');
+      const validPdfFile = join(testDir, 'valid.pdf');
+
+      writeFileSync(zeroByteFile, Buffer.alloc(0));
+      writeFileSync(fakeEpubFile, Buffer.from('<html><body>Not an EPUB</body></html>', 'utf8'));
+
+      // Valid EPUB header (PK\x03\x04 + dummy zip content)
+      const validEpubBuf = Buffer.concat([Buffer.from([0x50, 0x4b, 0x03, 0x04]), Buffer.alloc(100)]);
+      writeFileSync(validEpubFile, validEpubBuf);
+
+      // Valid PDF header (%PDF-1.5)
+      const validPdfBuf = Buffer.concat([Buffer.from('%PDF-1.5\n', 'utf8'), Buffer.alloc(100)]);
+      writeFileSync(validPdfFile, validPdfBuf);
+
+      ok('file verification rejects non-existent file', !bridge.verifyFile(missingFile, 'epub').ok);
+      ok('file verification rejects 0-byte file', !bridge.verifyFile(zeroByteFile, 'epub').ok);
+      ok('file verification rejects corrupted / spoofed magic bytes', !bridge.verifyFile(fakeEpubFile, 'epub').ok);
+      ok('file verification accepts valid EPUB magic bytes', bridge.verifyFile(validEpubFile, 'epub').ok);
+      ok('file verification accepts valid PDF magic bytes', bridge.verifyFile(validPdfFile, 'pdf').ok);
+
+      // Register a queued task to test webhook rejection on corrupt file
+      bridge.state.tasks['task-corrupt'] = {
+        taskId: 'task-corrupt',
+        title: 'Corrupted Book',
+        format: 'epub',
+        status: 'queued',
+        requestIds: ['req-corrupt-1'],
+        userIds: [],
+      };
+      bridge.saveState();
+
+      const hookResCorrupt = await bridge.handleWebhook({
+        task_id: 'task-corrupt',
+        download_path: fakeEpubFile,
+        format: 'epub',
+      }, 'test-secret');
+
+      ok('bridge rejects corrupted download in webhook with 422', hookResCorrupt.statusCode === 422 && !hookResCorrupt.ok);
+      ok('corrupted download does NOT mark task completed', bridge.state.tasks['task-corrupt'].status === 'failed');
+    }
+
+    // Test B6: Fulfills BookOrbit requests only after verified file import
+    {
+      const bridge = new BridgeService({
+        stateFilePath: testStateFile,
+        secret: 'test-secret',
+        bookorbitUrl: 'http://bookorbit:8080',
+        bookorbitApiKey: 'bo-api-key',
+      });
+
+      const validEpub = join(testDir, 'valid.epub');
+      bridge.state.tasks['task-success'] = {
+        taskId: 'task-success',
+        title: '1984',
+        author: 'George Orwell',
+        format: 'epub',
+        status: 'queued',
+        requestIds: ['req-success-1'],
+        userIds: ['alice'],
+      };
+      bridge.saveState();
+
+      const boCalls = [];
+      const fakeBoFetch = async (url, opts) => {
+        boCalls.push({ url, opts });
+        return mockResponse({ ok: true, status: 'AVAILABLE' });
+      };
+
+      const hookRes = await bridge.handleWebhook({
+        task_id: 'task-success',
+        download_path: validEpub,
+        format: 'epub',
+      }, 'test-secret', fakeBoFetch);
+
+      ok('webhook accepts valid file and marks completed', hookRes.ok && hookRes.statusCode === 200);
+      ok('notifies BookOrbit import endpoint with verified file path', boCalls.some((c) => c.url.includes('/api/v1/import/file') && JSON.parse(c.opts.body).filePath === validEpub));
+      ok('marks BookOrbit request AVAILABLE only after successful import', boCalls.some((c) => c.url.includes('/api/v1/requests/req-success-1/fulfill') && JSON.parse(c.opts.body).status === 'AVAILABLE'));
+    }
+
+    // Test B7: Bounded periodic reconciliation discovers completed tasks without polling loops
+    {
+      const bridge = new BridgeService({ stateFilePath: testStateFile });
+      const validEpub = join(testDir, 'valid.epub');
+
+      bridge.state.tasks['task-missed-webhook'] = {
+        taskId: 'task-missed-webhook',
+        title: 'Fahrenheit 451',
+        format: 'epub',
+        status: 'queued',
+        filePath: validEpub,
+        requestIds: ['req-f451'],
+        userIds: [],
+      };
+      bridge.saveState();
+
+      const fakeSmFetch = async (url) => {
+        if (url.includes('/api/status')) {
+          return mockResponse({
+            completed_tasks: [
+              { id: 'task-missed-webhook', title: 'Fahrenheit 451', format: 'epub', download_path: validEpub },
+            ],
+            failed_tasks: [],
+          });
+        }
+        return mockResponse({});
+      };
+
+      const recon = await bridge.reconcile({ fetchFn: fakeSmFetch });
+      ok('reconciliation discovers completed task and verifies file', recon.ok && recon.updatedCount === 1);
+      ok('task transitioned to completed via reconciliation', bridge.state.tasks['task-missed-webhook'].status === 'completed');
+    }
+
+    // Test B8: Bounded reconciliation marks failed tasks and frees release lock for retry
+    {
+      const bridge = new BridgeService({ stateFilePath: testStateFile });
+      const releaseKey = 'annas:failed-src-1';
+      bridge.state.releases[releaseKey] = 'task-failed-1';
+      bridge.state.tasks['task-failed-1'] = {
+        taskId: 'task-failed-1',
+        releaseKey,
+        title: 'Failed Download',
+        format: 'epub',
+        status: 'queued',
+        requestIds: ['req-fail-1'],
+        userIds: [],
+      };
+      bridge.saveState();
+
+      const fakeSmFetch = async (url) => {
+        if (url.includes('/api/status')) {
+          return mockResponse({
+            completed_tasks: [],
+            failed_tasks: [
+              { id: 'task-failed-1', error: 'Mirror timed out' },
+            ],
+          });
+        }
+        return mockResponse({});
+      };
+
+      const recon = await bridge.reconcile({ fetchFn: fakeSmFetch });
+      ok('reconciliation marks failed task', recon.ok && bridge.state.tasks['task-failed-1'].status === 'failed');
+      ok('reconciliation frees release lock so retry is permitted', bridge.state.releases[releaseKey] === undefined);
+    }
+
+    // Test B9: Shelfmark hook script executes cleanly in both stdin JSON and argument modes
+    {
+      const hookServer = http.createServer((req, res) => {
+        let body = '';
+        req.on('data', (c) => { body += c; });
+        req.on('end', () => {
+          const secret = req.headers['x-bridge-secret'];
+          const parsed = body ? JSON.parse(body) : {};
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: true, secret, received: parsed }));
+        });
+      });
+
+      await new Promise((resolve) => hookServer.listen(8098, resolve));
+
+      try {
+        // Mode 1: Argument mode (CLI argument $1)
+        const argOut = await new Promise((resolve, reject) => {
+          execFile('scripts/shelfmark-hook.sh', ['/tmp/downloads/Book.epub'], {
+            env: { ...process.env, BRIDGE_WEBHOOK_URL: 'http://localhost:8098/webhook', BRIDGE_SECRET: 'test-hook-secret' },
+          }, (err, stdout) => {
+            if (err) reject(err);
+            else resolve(stdout);
+          });
+        });
+        ok('shelfmark hook executes in argument mode ($1)', argOut.includes('Success (HTTP 200)') && argOut.includes('Book.epub'));
+
+        // Mode 2: Stdin JSON mode (CUSTOM_SCRIPT_JSON_PAYLOAD=true)
+        const stdinOut = await new Promise((resolve, reject) => {
+          const child = execFile('scripts/shelfmark-hook.sh', [], {
+            env: { ...process.env, BRIDGE_WEBHOOK_URL: 'http://localhost:8098/webhook', BRIDGE_SECRET: 'test-hook-secret' },
+          }, (err, stdout) => {
+            if (err) reject(err);
+            else resolve(stdout);
+          });
+          child.stdin.write(JSON.stringify({ task_id: 'task-hook-stdin', status: 'completed', format: 'epub' }));
+          child.stdin.end();
+        });
+        ok('shelfmark hook executes in stdin JSON mode', stdinOut.includes('Success (HTTP 200)') && stdinOut.includes('task-hook-stdin'));
+      } finally {
+        await new Promise((resolve) => hookServer.close(resolve));
+      }
+    }
+  } finally {
+    // Cleanup temporary test files
+    try {
+      if (existsSync(testDir)) {
+        for (const file of ['zero.epub', 'fake.epub', 'valid.epub', 'valid.pdf', 'bridge-state.json']) {
+          const p = join(testDir, file);
+          if (existsSync(p)) unlinkSync(p);
+        }
+      }
+    } catch {}
   }
 
   console.log(`\nResults: ${pass} passed, ${fail} failed.\n`);

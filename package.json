@@ -1,10 +1,11 @@
 {
   "name": "bookorbit-plugin-shelfmark",
-  "version": "1.3.1",
+  "version": "1.4.0",
   "description": "Shelfmark indexer plugin for BookOrbit",
   "type": "module",
   "scripts": {
     "test": "node verify.mjs",
+    "bridge": "node bridge/bridge.mjs",
     "release": "node scripts/sign-release.mjs"
   },
   "author": "esreddy2",
