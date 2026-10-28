@@ -23,6 +23,8 @@ import {
   isJwt,
   decodeJwtExp,
   parseShelfmarkStatus,
+  normalizeTaskGroup,
+  parsePositiveInt,
 } from './bridge/bridge.mjs';
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -108,7 +110,7 @@ async function runTests() {
   ok('preferFormat defaults to epub', plugin.settingsFields.find((f) => f.key === 'preferFormat')?.default === 'epub');
   ok('defines downloadViaShelfmark toggle', plugin.settingsFields.some((f) => f.key === 'downloadViaShelfmark'));
   ok('defines pollTimeoutSeconds defaulting to 240', plugin.settingsFields.find((f) => f.key === 'pollTimeoutSeconds')?.default === 240);
-  ok('declares semantic version 1.5.1', plugin.version === '1.5.1');
+  ok('declares semantic version 1.5.2', plugin.version === '1.5.2');
   ok('declares update channel', typeof plugin.update === 'object' && plugin.update !== null);
   ok('update manifestUrl is HTTPS and points to fork repo', typeof plugin.update?.manifestUrl === 'string' && plugin.update.manifestUrl.includes('esreddy2/bookorbit-plugin-shelfmark'));
   ok('update ed25519PublicKey is 43-char base64url', /^[A-Za-z0-9_-]{43}$/.test(plugin.update?.ed25519PublicKey ?? ''));
@@ -1679,6 +1681,7 @@ async function runTests() {
         bookorbitApiKey: 'bo-admin-key',
         allowedBaseDirs: [testDir],
         defaultLibraryId: 2,
+        defaultFolderId: 1,
       });
 
       const validEpub = join(testDir, 'valid.epub');
@@ -2169,7 +2172,10 @@ async function runTests() {
       const fakeBoFetch = async (url, opts) => {
         boCalls.push({ url, opts });
         if (url.includes('/api/v1/book-dock/upload')) {
-          return mockResponse({ id: 801 });
+          return mockResponse({ id: 801, status: 'ready_to_file' });
+        }
+        if (url.includes('/api/v1/book-dock/files/801')) {
+          return mockResponse({ id: 801, status: 'ready_to_file' });
         }
         if (url.includes('/api/v1/book-dock/finalize')) {
           const body = JSON.parse(opts.body);
@@ -2217,7 +2223,10 @@ async function runTests() {
       const fakeBoFetch = async (url, opts) => {
         if (url.includes('/api/v1/book-dock/upload')) {
           uploadCallCount++;
-          return mockResponse({ id: 802 });
+          return mockResponse({ id: 802, status: 'ready_to_file' });
+        }
+        if (url.includes('/api/v1/book-dock/files/802')) {
+          return mockResponse({ id: 802, status: 'ready_to_file' });
         }
         if (url.includes('/api/v1/book-dock/finalize')) {
           // Finalize returns needs_review / low score hold
@@ -2309,7 +2318,10 @@ async function runTests() {
       const fulfilledRequests = new Set();
       const fakeBoFetch = async (url, opts) => {
         if (url.includes('/api/v1/book-dock/upload')) {
-          return mockResponse({ id: Math.floor(Math.random() * 1000) });
+          return mockResponse({ id: Math.floor(Math.random() * 1000), status: 'ready_to_file' });
+        }
+        if (url.includes('/api/v1/book-dock/files/')) {
+          return mockResponse({ status: 'ready_to_file' });
         }
         if (url.includes('/api/v1/book-dock/finalize')) {
           return mockResponse({ results: [{ fileId: 1, success: true, bookId: Math.floor(Math.random() * 1000) }] });
@@ -2493,16 +2505,16 @@ async function runTests() {
       bridge.saveState();
 
       const shelfmarkStatusPayload = {
-        complete: [
-          { id: 'task-c1', title: 'Book C', format: 'epub', target: validEpub },
-        ],
-        downloading: [
-          { id: 'task-d1', title: 'Book D', format: 'epub' },
-        ],
-        queued: [],
-        error: [
-          { id: 'task-e1', title: 'Book E', error: 'Tracker returned 404 not found' },
-        ],
+        complete: {
+          'task-c1': { title: 'Book C', format: 'epub', target: validEpub },
+        },
+        downloading: {
+          'task-d1': { title: 'Book D', format: 'epub' },
+        },
+        queued: {},
+        error: {
+          'task-e1': { title: 'Book E', error: 'Tracker returned 404 not found' },
+        },
       };
 
       const parsed = parseShelfmarkStatus(shelfmarkStatusPayload);
@@ -2731,6 +2743,301 @@ async function runTests() {
       const resFiled = await bridge.fulfillBookOrbitRequests(bridge.state.tasks['task-already-filed'], fakeBoFetchAlreadyFiled);
       ok('adopts bookId from already-filed Book Dock record without calling finalize again', !finalizeCalledForFiled && resFiled.bookId === 8822);
       ok('handles 400 already fulfilled idempotently without failing', resFiled.fulfilled === true && bridge.state.tasks['task-already-filed'].status === 'fulfilled');
+    }
+
+    // Test B25 (Bug 1): Keyed Shelfmark task groups normalization, queue adoption, and reconciliation
+    {
+      const validEpub = join(testDir, 'valid.epub');
+
+      // 1. Direct normalization testing
+      const keyedSample = {
+        'task-af': { title: 'Animal Farm', format: 'epub', target: validEpub },
+        'task-1984': { title: '1984', format: 'epub', target: validEpub },
+      };
+      const normKeyed = normalizeTaskGroup(keyedSample);
+      ok('normalizeTaskGroup converts keyed object dictionary into an array', Array.isArray(normKeyed) && normKeyed.length === 2);
+      ok('normalizeTaskGroup preserves task ID from object keys', normKeyed[0].id === 'task-af' && normKeyed[0].task_id === 'task-af' && normKeyed[1].id === 'task-1984');
+
+      const arraySample = [{ id: 'task-arr-1', title: 'Arr Book' }];
+      const normArr = normalizeTaskGroup(arraySample);
+      ok('normalizeTaskGroup handles legacy array input safely', Array.isArray(normArr) && normArr[0].id === 'task-arr-1' && normArr[0].task_id === 'task-arr-1');
+      ok('normalizeTaskGroup handles null or empty group safely', normalizeTaskGroup(null).length === 0 && normalizeTaskGroup({}).length === 0);
+
+      // 2. Realistic live Shelfmark v1.5.1 keyed status response
+      const liveStatus = {
+        complete: {
+          'sm-comp-1': { title: '1984', format: 'epub', target: validEpub },
+          'sm-comp-2': { title: 'Animal Farm', format: 'epub', target: validEpub },
+        },
+        downloading: {
+          'sm-dl-1': { title: 'Brave New World', format: 'epub', progress: 45, source_id: 'src-bnw-1' },
+        },
+        queued: {},
+        error: {
+          'sm-err-1': { title: 'Fahrenheit 451', error: 'Tracker error: connection refused' },
+        },
+      };
+
+      const parsedLive = parseShelfmarkStatus(liveStatus);
+      ok('parseShelfmarkStatus returns array for complete group', Array.isArray(parsedLive.complete) && parsedLive.complete.length === 2);
+      ok('parseShelfmarkStatus returns array for downloading group', Array.isArray(parsedLive.downloading) && parsedLive.downloading.length === 1 && parsedLive.downloading[0].id === 'sm-dl-1');
+      ok('parseShelfmarkStatus returns array for queued group', Array.isArray(parsedLive.queued) && parsedLive.queued.length === 0);
+      ok('parseShelfmarkStatus returns array for error group', Array.isArray(parsedLive.error) && parsedLive.error.length === 1 && parsedLive.error[0].id === 'sm-err-1');
+
+      // 3. Queue adoption when Shelfmark status returns keyed groups
+      const b25StateFile = join(testDir, '.bridge-b25-state.json');
+      const bridge = new BridgeService({
+        stateFilePath: b25StateFile,
+        allowedBaseDirs: [testDir],
+        shelfmarkUrl: 'http://localhost:8125',
+      });
+
+      const fakeSmFetchKeyed = async (url, opts) => {
+        if (url.includes('/api/releases/download')) {
+          // Returns 200 without task ID; requires correlation against /api/status
+          return mockResponse({});
+        }
+        if (url.includes('/api/status')) {
+          return mockResponse(liveStatus);
+        }
+        return mockResponse({});
+      };
+
+      const adoptResult = await bridge.queueRelease({
+        requestId: 'req-bnw',
+        userId: 'alice',
+        release: { title: 'Brave New World', format: 'epub', source: 'annas', sourceId: 'src-bnw-1' },
+        fetchFn: fakeSmFetchKeyed,
+      });
+
+      ok('queueRelease adopts active task from keyed downloading group without throwing', adoptResult.taskId === 'sm-dl-1' && adoptResult.status === 'queued');
+
+      // 4. Reconciliation on keyed status response without throwing
+      bridge.state.tasks['sm-comp-1'] = { taskId: 'sm-comp-1', title: '1984', format: 'epub', status: 'downloading', requestIds: ['req-1984'], userIds: [] };
+      bridge.state.tasks['sm-err-1'] = { taskId: 'sm-err-1', title: 'Fahrenheit 451', format: 'epub', status: 'downloading', releaseKey: 'annas:f451', requestIds: ['req-f451'], userIds: [] };
+      bridge.state.releases['annas:f451'] = 'sm-err-1';
+
+      const reconResult = await bridge.reconcile({ fetchFn: fakeSmFetchKeyed });
+      ok('reconciliation operates on keyed groups without throwing', reconResult.ok && reconResult.updatedCount === 2);
+      ok('reconciliation transitions tracked complete task from keyed group to completed', bridge.state.tasks['sm-comp-1'].status === 'completed');
+      ok('reconciliation transitions tracked error task from keyed group to failed', bridge.state.tasks['sm-err-1'].status === 'failed');
+      ok('reconciliation frees release lock on keyed error task', bridge.state.releases['annas:f451'] === undefined);
+    }
+
+    // Test B26 (Bug 2): Failed first-run baseline enumeration fail-closed safety
+    {
+      const b26StateFile = join(testDir, '.bridge-b26-state.json');
+      const bridge = new BridgeService({
+        stateFilePath: b26StateFile,
+        bookorbitUrl: 'http://bookorbit:8080',
+        bookorbitApiKey: 'bo-key',
+      });
+
+      // 1. HTTP 401 Unauthorized
+      const fake401 = async () => mockResponse({ error: 'Unauthorized' }, 401);
+      const res401 = await bridge.initializeBaseline({ fetchFn: fake401 });
+      ok('baseline enumeration fails closed on HTTP 401', res401.established === false && bridge.state.baselineEstablishedAt === null);
+
+      // 2. HTTP 403 Forbidden
+      const fake403 = async () => mockResponse({ error: 'Forbidden' }, 403);
+      const res403 = await bridge.initializeBaseline({ fetchFn: fake403 });
+      ok('baseline enumeration fails closed on HTTP 403', res403.established === false && bridge.state.baselineEstablishedAt === null);
+
+      // 3. HTTP 500 Internal Server Error
+      const fake500 = async () => mockResponse({ error: 'Internal Server Error' }, 500);
+      const res500 = await bridge.initializeBaseline({ fetchFn: fake500 });
+      ok('baseline enumeration fails closed on HTTP 500', res500.established === false && bridge.state.baselineEstablishedAt === null);
+
+      // 4. Network interruption / fetch exception
+      const fakeNetError = async () => { throw new Error('ECONNRESET: connection reset by peer'); };
+      const resNet = await bridge.initializeBaseline({ fetchFn: fakeNetError });
+      ok('baseline enumeration fails closed on network interruption', resNet.established === false && bridge.state.baselineEstablishedAt === null);
+
+      // 5. Partial pagination (total is 100, page 1 returns 50, page 2 returns 0 items)
+      let pageCallCount = 0;
+      const fakePartialPagination = async (url) => {
+        pageCallCount++;
+        if (url.includes('page=1')) {
+          const items = Array.from({ length: 50 }, (_, i) => ({ id: `req-p1-${i}` }));
+          return mockResponse({ total: 100, items });
+        }
+        // Truncated page 2 returning 0 items
+        return mockResponse({ total: 100, items: [] });
+      };
+      const resPartial = await bridge.initializeBaseline({ fetchFn: fakePartialPagination });
+      ok('baseline enumeration fails closed on partial pagination', resPartial.established === false && bridge.state.baselineEstablishedAt === null);
+
+      // 6. State persistence failure
+      const itemsAll = Array.from({ length: 5 }, (_, i) => ({ id: `req-full-${i}` }));
+      const fakeSuccessFetch = async () => mockResponse({ total: 5, items: itemsAll });
+      const originalSaveState = bridge.saveState.bind(bridge);
+      bridge.saveState = () => false; // Simulate write failure
+      const resPersistFail = await bridge.initializeBaseline({ fetchFn: fakeSuccessFetch });
+      ok('baseline enumeration fails closed on persistence failure', resPersistFail.established === false && bridge.state.baselineEstablishedAt === null);
+      ok('rolls back in-memory baselineRequestIds on persistence failure', Object.keys(bridge.state.baselineRequestIds).length === 0);
+      bridge.saveState = originalSaveState;
+
+      // 7. processPendingRequests halts closed when baseline fails
+      let releaseQueued = false;
+      const fakeBoWithRequests = async (url) => {
+        if (url.includes('/api/v1/admin/book-requests')) {
+          // Baseline call fails with 500
+          return mockResponse({ error: 'Server temporarily unavailable' }, 500);
+        }
+        return mockResponse({});
+      };
+      bridge.queueRelease = async () => { releaseQueued = true; };
+      await bridge.processPendingRequests({ fetchFn: fakeBoWithRequests });
+      ok('processPendingRequests halts closed and does not queue requests after incomplete baseline', !releaseQueued && bridge.state.baselineEstablishedAt === null);
+    }
+
+    // Test B27 (Bug 3): Book Dock readiness settlement, timeout fail-closed, already-filed adoption, and library/folder validation
+    {
+      const b27StateFile = join(testDir, '.bridge-b27-state.json');
+      const bridge = new BridgeService({
+        stateFilePath: b27StateFile,
+        bookorbitUrl: 'http://bookorbit:8080',
+        bookorbitApiKey: 'bo-key',
+        allowedBaseDirs: [testDir],
+        dockReadinessAttempts: 3,
+        dockReadinessIntervalMs: 10,
+        defaultLibraryId: 1,
+        defaultFolderId: 1,
+      });
+
+      const validEpub = join(testDir, 'valid.epub');
+
+      // 1. Timeout on still-processing file fails closed without calling finalize
+      bridge.state.tasks['task-timeout'] = {
+        taskId: 'task-timeout',
+        title: 'Processing Book',
+        format: 'epub',
+        status: 'completed',
+        filePath: validEpub,
+        dockFileId: null,
+        matchedBookId: null,
+        requestIds: ['req-timeout-1'],
+        userIds: [],
+      };
+
+      let finalizeCalled = false;
+      const fakeBoTimeout = async (url) => {
+        if (url.includes('/api/v1/book-dock/upload')) {
+          return mockResponse({ id: 933, status: 'processing' });
+        }
+        if (url.includes('/api/v1/book-dock/files/933')) {
+          return mockResponse({ id: 933, status: 'processing' });
+        }
+        if (url.includes('/api/v1/book-dock/finalize')) {
+          finalizeCalled = true;
+          return mockResponse({ results: [{ fileId: 933, success: true, bookId: 1234 }] });
+        }
+        return mockResponse({});
+      };
+
+      const resTimeout = await bridge.fulfillBookOrbitRequests(bridge.state.tasks['task-timeout'], fakeBoTimeout);
+      ok('timed-out Book Dock file fails closed without calling finalize', !finalizeCalled && resTimeout.fulfilled === false);
+      ok('task transitions to finalization_failed on readiness timeout', bridge.state.tasks['task-timeout'].status === 'finalization_failed');
+
+      // 2. Already-filed file adopted with verified positive integer bookId
+      bridge.state.tasks['task-filed-adopt'] = {
+        taskId: 'task-filed-adopt',
+        title: 'Filed Book',
+        format: 'epub',
+        status: 'completed',
+        filePath: validEpub,
+        dockFileId: 944,
+        matchedBookId: null,
+        requestIds: ['req-filed-adopt-1'],
+        userIds: [],
+      };
+
+      let finalizeCalledForAdopt = false;
+      let fulfillCalledForAdopt = false;
+      const fakeBoAdopt = async (url) => {
+        if (url.includes('/api/v1/book-dock/files/944')) {
+          return mockResponse({ id: 944, status: 'filed', bookId: 4499 });
+        }
+        if (url.includes('/api/v1/book-dock/finalize')) {
+          finalizeCalledForAdopt = true;
+          return mockResponse({});
+        }
+        if (url.includes('/fulfill')) {
+          fulfillCalledForAdopt = true;
+          return mockResponse({ id: 'req-filed-adopt-1', status: 'AVAILABLE' });
+        }
+        return mockResponse({});
+      };
+
+      const resAdopt = await bridge.fulfillBookOrbitRequests(bridge.state.tasks['task-filed-adopt'], fakeBoAdopt);
+      ok('adopts valid bookId from already-filed record without finalize', !finalizeCalledForAdopt && resAdopt.bookId === 4499);
+      ok('fulfills request with adopted book ID', fulfillCalledForAdopt && bridge.state.tasks['task-filed-adopt'].status === 'fulfilled');
+
+      // 3. Already-filed file with invalid/missing bookId fails closed
+      bridge.state.tasks['task-filed-invalid-id'] = {
+        taskId: 'task-filed-invalid-id',
+        title: 'Corrupt Filed Book',
+        format: 'epub',
+        status: 'completed',
+        filePath: validEpub,
+        dockFileId: 955,
+        matchedBookId: null,
+        requestIds: ['req-invalid-id-1'],
+        userIds: [],
+      };
+
+      const fakeBoInvalidBookId = async (url) => {
+        if (url.includes('/api/v1/book-dock/files/955')) {
+          return mockResponse({ id: 955, status: 'filed', bookId: null });
+        }
+        return mockResponse({});
+      };
+
+      const resInvalidBookId = await bridge.fulfillBookOrbitRequests(bridge.state.tasks['task-filed-invalid-id'], fakeBoInvalidBookId);
+      ok('already-filed record with null bookId fails closed', resInvalidBookId.fulfilled === false && bridge.state.tasks['task-filed-invalid-id'].status === 'finalization_failed');
+
+      // 4. Companion validates library and folder IDs and fails closed if unconfigured or invalid
+      const bridgeNoIds = new BridgeService({
+        stateFilePath: join(testDir, '.bridge-b27-no-ids.json'),
+        bookorbitUrl: 'http://bookorbit:8080',
+        allowedBaseDirs: [testDir],
+        defaultLibraryId: null,
+        defaultFolderId: null,
+      });
+
+      ok('BridgeService defaults defaultLibraryId to null when unconfigured', bridgeNoIds.defaultLibraryId === null);
+      ok('BridgeService defaults defaultFolderId to null when unconfigured', bridgeNoIds.defaultFolderId === null);
+
+      bridgeNoIds.state.tasks['task-unconfigured-ids'] = {
+        taskId: 'task-unconfigured-ids',
+        title: 'No IDs Book',
+        format: 'epub',
+        status: 'completed',
+        filePath: validEpub,
+        dockFileId: null,
+        matchedBookId: null,
+        requestIds: ['req-no-ids-1'],
+        userIds: [],
+      };
+
+      let finalizeCalledNoIds = false;
+      const fakeBoNoIds = async (url) => {
+        if (url.includes('/api/v1/book-dock/upload')) {
+          return mockResponse({ id: 966, status: 'ready_to_file' });
+        }
+        if (url.includes('/api/v1/book-dock/finalize')) {
+          finalizeCalledNoIds = true;
+          return mockResponse({});
+        }
+        return mockResponse({});
+      };
+
+      const resNoIds = await bridgeNoIds.fulfillBookOrbitRequests(bridgeNoIds.state.tasks['task-unconfigured-ids'], fakeBoNoIds);
+      ok('fails finalization safely when library or folder ID is unconfigured', !finalizeCalledNoIds && resNoIds.fulfilled === false && bridgeNoIds.state.tasks['task-unconfigured-ids'].status === 'finalization_failed');
+
+      // 5. parsePositiveInt validation helper
+      ok('parsePositiveInt accepts positive integers', parsePositiveInt(1) === 1 && parsePositiveInt('42') === 42);
+      ok('parsePositiveInt rejects zero, negative numbers, decimals, and non-numeric values', parsePositiveInt(0) === null && parsePositiveInt(-5) === null && parsePositiveInt(1.5) === null && parsePositiveInt('abc') === null && parsePositiveInt(null) === null);
     }
   } finally {
     // Cleanup temporary test files

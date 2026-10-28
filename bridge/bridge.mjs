@@ -100,19 +100,67 @@ export function decodeJwtExp(token) {
 }
 
 /**
+ * Normalizes a Shelfmark task group (which is an object keyed by task ID in v1.5.1
+ * or an array in legacy/mock fixtures) into an array of task records.
+ * Retains each original task ID from the object key or element.
+ */
+export function normalizeTaskGroup(group) {
+  if (!group || typeof group !== 'object') {
+    return [];
+  }
+  if (Array.isArray(group)) {
+    return group.map((item) => {
+      if (!item || typeof item !== 'object') return item;
+      const id = item.id || item.task_id;
+      return {
+        ...item,
+        id,
+        task_id: item.task_id || id,
+      };
+    });
+  }
+  return Object.entries(group).map(([key, val]) => {
+    if (!val || typeof val !== 'object') {
+      return { id: key, task_id: key };
+    }
+    const id = val.id || val.task_id || key;
+    return {
+      ...val,
+      id,
+      task_id: val.task_id || id,
+    };
+  });
+}
+
+/**
  * Parses Shelfmark v1.5.1 /api/status response, supporting keyed groups
  * (`complete`, `downloading`, `queued`, `error`) and legacy arrays.
+ * Always returns normalized arrays of task records.
  */
 export function parseShelfmarkStatus(statusJson) {
   if (!statusJson || typeof statusJson !== 'object') {
     return { complete: [], downloading: [], queued: [], error: [] };
   }
   return {
-    complete: statusJson.complete || statusJson.completed_tasks || [],
-    downloading: statusJson.downloading || statusJson.active_tasks || [],
-    queued: statusJson.queued || statusJson.queued_tasks || [],
-    error: statusJson.error || statusJson.failed_tasks || [],
+    complete: normalizeTaskGroup(statusJson.complete || statusJson.completed_tasks),
+    downloading: normalizeTaskGroup(statusJson.downloading || statusJson.active_tasks),
+    queued: normalizeTaskGroup(statusJson.queued || statusJson.queued_tasks),
+    error: normalizeTaskGroup(statusJson.error || statusJson.failed_tasks),
   };
+}
+
+/**
+ * Validates and parses positive integers (e.g. library and folder IDs).
+ */
+export function parsePositiveInt(val) {
+  if (typeof val === 'number') {
+    return Number.isInteger(val) && val > 0 ? val : null;
+  }
+  if (typeof val === 'string' && /^\d+$/.test(val.trim())) {
+    const parsed = parseInt(val.trim(), 10);
+    return parsed > 0 ? parsed : null;
+  }
+  return null;
 }
 
 /**
@@ -422,8 +470,10 @@ export class BridgeService {
     this.bookorbitToken = options.bookorbitToken || process.env.BOOKORBIT_TOKEN || '';
     this.shelfmarkUrl = (options.shelfmarkUrl || process.env.SHELFMARK_URL || 'http://localhost:8084').replace(/\/$/, '');
     this.shelfmarkApiKey = options.shelfmarkApiKey || process.env.SHELFMARK_API_KEY || '';
-    this.defaultLibraryId = options.defaultLibraryId !== undefined ? options.defaultLibraryId : (process.env.BOOKORBIT_DEFAULT_LIBRARY_ID ? parseInt(process.env.BOOKORBIT_DEFAULT_LIBRARY_ID, 10) : 1);
-    this.defaultFolderId = options.defaultFolderId !== undefined ? options.defaultFolderId : (process.env.BOOKORBIT_DEFAULT_FOLDER_ID ? parseInt(process.env.BOOKORBIT_DEFAULT_FOLDER_ID, 10) : 1);
+    this.defaultLibraryId = options.defaultLibraryId !== undefined ? options.defaultLibraryId : (process.env.BOOKORBIT_DEFAULT_LIBRARY_ID ? parseInt(process.env.BOOKORBIT_DEFAULT_LIBRARY_ID, 10) : null);
+    this.defaultFolderId = options.defaultFolderId !== undefined ? options.defaultFolderId : (process.env.BOOKORBIT_DEFAULT_FOLDER_ID ? parseInt(process.env.BOOKORBIT_DEFAULT_FOLDER_ID, 10) : null);
+    this.dockReadinessAttempts = options.dockReadinessAttempts || 25;
+    this.dockReadinessIntervalMs = options.dockReadinessIntervalMs || 100;
     this.reconcileIntervalMs = options.reconcileIntervalMs || 15 * 60 * 1000; // 15 minutes
 
     // Path translation & containment
@@ -489,6 +539,7 @@ export class BridgeService {
 
   /**
    * Persists state to disk atomically using a temporary file.
+   * Returns true on success, false on failure.
    */
   saveState() {
     try {
@@ -499,14 +550,18 @@ export class BridgeService {
       const tmpPath = `${this.stateFilePath}.tmp.${Date.now()}.${crypto.randomBytes(4).toString('hex')}`;
       fs.writeFileSync(tmpPath, JSON.stringify(this.state, null, 2), 'utf8');
       fs.renameSync(tmpPath, this.stateFilePath);
+      return true;
     } catch (err) {
       console.error(`[Bridge] Error: Failed to save state to ${this.stateFilePath}: ${sanitizeLog(err.message)}`);
+      return false;
     }
   }
 
   /**
    * On first startup, enumerates all pre-existing BookOrbit requests across all
    * pages to establish a baseline. Historical requests in this baseline are never queued.
+   * Fails closed: never marks the baseline established unless all pages have been
+   * fetched successfully and durable state persistence succeeds.
    */
   async initializeBaseline({ fetchFn = globalThis.fetch } = {}) {
     if (this.state.baselineEstablishedAt) {
@@ -529,6 +584,7 @@ export class BridgeService {
     const limit = 50;
     let total = Infinity;
     let count = 0;
+    const collectedIds = [];
 
     while (count < total) {
       const url = `${this.bookorbitUrl}/api/v1/admin/book-requests?page=${page}&limit=${limit}`;
@@ -537,35 +593,72 @@ export class BridgeService {
         res = await fetchFn(url, { headers });
       } catch (err) {
         console.warn(`[Bridge] Failed to fetch baseline page ${page}: ${sanitizeLog(err.message)}`);
-        break;
+        return { established: false, count, error: `Network error on page ${page}: ${err.message}` };
       }
 
       if (!res.ok) {
-        console.warn(`[Bridge] Baseline enumeration returned HTTP ${res.status}`);
-        break;
+        console.warn(`[Bridge] Baseline enumeration returned HTTP ${res.status} on page ${page}`);
+        return { established: false, count, error: `HTTP ${res.status} on page ${page}` };
       }
 
-      const data = await res.json().catch(() => ({}));
+      let data;
+      try {
+        data = await res.json();
+      } catch (err) {
+        console.warn(`[Bridge] Failed to parse baseline JSON page ${page}: ${sanitizeLog(err.message)}`);
+        return { established: false, count, error: `Malformed JSON on page ${page}: ${err.message}` };
+      }
+
       const items = Array.isArray(data) ? data : data.items || [];
       if (typeof data.total === 'number') {
         total = data.total;
       }
 
-      if (items.length === 0) break;
+      if (items.length === 0) {
+        if (total !== Infinity && count < total) {
+          console.warn(`[Bridge] Baseline enumeration partial: expected ${total}, received 0 items on page ${page} (collected ${count})`);
+          return { established: false, count, error: `Partial pagination: expected total ${total}, got ${count}` };
+        }
+        break;
+      }
 
       for (const item of items) {
-        if (item.id) {
-          this.state.baselineRequestIds[item.id] = true;
+        if (item && item.id) {
+          collectedIds.push(item.id);
           count++;
         }
       }
 
       if (count >= total) break;
+      if (Array.isArray(data) && items.length < limit) break;
+
       page++;
     }
 
-    this.state.baselineEstablishedAt = new Date().toISOString();
-    this.saveState();
+    if (total !== Infinity && count < total) {
+      console.warn(`[Bridge] Baseline enumeration partial: collected ${count} of ${total} requests`);
+      return { established: false, count, error: `Partial pagination: expected total ${total}, got ${count}` };
+    }
+
+    // Populate baseline IDs only after complete successful pagination
+    for (const id of collectedIds) {
+      this.state.baselineRequestIds[id] = true;
+    }
+
+    const baselineTimestamp = new Date().toISOString();
+    this.state.baselineEstablishedAt = baselineTimestamp;
+
+    const saved = this.saveState();
+    if (!saved) {
+      // Revert in-memory baseline state on persistence failure!
+      this.state.baselineEstablishedAt = null;
+      for (const id of collectedIds) {
+        delete this.state.baselineRequestIds[id];
+      }
+      console.error('[Bridge] Failed to persist baseline state to disk');
+      return { established: false, count, error: 'Persistence failure' };
+    }
+
     console.log(`[Bridge] First-run baseline established with ${count} existing requests. Historical backlog will not be processed.`);
     return { established: true, count };
   }
@@ -737,7 +830,11 @@ export class BridgeService {
 
     try {
       if (!this.state.baselineEstablishedAt) {
-        await this.initializeBaseline({ fetchFn });
+        const baselineResult = await this.initializeBaseline({ fetchFn });
+        if (!baselineResult.established || !this.state.baselineEstablishedAt) {
+          console.warn('[Bridge] Baseline not established. Halting request processing until baseline succeeds.');
+          return;
+        }
       }
 
       let token = '';
@@ -1178,6 +1275,8 @@ export class BridgeService {
 
     let bookDockFileId = task.dockFileId || null;
     let matchedBookId = task.matchedBookId || null;
+    let readyToFinalize = false;
+    let isAlreadyFinalized = false;
 
     // Step 1: Ingest file into Book Dock if not already uploaded
     if (!bookDockFileId) {
@@ -1210,6 +1309,9 @@ export class BridgeService {
           const uploadJson = await uploadRes.json().catch(() => ({}));
           bookDockFileId = uploadJson.id || uploadJson.fileId;
           task.dockFileId = bookDockFileId;
+          if ((uploadJson.status || '').toLowerCase() === 'ready_to_file') {
+            readyToFinalize = true;
+          }
           this.saveState();
         } else {
           const errText = await uploadRes.text().catch(() => '');
@@ -1225,43 +1327,74 @@ export class BridgeService {
     }
 
     // Step 2: Wait for upload to reach a genuinely finalizable state (ready_to_file) or adopt already-filed file
-    let isAlreadyFinalized = false;
-    try {
-      for (let attempt = 0; attempt < 15; attempt++) {
-        const checkRes = await fetchFn(`${boUrl}/api/v1/book-dock/files/${bookDockFileId}`, { headers });
-        if (checkRes.ok) {
-          const fileInfo = await checkRes.json().catch(() => ({}));
-          const fileStatus = (fileInfo.status || '').toLowerCase();
-          if (fileStatus === 'filed' || fileStatus === 'finalized') {
-            isAlreadyFinalized = true;
-            if (fileInfo.bookId && typeof fileInfo.bookId === 'number') {
-              matchedBookId = fileInfo.bookId;
-              task.matchedBookId = matchedBookId;
-              this.saveState();
+    if (!readyToFinalize) {
+      try {
+        for (let attempt = 0; attempt < this.dockReadinessAttempts; attempt++) {
+          const checkRes = await fetchFn(`${boUrl}/api/v1/book-dock/files/${bookDockFileId}`, { headers });
+          if (checkRes.ok) {
+            const fileInfo = await checkRes.json().catch(() => ({}));
+            const fileStatus = (fileInfo.status || '').toLowerCase();
+            if (fileStatus === 'filed' || fileStatus === 'finalized') {
+              const bId = parsePositiveInt(fileInfo.bookId);
+              if (bId) {
+                isAlreadyFinalized = true;
+                matchedBookId = bId;
+                task.matchedBookId = matchedBookId;
+                this.saveState();
+                break;
+              } else {
+                task.status = 'finalization_failed';
+                task.error = 'Book Dock file reported filed but missing valid bookId';
+                this.saveState();
+                return { fulfilled: false, error: task.error };
+              }
             }
-            break;
+            if (fileStatus === 'ready_to_file') {
+              readyToFinalize = true;
+              break;
+            }
+            if (fileStatus === 'error' || fileStatus === 'failed') {
+              task.status = 'finalization_failed';
+              task.error = fileInfo.error || fileInfo.message || 'Book Dock file reported error state';
+              this.saveState();
+              return { fulfilled: false, error: task.error };
+            }
           }
-          if (fileStatus === 'ready_to_file') {
-            break;
-          }
-          if (fileStatus === 'error' || fileStatus === 'failed') {
-            task.status = 'finalization_failed';
-            task.error = fileInfo.error || fileInfo.message || 'Book Dock file reported error state';
-            this.saveState();
-            return { fulfilled: false, error: task.error };
-          }
+          await new Promise((r) => setTimeout(r, this.dockReadinessIntervalMs));
         }
-        await new Promise((r) => setTimeout(r, 100));
+      } catch (err) {
+        console.warn(`[Bridge] Book Dock check exception: ${sanitizeLog(err.message)}`);
       }
-    } catch {}
+    }
+
+    // Fail closed: Never finalize a still-processing file!
+    if (!readyToFinalize && !isAlreadyFinalized) {
+      task.status = 'finalization_failed';
+      task.error = `Book Dock file ${bookDockFileId} timed out waiting for ready_to_file state (still processing)`;
+      this.saveState();
+      return { fulfilled: false, error: task.error };
+    }
 
     // Step 3: Finalize into Target Library & Destination Folder if not already finalized
     if (!matchedBookId && !isAlreadyFinalized) {
+      const rawLibraryId = task.libraryId ?? this.defaultLibraryId;
+      const rawFolderId = task.folderId ?? this.defaultFolderId;
+
+      const targetLibraryId = parsePositiveInt(rawLibraryId);
+      const targetFolderId = parsePositiveInt(rawFolderId);
+
+      if (!targetLibraryId || !targetFolderId) {
+        task.status = 'finalization_failed';
+        task.error = `Finalization requires a library and a folder: destination library or folder ID is unconfigured or invalid (library: ${rawLibraryId}, folder: ${rawFolderId})`;
+        this.saveState();
+        return { fulfilled: false, error: task.error };
+      }
+
       try {
         const finalizePayload = {
           fileIds: [bookDockFileId],
-          defaultLibraryId: task.libraryId ?? this.defaultLibraryId,
-          defaultFolderId: task.folderId ?? this.defaultFolderId,
+          defaultLibraryId: targetLibraryId,
+          defaultFolderId: targetFolderId,
         };
 
         const finalizeRes = await fetchFn(`${boUrl}/api/v1/book-dock/finalize`, {
@@ -1282,7 +1415,8 @@ export class BridgeService {
         const resultItem = finalizeJson.results?.find((r) => r.fileId === bookDockFileId) || finalizeJson.results?.[0];
 
         // CRITICAL: Strictly require results[].success === true and valid positive bookId
-        const isSuccess = Boolean(resultItem) && resultItem.success === true && typeof resultItem.bookId === 'number' && resultItem.bookId > 0;
+        const resultBookId = parsePositiveInt(resultItem?.bookId);
+        const isSuccess = Boolean(resultItem) && resultItem.success === true && Boolean(resultBookId);
         if (!resultItem || !isSuccess) {
           task.status = 'finalization_failed';
           task.error = resultItem?.message || 'Finalization returned failed or needs review';
@@ -1290,7 +1424,7 @@ export class BridgeService {
           return { fulfilled: false, error: task.error };
         }
 
-        matchedBookId = resultItem.bookId;
+        matchedBookId = resultBookId;
         task.matchedBookId = matchedBookId;
         this.saveState();
       } catch (err) {
