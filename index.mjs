@@ -34,7 +34,7 @@ const KNOWN_TITLE_EQUIVALENTS = new Map([
 
 export default {
   apiVersion: 1,
-  version: '1.5.14',
+  version: '1.5.15',
   update: {
     manifestUrl: 'https://raw.githubusercontent.com/esreddy2/bookorbit-plugin-shelfmark/main/updates/shelfmark.json',
     ed25519PublicKey: '-0aHVhXqg7cGaDchc2p1Y8tDnn8A7cJ0WREKspNv5Bc',
@@ -253,7 +253,9 @@ export default {
       // Extract authentic ISBN
       // Never claim a release has the request's ISBN without independent evidence.
       // Preserve the release's own ISBN (or metadata book ISBN), never the query ISBN.
-      const authenticIsbn = extractIsbn(book, null) || (rel.isbn ? String(rel.isbn).trim() : null) || (rel.extra?.isbn ? String(rel.extra.isbn).trim() : null) || (rel.extra?.isbn13 ? String(rel.extra.isbn13).trim() : null);
+      // Never use the parent catalog ISBN as proof of a release's edition: only the
+      // release's own ISBN (or EPUB metadata discovered later) is authentic.
+      const authenticIsbn = (rel.isbn ? String(rel.isbn).trim() : null) || (rel.extra?.isbn ? String(rel.extra.isbn).trim() : null) || (rel.extra?.isbn13 ? String(rel.extra.isbn13).trim() : null);
       if (searchIsbn && authenticIsbn && authenticIsbn !== searchIsbn) return;
       const releaseYear = toNumber(rel.year || rel.publish_year || rel.publication_year || rel.published_year || rel.publicationYear || rel.publishedYear || rel.extra?.year || rel.extra?.publish_year || rel.extra?.publication_year || book?.publish_year || book?.publishYear || book?.year || book?.publication_year || rel?.book?.publish_year || rel?.book?.publishYear || rel?.book?.year || null);
       if (requestedYear && releaseYear && requestedYear !== releaseYear) return;
@@ -453,44 +455,53 @@ export default {
           if (hasSufficientResults()) break;
           if (signal?.aborted || Date.now() - searchStartTime >= SEARCH_BUDGET_MS) break;
 
-          const queryKey = `${book.provider_id || ''}:${queryTitle.toLowerCase()}:${naturalAuthor.toLowerCase()}:${isbn || ''}`;
-          if (queriedKeys.has(queryKey)) continue;
-          queriedKeys.add(queryKey);
+          const fetchBookReleases = async (useIsbn) => {
+            const key = `${book.provider_id || ''}:${queryTitle.toLowerCase()}:${naturalAuthor.toLowerCase()}:${useIsbn ? (isbn || '') : ''}`;
+            if (queriedKeys.has(key)) return [];
+            queriedKeys.add(key);
+            const releasesUrl = new URL(`${baseUrl}/api/releases`);
+            releasesUrl.searchParams.set('provider', book.provider || 'openlibrary');
+            releasesUrl.searchParams.set('book_id', book.provider_id || '');
+            releasesUrl.searchParams.set('title', queryTitle);
+            if (naturalAuthor) {
+              releasesUrl.searchParams.set('author', naturalAuthor);
+            }
+            if (useIsbn && isbn) {
+              releasesUrl.searchParams.set('isbn', isbn);
+            }
+            releasesUrl.searchParams.set('content_type', 'ebook');
+            if (source && source !== 'all') {
+              releasesUrl.searchParams.set('source', source);
+            }
+            let relRes;
+            try {
+              relRes = await safeHostFetch(host, releasesUrl.href, { headers }, signal);
+            } catch (err) {
+                if (signal?.aborted) throw err;
+              return [];
+            }
+            if (!relRes.ok) return [];
+            const relData = await relRes.json().catch(() => ({ releases: [] }));
+            return Array.isArray(relData)
+              ? relData
+              : Array.isArray(relData.releases)
+                ? relData.releases
+                : [];
+          };
 
-          const releasesUrl = new URL(`${baseUrl}/api/releases`);
-          releasesUrl.searchParams.set('provider', book.provider || 'openlibrary');
-          releasesUrl.searchParams.set('book_id', book.provider_id || '');
-          releasesUrl.searchParams.set('title', queryTitle);
-          if (naturalAuthor) {
-            releasesUrl.searchParams.set('author', naturalAuthor);
-          }
-          if (isbn) {
-            releasesUrl.searchParams.set('isbn', isbn);
-          }
-          releasesUrl.searchParams.set('content_type', 'ebook');
-          if (source && source !== 'all') {
-            releasesUrl.searchParams.set('source', source);
-          }
-
-          let relRes;
+          let foundReleases = [];
           try {
-            relRes = await safeHostFetch(host, releasesUrl.href, { headers }, signal);
+            foundReleases = await fetchBookReleases(true);
+            if ((!foundReleases || foundReleases.length === 0) && isbn) {
+              foundReleases = await fetchBookReleases(false);
+              }
           } catch (err) {
             if (signal?.aborted) break;
             continue;
           }
 
-          if (!relRes.ok) continue;
-
-          const relData = await relRes.json().catch(() => ({ releases: [] }));
-          const foundReleases = Array.isArray(relData)
-            ? relData
-            : Array.isArray(relData.releases)
-              ? relData.releases
-              : [];
-
           for (const rel of foundReleases) {
-            const relTitle = rel.title || '';
+              const relTitle = rel.title || '';
             const relAuthor = toNaturalAuthor(rel.author || rel.extra?.author || rel.extra?.Author);
             if (relTitle && !isTitleMatch(relTitle, searchTitle) && !isTitleMatch(relTitle, book.title)) {
               continue;
@@ -540,43 +551,61 @@ export default {
         if (hasSufficientResults()) break;
         if (signal?.aborted || Date.now() - searchStartTime >= SEARCH_BUDGET_MS) break;
 
-        const queryKey = `direct:${queryTitle.toLowerCase()}:${naturalSearchAuthor.toLowerCase()}:${queryIsbn || ''}`;
-        if (queriedKeys.has(queryKey)) continue;
-        queriedKeys.add(queryKey);
+        const fetchDirectReleases = async (useIsbn) => {
+          const key = `direct:${queryTitle.toLowerCase()}:${naturalSearchAuthor.toLowerCase()}:${useIsbn ? (queryIsbn || '') : ''}`;
+          if (queriedKeys.has(key)) return [];
+          queriedKeys.add(key);
+          const directRelUrl = new URL(`${baseUrl}/api/releases`);
+          if (queryTitle) {
+            directRelUrl.searchParams.set('title', queryTitle);
+          }
+          if (naturalSearchAuthor) {
+            directRelUrl.searchParams.set('author', naturalSearchAuthor);
+          }
+          if (useIsbn && queryIsbn) {
+            directRelUrl.searchParams.set('isbn', queryIsbn);
+          }
+          directRelUrl.searchParams.set('content_type', 'ebook');
+          if (source && source !== 'all') {
+            directRelUrl.searchParams.set('source', source);
+          }
+          const directRelRes = await safeHostFetch(host, directRelUrl.href, { headers }, signal);
+          if (!directRelRes.ok) return [];
+          const directData = await directRelRes.json().catch(() => ({ releases: [] }));
+          return Array.isArray(directData)
+            ? directData
+            : Array.isArray(directData.releases)
+              ? directData.releases
+              : Array.isArray(directData.items)
+                ? directData.items
+                : Array.isArray(directData.results)
+                  ? directData.results
+                  : [];
+        };
 
         if ((!source || source === 'all') && !queryTitle && !naturalSearchAuthor && !queryIsbn) {
           continue;
         }
-        const directRelUrl = new URL(`${baseUrl}/api/releases`);
-        if (queryTitle) {
-          directRelUrl.searchParams.set('title', queryTitle);
-        }
-        if (naturalSearchAuthor) {
-          directRelUrl.searchParams.set('author', naturalSearchAuthor);
-        }
-        if (queryIsbn) {
-          directRelUrl.searchParams.set('isbn', queryIsbn);
-        }
-        directRelUrl.searchParams.set('content_type', 'ebook');
-        if (source && source !== 'all') {
-          directRelUrl.searchParams.set('source', source);
-        }
 
+        let directReleases = [];
         try {
-          const directRelRes = await safeHostFetch(host, directRelUrl.href, { headers }, signal);
-          if (directRelRes.ok) {
-            const directData = await directRelRes.json().catch(() => ({ releases: [] }));
-            const directReleases = Array.isArray(directData)
-              ? directData
-              : Array.isArray(directData.releases)
-                ? directData.releases
-                : Array.isArray(directData.items)
-                  ? directData.items
-                  : Array.isArray(directData.results)
-                    ? directData.results
-                    : [];
+          directReleases = await fetchDirectReleases(true);
+          if ((!directReleases || directReleases.length === 0) && queryIsbn) {
+            directReleases = await fetchDirectReleases(false);
+          }
+        } catch (err) {
+          if (signal?.aborted) {
+            if (releases.length > 0) return rankAndSlice();
+            throw classifyAbort(signal, host, 'Search was cancelled.');
+          }
+          if (providerError && releases.length === 0) {
+            throw host.fail('unreachable', `Shelfmark search failed: ${providerError}`);
+          }
+          continue;
+        }
 
-            for (const rel of directReleases) {
+        if (Array.isArray(directReleases)) {
+          for (const rel of directReleases) {
               const relTitle = rel.title || '';
 const relAuthor = toNaturalAuthor(rel.author || rel.extra?.author || rel.extra?.Author);
               // Strictly validate title and author on direct releases
@@ -597,17 +626,8 @@ const relAuthor = toNaturalAuthor(rel.author || rel.extra?.author || rel.extra?.
               addRelease(rel, null);
             }
           }
-        } catch (err) {
-          if (signal?.aborted) {
-            if (releases.length > 0) return rankAndSlice();
-            throw classifyAbort(signal, host, 'Search was cancelled.');
-          }
-          if (providerError && releases.length === 0) {
-            throw host.fail('unreachable', `Shelfmark search failed: ${providerError}`);
-          }
         }
       }
-    }
 
     // Check deadline / cancellation state
     if (signal?.aborted) {

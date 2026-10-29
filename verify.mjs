@@ -1,5 +1,5 @@
 /**
- * BookOrbit ↔ Shelfmark acceptance and regression verification, v1.5.14.
+ * BookOrbit ↔ Shelfmark acceptance and regression verification, v1.5.15.
  *
  * EXTERNAL ORACLES — NOT AN IMPLEMENTATION-DERIVED TEST PLAN:
  *   - BookOrbit v3.5.0 API/host contracts and request behavior.
@@ -15,7 +15,7 @@
  *
  * Place at repository ROOT as verify.mjs, then run:
  *   node verify.mjs                # acceptance tests while developing
- *   node verify.mjs --release      # additionally require signed v1.5.14 release
+ *   node verify.mjs --release      # additionally require signed v1.5.15 release
  *
  * A 404 for an unknown route is intentional. NEVER add a made-up endpoint
  * to the allowlist just to make a test green. Verify an API contract first.
@@ -53,7 +53,7 @@ import {
 } from './bridge/bridge.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
-const EXPECTED_VERSION = '1.5.14';
+const EXPECTED_VERSION = '1.5.15';
 const RELEASE_MODE = process.argv.includes('--release');
 const TEST_TIMEOUT_MS = 10_000;
 const tests = [];
@@ -373,7 +373,7 @@ test('DECLARATION: BookOrbit API v1, Shelfmark indexer and ebook-only', () => {
   assert.equal(plugin.type, 'shelfmark');
   assert.deepEqual(plugin.mediaKinds, ['ebook']);
 });
-test('DECLARATION: native indexer advertises v1.5.14, never a previous version', () => {
+test('DECLARATION: native indexer advertises v1.5.15, never a previous version', () => {
   assert.equal(plugin.version, EXPECTED_VERSION);
 });
 test('DECLARATION: exposes search, test, and resolveFile entry points', () => {
@@ -399,7 +399,7 @@ test('RELEASE CONTRACT: package version, plugin version and release target agree
   assert.equal(plugin.version, EXPECTED_VERSION);
 });
 if (RELEASE_MODE) {
-  test('RELEASE: signed manifest has declared format and v1.5.14 version', () => {
+  test('RELEASE: signed manifest has declared format and v1.5.15 version', () => {
     const manifest = JSON.parse(readFileSync(join(HERE, 'updates', 'shelfmark.json'), 'utf8'));
     assert.equal(manifest.schemaVersion, 1);
     assert.equal(manifest.type, 'shelfmark');
@@ -704,6 +704,38 @@ test('SEARCH: metadata ISBN is carried into the release lookup', async () => {
     releases: [release('1984', 'George Orwell')],
   });
   assert.ok(fake.called('sm.releases').some((c) => c.query.get('isbn') === '9780451524935'));
+});
+test('SEARCH: ISBN-locked release query falls back to title and author without ISBN', async () => {
+  const isbn = '9791223228388';
+  const { result, fake } = await searchScenario({
+    query: standardQuery('1984', 'George Orwell', { isbn13: isbn }),
+    books: [metadata('1984', 'George Orwell', { isbn: [isbn] })],
+    onReleases: (entry) => entry.query.get('isbn')
+      ? { releases: [] }
+      : { releases: [release('1984', 'George Orwell')] },
+  });
+  assert.ok(fake.called('sm.releases').some((c) => c.query.get('isbn') === isbn));
+  assert.ok(fake.called('sm.releases').some((c) => !c.query.get('isbn')));
+  assert.ok(result.length > 0);
+});
+
+test('SEARCH: a release with a conflicting authentic ISBN is rejected', async () => {
+  const requestedIsbn = '9791223228388';
+  const { result } = await searchScenario({
+    query: standardQuery('1984', 'George Orwell', { isbn13: requestedIsbn }),
+    books: [metadata('1984', 'George Orwell', { isbn: [requestedIsbn] })],
+    releases: [release('1984', 'George Orwell', { isbn: '9780451524935' })],
+  });
+  assert.equal(result.length, 0);
+});
+
+test('SEARCH: no ISBN is fabricated when release metadata lacks one', async () => {
+  const { result } = await searchScenario({
+    query: standardQuery('1984', 'George Orwell'),
+    books: [metadata('1984', 'George Orwell')],
+    releases: [release('1984', 'George Orwell')],
+  });
+  assert.ok(result.every((r) => r.isbn === null || r.isbn === undefined || r.isbn === ''));
 });
 test('SEARCH: authentic size and metadata are preserved, unreported tracker fields stay unknown', async () => {
   const { result } = await searchScenario({
