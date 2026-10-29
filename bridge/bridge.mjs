@@ -2167,6 +2167,37 @@ export class BridgeService {
    *   'incompatible' - Book exists in library but edition is incompatible
    *   'unknown'       - Outage / auth failure / network error / ambiguous query (fail closed)
    */
+  async listAuthoritativeLibraryBooks(targetLibraryId, headers, fetchFn = globalThis.fetch) {
+    const libraryId = parsePositiveInt(targetLibraryId);
+    if (!libraryId) return null;
+    const url = `${this.bookorbitUrl}/api/v1/libraries/${libraryId}/books`;
+    const size = 100;
+    const all = [];
+    try {
+      for (let page = 0; page < 5; page++) {
+        const result = await fetchFn(url, {
+          method: 'POST',
+          headers: { ...headers, 'Content-Type': 'application/json' },
+          body: JSON.stringify({ q: '', sort: [], pagination: { page, size } }),
+        });
+        if (!result?.ok) return null;
+        const data = await result.json();
+        if (!data || !Array.isArray(data.items)) return null;
+        all.push(...data.items);
+        const total = Number(data.total);
+        if (Number.isFinite(total) && total >= 0) {
+          if (all.length >= total) return all;
+          if (data.items.length < size) return null;
+        } else if (data.items.length < size) {
+          return all;
+        }
+      }
+    } catch (err) {
+      console.warn(`[Bridge] Library membership lookup unavailable: ${sanitizeLog(err?.message || err)}`);
+    }
+    return null;
+  }
+
   async verifyBookInLibrary(task, targetLibraryId, bookId, headers, fetchFn = globalThis.fetch) {
     const bId = parsePositiveInt(bookId);
     if (!bId) return 'deleted';
@@ -2176,7 +2207,6 @@ export class BridgeService {
     const authHeaders = headers || await this.getAuthHeaders();
     const boUrl = this.bookorbitUrl;
 
-    // Helper to evaluate edition compatibility for a found card.
     const evaluateCard = (card, ignoreTitleMismatch = false) => {
       const authors = Array.isArray(card?.authors) ? card.authors : [];
       const author = typeof card?.author === 'string' && card.author.trim()
@@ -2197,7 +2227,6 @@ export class BridgeService {
       const compatTask = { ...task, author: expectedAuthor };
       const compatBook = { ...book };
       if (ignoreTitleMismatch) {
-        // A renamed book keeps its identity by ID; title drift alone is not a different edition.
         compatTask.title = book.title || compatTask.title;
         compatTask.bookTitle = book.title || compatTask.bookTitle;
         compatBook.title = book.title || compatBook.title;
@@ -2209,49 +2238,52 @@ export class BridgeService {
       return 'exists';
     };
 
-    // 1. Prefer a supported exact-ID verification route when available.
+    // Library-scoped membership is authoritative for deletion in this library.
+    const libraryBooks = await this.listAuthoritativeLibraryBooks(libId, authHeaders, fetchFn);
+    if (libraryBooks === null) {
+      return 'unknown';
+    }
+    const foundCard = libraryBooks.find((c) => parsePositiveInt(c?.id ?? c?.bookId) === bId);
+
+    // Exact-ID route can refine edition/membership but is not trusted alone for deletion.
+    let exactBook = null;
+    let exactLibraryMismatch = false;
     if (boUrl) {
-      let exactResolved = false;
-      let exactStatus = null;
       try {
         const res = await fetchFn(`${boUrl}/api/v1/books/${bId}`, { headers: authHeaders });
-        exactStatus = res?.status ?? null;
         if (res?.ok) {
           const data = await res.json().catch(() => null);
-          if (data && (data.id === undefined || parsePositiveInt(data.id ?? data.bookId) === bId)) {
-            // Verify library membership when the route exposes it.
-            const bookLibId = parsePositiveInt(data.libraryId ?? data.library?.id ?? data.library_id);
-            if (bookLibId && bookLibId !== libId) {
-              // Book exists, but not in the target library.
-              return 'deleted';
+          if (data) {
+            const dataId = parsePositiveInt(data.id ?? data.bookId);
+            if (!dataId || dataId === bId) {
+              exactBook = data;
+              const bookLibId = parsePositiveInt(data.libraryId ?? data.library?.id ?? data.library_id);
+              if (bookLibId && bookLibId !== libId) {
+                exactLibraryMismatch = true;
+              }
             }
-            exactResolved = true;
-            return evaluateCard(data, true);
           }
         }
-        if (exactStatus === 404) {
-          // Authoritative: book no longer exists.
-          return 'deleted';
-        }
+        // 404 and other failures are treated conservatively: do not declare deletion.
       } catch (err) {
         console.warn(`[Bridge] Exact book lookup unavailable: ${sanitizeLog(err?.message || err)}`);
       }
-      // Non-404 failure: do not treat as deletion; fall through to title search.
-      if (exactResolved) return 'exists';
     }
 
-    // 2. Fall back to library-scoped title search. A missing saved ID here is
-    //    NOT proof of deletion (renamed books, stale title index, etc.).
-    const cards = await this.listAuthoritativeBookOrbitBooks(task, libId, authHeaders, fetchFn);
-    if (cards === null) {
+    if (exactLibraryMismatch) {
+      // The book exists in another library; that is not deletion.
       return 'unknown';
     }
-    const foundCard = cards.find((c) => parsePositiveInt(c?.id ?? c?.bookId) === bId);
+
     if (!foundCard) {
-      // Inconclusive: title search does not contain this ID. Do not declare deletion.
-      return 'unknown';
+      // Authoritative library listing for this library does not contain this ID.
+      return 'deleted';
     }
-    return evaluateCard(foundCard, false);
+
+    if (exactBook) {
+      return evaluateCard({ ...foundCard, ...exactBook }, true);
+    }
+    return evaluateCard(foundCard, true);
   }
 
   /**
@@ -2720,9 +2752,11 @@ export class BridgeService {
           task.status = 'completed';
         }
         this.saveState();
-      } else if (bookStatus === 'unknown') {
-        console.warn(`[Bridge] BookOrbit library check unavailable for book ${matchedBookId}; failing closed without re-uploading.`);
-        task.error = 'BookOrbit library verification unavailable';
+      } else if (bookStatus === 'unknown' || bookStatus === 'incompatible') {
+        console.warn(`[Bridge] BookOrbit library check ${bookStatus} for book ${matchedBookId}; failing closed without re-uploading or invalidating.`);
+        task.error = bookStatus === 'incompatible'
+          ? 'BookOrbit library book is an incompatible edition'
+          : 'BookOrbit library verification unavailable';
         this.saveState();
         return { fulfilled: false, bookId: matchedBookId, error: task.error };
       }

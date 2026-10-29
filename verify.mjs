@@ -1,5 +1,5 @@
 /**
- * BookOrbit ↔ Shelfmark acceptance and regression verification, v1.5.12.
+ * BookOrbit ↔ Shelfmark acceptance and regression verification, v1.5.13.
  *
  * EXTERNAL ORACLES — NOT AN IMPLEMENTATION-DERIVED TEST PLAN:
  *   - BookOrbit v3.5.0 API/host contracts and request behavior.
@@ -15,7 +15,7 @@
  *
  * Place at repository ROOT as verify.mjs, then run:
  *   node verify.mjs                # acceptance tests while developing
- *   node verify.mjs --release      # additionally require signed v1.5.12 release
+ *   node verify.mjs --release      # additionally require signed v1.5.13 release
  *
  * A 404 for an unknown route is intentional. NEVER add a made-up endpoint
  * to the allowlist just to make a test green. Verify an API contract first.
@@ -53,7 +53,7 @@ import {
 } from './bridge/bridge.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
-const EXPECTED_VERSION = '1.5.12';
+const EXPECTED_VERSION = '1.5.13';
 const RELEASE_MODE = process.argv.includes('--release');
 const TEST_TIMEOUT_MS = 10_000;
 const tests = [];
@@ -373,7 +373,7 @@ test('DECLARATION: BookOrbit API v1, Shelfmark indexer and ebook-only', () => {
   assert.equal(plugin.type, 'shelfmark');
   assert.deepEqual(plugin.mediaKinds, ['ebook']);
 });
-test('DECLARATION: native indexer advertises v1.5.12, never a previous version', () => {
+test('DECLARATION: native indexer advertises v1.5.13, never a previous version', () => {
   assert.equal(plugin.version, EXPECTED_VERSION);
 });
 test('DECLARATION: exposes search, test, and resolveFile entry points', () => {
@@ -399,7 +399,7 @@ test('RELEASE CONTRACT: package version, plugin version and release target agree
   assert.equal(plugin.version, EXPECTED_VERSION);
 });
 if (RELEASE_MODE) {
-  test('RELEASE: signed manifest has declared format and v1.5.12 version', () => {
+  test('RELEASE: signed manifest has declared format and v1.5.13 version', () => {
     const manifest = JSON.parse(readFileSync(join(HERE, 'updates', 'shelfmark.json'), 'utf8'));
     assert.equal(manifest.schemaVersion, 1);
     assert.equal(manifest.type, 'shelfmark');
@@ -2238,7 +2238,7 @@ test('VERIFY BOOK: renamed book is not declared deleted when exact ID still exis
   const task = createTask(bridge, { title: 'Old Title', author: 'Mary Shelley', year: 1818, format: 'epub' });
   const fake = apiScenarios({
     'bo.book': () => response({ id: 501, libraryId: 1, title: 'Renamed Title', author: 'Mary Shelley', publishedYear: 1818, format: 'epub' }),
-    'bo.libraryBooks': () => response({ items: [], total: 0 }),
+    'bo.libraryBooks': () => response({ items: [{ id: 501, title: 'Original Title', author: 'Mary Shelley', year: 1818, format: 'epub' }], total: 1 }),
   });
   const status = await bridge.verifyBookInLibrary(task, 1, 501, {}, fake.fetch);
   assert.equal(status, 'exists');
@@ -2249,7 +2249,7 @@ test('VERIFY BOOK: different edition returns incompatible rather than deleted', 
   const task = createTask(bridge, { title: 'Frankenstein', author: 'Mary Shelley', year: 1818, format: 'epub' });
   const fake = apiScenarios({
     'bo.book': () => response({ id: 502, libraryId: 1, title: 'Frankenstein', author: 'Mary Shelley', publishedYear: 2015, format: 'epub' }),
-    'bo.libraryBooks': () => response({ items: [], total: 0 }),
+    'bo.libraryBooks': () => response({ items: [{ id: 502, title: 'Frankenstein', author: 'Mary Shelley', year: 2015, format: 'epub' }], total: 1 }),
   });
   const status = await bridge.verifyBookInLibrary(task, 1, 502, {}, fake.fetch);
   assert.equal(status, 'incompatible');
@@ -2271,7 +2271,7 @@ test('VERIFY BOOK: title search missing saved ID is inconclusive, not deletion',
   const task = createTask(bridge, { title: 'Frankenstein', author: 'Mary Shelley', year: 1818, format: 'epub' });
   const fake = apiScenarios({
     'bo.book': () => failResponse(503, 'Exact route unavailable'),
-    'bo.libraryBooks': () => response({ items: [], total: 0 }),
+    'bo.libraryBooks': () => failResponse(503, 'Library unavailable'),
   });
   const status = await bridge.verifyBookInLibrary(task, 1, 504, {}, fake.fetch);
   assert.equal(status, 'unknown');
@@ -2286,6 +2286,60 @@ test('VERIFY BOOK: API or auth failure returns unknown and preserves evidence', 
   });
   const status = await bridge.verifyBookInLibrary(task, 1, 505, {}, fake.fetch);
   assert.equal(status, 'unknown');
+});
+
+
+test('VERIFY BOOK: exact-ID 404 does not by itself delete a book still listed in its library', async () => {
+  const bridge = new BridgeService(bridgeOpts());
+  const task = createTask(bridge, { title: 'Frankenstein', author: 'Mary Shelley', year: 1818, format: 'epub' });
+  const fake = apiScenarios({
+    'bo.book': () => failResponse(404, 'Book not found'),
+    'bo.libraryBooks': () => response({ items: [{ id: 506, title: 'Frankenstein', author: 'Mary Shelley', year: 1818, format: 'epub' }], total: 1 }),
+  });
+  const status = await bridge.verifyBookInLibrary(task, 1, 506, {}, fake.fetch);
+  assert.equal(status, 'exists');
+});
+
+test('VERIFY BOOK: deletion is proven by library listing, not by exact-ID 404 alone', async () => {
+  const bridge = new BridgeService(bridgeOpts());
+  const task = createTask(bridge, { title: 'Frankenstein', author: 'Mary Shelley', year: 1818, format: 'epub' });
+  const fake = apiScenarios({
+    'bo.book': () => failResponse(404, 'Book not found'),
+    'bo.libraryBooks': () => response({ items: [], total: 0 }),
+  });
+  const status = await bridge.verifyBookInLibrary(task, 1, 507, {}, fake.fetch);
+  assert.equal(status, 'deleted');
+});
+
+test('VERIFY BOOK: a book found in another library is not treated as deleted', async () => {
+  const bridge = new BridgeService(bridgeOpts());
+  const task = createTask(bridge, { title: 'Frankenstein', author: 'Mary Shelley', year: 1818, format: 'epub' });
+  const fake = apiScenarios({
+    'bo.book': () => response({ id: 508, libraryId: 2, title: 'Frankenstein', author: 'Mary Shelley', publishedYear: 1818, format: 'epub' }),
+    'bo.libraryBooks': () => response({ items: [], total: 0 }),
+  });
+  const status = await bridge.verifyBookInLibrary(task, 1, 508, {}, fake.fetch);
+  assert.equal(status, 'unknown');
+});
+
+test('FULFILL: incompatible matched book fails closed without upload, fulfillment, or ID invalidation', async () => {
+  const bridge = new BridgeService(bridgeOpts());
+  const task = createTask(bridge, {
+    title: 'Frankenstein', author: 'Mary Shelley', year: 1818, format: 'epub',
+    filePath: FILES.validEpub, matchedBookId: 509, requestIds: ['compat-req-1'],
+  });
+  const fake = apiScenarios({
+    requests: [request('compat-req-1', 'Frankenstein', 'Mary Shelley', { year: 1818 })],
+    'bo.libraryBooks': () => response({ items: [{ id: 509, title: 'Frankenstein', author: 'Mary Shelley', year: 2015, format: 'epub' }], total: 1 }),
+    'bo.book': () => response({ id: 509, libraryId: 1, title: 'Frankenstein', author: 'Mary Shelley', publishedYear: 2015, format: 'epub' }),
+    'bo.upload': () => response({ id: 9999 }),
+    'bo.fulfill': { status: 'AVAILABLE' },
+  });
+  const result = await bridge.fulfillBookOrbitRequests(task, fake.fetch);
+  assert.equal(result.fulfilled, false);
+  assert.equal(task.matchedBookId, 509);
+  assert.equal(fake.called('bo.upload').length, 0);
+  assert.equal(fake.called('bo.fulfill').length, 0);
 });
 
 // 10. Security: real local files, path containment, webhook identity and size
