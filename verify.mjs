@@ -690,6 +690,36 @@ test('SEARCH: OceanofPDF book-page URL survives the search result into serialize
   assert.ok([guid.source_url, guid.download_url, guid.info_url, guid.extra?.source_url]
     .some((value) => value === oceanPage), 'real source page URL was dropped from GUID');
 });
+
+test('SEARCH: configured release source is forwarded to /api/releases', async () => {
+  const { fake } = await searchScenario({
+    query: standardQuery(),
+    books: [metadata('Fahrenheit 451', 'Ray Bradbury')],
+    releases: [release('Fahrenheit 451', 'Ray Bradbury')],
+    settings: { releaseSource: 'libgen' },
+  });
+  const calls = fake.called('sm.releases');
+  assert.ok(calls.length > 0, 'must query releases');
+  assert.ok(calls.every((c) => c.query.get('source') === 'libgen'),
+    'configured source must be forwarded');
+});
+
+test('SEARCH: release payload carries the documented Shelfmark contract fields', async () => {
+  const { result } = await searchScenario({
+    query: standardQuery(),
+    books: [metadata('Fahrenheit 451', 'Ray Bradbury')],
+    releases: [release('Fahrenheit 451', 'Ray Bradbury')],
+  });
+  assert.ok(result.length > 0);
+  const payload = result[0].extra.releasePayload;
+  for (const field of ['source', 'source_id', 'title', 'format', 'content_type', 'protocol',
+    'indexer', 'seeders', 'size', 'size_bytes', 'author', 'year', 'language', 'isbn']) {
+    assert.ok(Object.hasOwn(payload, field), `missing payload field ${field}`);
+  }
+  assert.equal(payload.content_type, 'ebook');
+  assert.equal(payload.format, 'epub');
+  assert.equal(payload.source, 'annas');
+});
 test('SEARCH: separate source IDs with same title must remain independently identifiable', async () => {
   const { result } = await searchScenario({
     query: standardQuery('Frankenstein', 'Mary Shelley'),
@@ -2190,6 +2220,39 @@ test('HTTP: malformed authenticated webhook JSON cannot trigger an import', asyn
     assert.ok(res.status >= 400);
   } finally { await closeServer(server); bridge.stop(); }
 });
+
+test('HTTP: unknown route returns 404 JSON', async () => {
+  const bridge = new BridgeService(bridgeOpts({ secret: 'private-test-secret' }));
+  const server = bridge.createServer(0, '127.0.0.1');
+  const url = await listen(server);
+  try {
+    const res = await fetch(`${url}/no-such-route`, { signal: AbortSignal.timeout(1500) });
+    assert.equal(res.status, 404);
+    const body = await res.json();
+    assert.ok(body.error);
+  } finally { await closeServer(server); bridge.stop(); }
+});
+
+test('HTTP: multi-file webhook payload adopts the first verifiable file', async () => {
+  const bridge = new BridgeService(bridgeOpts());
+  const task = createTask(bridge, { status: 'queued', filePath: null, requestIds: ['multi-file-req'] });
+  const server = bridge.createServer(0, '127.0.0.1');
+  const url = await listen(server);
+  try {
+    const res = await fetch(`${url}/webhook/shelfmark`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Bridge-Secret': bridge.secret },
+      body: JSON.stringify({
+        task: { task_id: task.taskId, title: task.title, format: task.format },
+        paths: { target: FILES.invalidEpub, final_paths: [FILES.invalidEpub, FILES.validEpub] },
+      }),
+      signal: AbortSignal.timeout(2000),
+    });
+    assert.ok(res.status === 200 || res.status === 422);
+    const body = await res.json();
+    if (body.ok) assert.equal(body.filePath, FILES.validEpub);
+  } finally { await closeServer(server); bridge.stop(); }
+}, 5000);
 
 function executeHook(script, filename, payload, url, secret = 'hook-fixture-secret') {
   return new Promise((resolve, reject) => {
