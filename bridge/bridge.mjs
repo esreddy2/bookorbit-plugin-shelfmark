@@ -157,7 +157,14 @@ export function timingSafeCompare(a, b) {
 export function isJwt(token) {
   if (!token || typeof token !== 'string') return false;
   const parts = token.split('.');
-  return parts.length === 3;
+  if (parts.length !== 3 || parts.some((p) => !p)) return false;
+  try {
+    const header = JSON.parse(Buffer.from(parts[0], 'base64url').toString('utf8'));
+    const payload = JSON.parse(Buffer.from(parts[1], 'base64url').toString('utf8'));
+    return !!header && typeof payload === 'object' && payload !== null;
+  } catch {
+    return false;
+  }
 }
 
 /** Decodes the expiration timestamp (ms) from a JWT without external libraries. */
@@ -1276,7 +1283,7 @@ export class BridgeService {
       if (res && res.ok) {
         const data = await res.json().catch(() => ({}));
         const status = String(data.status || data.state || data.requestStatus || data.request_status || '').toLowerCase();
-        if (status === 'cancelled' || status === 'canceled') return 'cancelled';
+        if (status === 'cancelled' || status === 'canceled' || status === 'rejected' || status === 'available') return 'cancelled';
         if (!status) return 'active';
         if (['approved', 'active', 'pending', 'searching', 'queued', 'downloading', 'resolving', 'locating', 'grabbed', 'importing', 'needs_review'].includes(status)) return 'active';
         if (['completed', 'fulfilled', 'available', 'done', 'success'].includes(status)) return 'fulfilled';
@@ -1299,7 +1306,7 @@ export class BridgeService {
         const found = items.find((r) => String(r?.id ?? r?.requestId ?? r?.request_id ?? r?.taskId ?? r?.task_id) === String(reqId));
         if (found) {
           const status = String(found.status || found.state || found.requestStatus || found.request_status || '').toLowerCase();
-          if (status === 'cancelled' || status === 'canceled') return 'cancelled';
+          if (status === 'cancelled' || status === 'canceled' || status === 'rejected' || status === 'available') return 'cancelled';
           if (!status) return 'active';
           if (['approved', 'active', 'pending', 'searching', 'queued', 'downloading', 'resolving', 'locating', 'grabbed', 'importing', 'needs_review'].includes(status)) return 'active';
           if (['completed', 'fulfilled', 'available', 'done', 'success'].includes(status)) return 'fulfilled';
@@ -1761,11 +1768,36 @@ export class BridgeService {
       headers['X-Api-Key'] = smKey;
     }
 
-    const res = await fetchFn(`${smUrl}/api/releases/download`, {
-      method: 'POST',
-      headers,
-      body: JSON.stringify(downloadPayload),
-    });
+    let res;
+    try {
+      res = await fetchFn(`${smUrl}/api/releases/download`, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify(downloadPayload),
+      });
+    } catch (netErr) {
+      // Lost response / network failure after request may have been sent:
+      // treat as uncertain, never requeue blindly.
+      const now = new Date().toISOString();
+      this.state.uncertainQueues[releaseKey] = {
+        releaseKey,
+        requestId,
+        userId,
+        release: downloadPayload,
+        libraryId: libraryId ?? this.defaultLibraryId,
+        folderId: folderId ?? this.defaultFolderId,
+        queuedAt: now,
+        status: 'uncertain_queue',
+      };
+      this.state.releases[releaseKey] = 'uncertain';
+      this.state.requests[requestId] = 'uncertain';
+      this.saveState();
+      return {
+        status: 'uncertain_queue',
+        taskId: null,
+        adopted: false,
+      };
+    }
 
     let taskId = null;
     if (res.ok) {
@@ -1783,7 +1815,8 @@ export class BridgeService {
              const titleMatch = (t.title || '').trim().toLowerCase() === (downloadPayload.title || '').trim().toLowerCase();
              const formatMatch = (t.format || '').toLowerCase() === (downloadPayload.format || '').toLowerCase();
              const sourceMatch = !downloadPayload.source || !(t.source) || String(t.source).toLowerCase() === String(downloadPayload.source).toLowerCase();
-             return titleMatch && formatMatch && sourceMatch;
+             const sourceIdMatch = !downloadPayload.source_id || !(t.source_id) || String(t.source_id) === String(downloadPayload.source_id);
+             return titleMatch && formatMatch && sourceMatch && sourceIdMatch;
            });
           if (matched) {
             taskId = matched.id || matched.task_id;
@@ -1816,7 +1849,8 @@ export class BridgeService {
       }
     } else if (res.status === 500) {
       const text = await res.text().catch(() => '');
-      if (text.includes('already in the download queue') || text.includes('already exists')) {
+      const lowerText = text.toLowerCase();
+      if (lowerText.includes('already') && lowerText.includes('queue')) {
         const statusRes = await fetchFn(`${smUrl}/api/status`, { headers });
         if (statusRes.ok) {
           const statusJson = await statusRes.json().catch(() => ({}));
@@ -1826,7 +1860,8 @@ export class BridgeService {
              const titleMatch = (t.title || '').trim().toLowerCase() === (downloadPayload.title || '').trim().toLowerCase();
              const formatMatch = (t.format || '').toLowerCase() === (downloadPayload.format || '').toLowerCase();
              const sourceMatch = !downloadPayload.source || !(t.source) || String(t.source).toLowerCase() === String(downloadPayload.source).toLowerCase();
-             return titleMatch && formatMatch && sourceMatch;
+             const sourceIdMatch = !downloadPayload.source_id || !(t.source_id) || String(t.source_id) === String(downloadPayload.source_id);
+             return titleMatch && formatMatch && sourceMatch && sourceIdMatch;
            });
           if (matched) {
             taskId = matched.id || matched.task_id;
@@ -2057,70 +2092,10 @@ export class BridgeService {
    * for edition verification, handling 409 destination conflicts and uncertain upload reconciliation.
    */
   async findAuthoritativeBookOrbitBook(task, targetLibraryId, headers, fetchFn = globalThis.fetch) {
-    const boUrl = this.bookorbitUrl;
-    const attempts = [];
-    if (targetLibraryId) {
-      attempts.push({
-        url: `${boUrl}/api/v1/libraries/${targetLibraryId}/books`,
-        init: { method: 'POST', headers: { ...headers, 'Content-Type': 'application/json' }, body: JSON.stringify({ sort: [], pagination: { page: 0, size: 100 } }) },
-      });
-      attempts.push({
-        url: `${boUrl}/api/v1/books/query`,
-        init: { method: 'POST', headers: { ...headers, 'Content-Type': 'application/json' }, body: JSON.stringify({ q: task.title || '', sort: [], pagination: { page: 0, size: 100 } }) },
-      });
-    }
-    attempts.push({
-      url: `${boUrl}/api/v1/books/search?q=${encodeURIComponent(task.title || '')}&limit=100`,
-      init: { headers },
-    });
-
-    const baseFileName = task.filePath ? path.basename(task.filePath).toLowerCase() : '';
-
-    for (const attempt of attempts) {
-      try {
-        const res = await fetchFn(attempt.url, attempt.init);
-        if (!res.ok) continue;
-        const data = await res.json().catch(() => null);
-        if (!data) continue;
-        const books = Array.isArray(data) ? data : (data.items || data.books || data.results || []);
-        if (!Array.isArray(books) || books.length === 0) continue;
-
-        // 1. First priority: match by destination file path / filename if reported on book files
-        if (baseFileName) {
-          for (const book of books) {
-            const files = Array.isArray(book.files) ? book.files : (book.file ? [book.file] : []);
-            const fileMatch = files.some((f) => {
-              const fname = (f.name || f.filename || f.path || '').toLowerCase();
-              return fname.includes(baseFileName) || baseFileName.includes(fname);
-            });
-            if (fileMatch) {
-              const bId = parsePositiveInt(book.id || book.bookId);
-              if (bId) return { ...book, id: bId };
-            }
-          }
-        }
-
-        // 2. Second priority: match by verified edition compatibility
-        for (const book of books) {
-          if (areEditionsCompatible(task, book)) {
-            const bId = parsePositiveInt(book.id || book.bookId);
-            if (bId) return { ...book, id: bId };
-          }
-        }
-
-        // 3. Third priority: return candidate with matching title only if edition-compatible
-        const titleMatch = books.find((b) => {
-          if ((b.title || b.name || '').trim().toLowerCase() !== (task.title || '').trim().toLowerCase()) return false;
-          return areEditionsCompatible(task, b);
-        });
-        if (titleMatch) {
-          const bId = parsePositiveInt(titleMatch.id || titleMatch.bookId);
-          if (bId) return { ...titleMatch, id: bId };
-        }
-      } catch {}
-    }
-
+    // No BookOrbit route in the supported contract can authoritatively enumerate library
+    // books, so never fabricate an ID or call undeclared endpoints.
     return null;
+
   }
 
   /**
@@ -2158,7 +2133,7 @@ export class BridgeService {
         body: multipartBody,
       });
     } catch (err) {
-      return { error: `Network error during direct library upload: ${err.message}`, networkError: true };
+      return { error: `Network error during direct library upload: ${sanitizeLog(err.message)}`, networkError: true };
     }
 
     if (uploadRes.status === 404) {
@@ -2232,7 +2207,7 @@ export class BridgeService {
     }
 
     const errText = await uploadRes.text().catch(() => '');
-    return { error: `Direct upload failed (HTTP ${uploadRes.status}): ${errText}` };
+    return { error: `Direct upload failed (HTTP ${uploadRes.status}): ${sanitizeLog(errText)}` };
   }
 
   /**
@@ -2482,28 +2457,17 @@ export class BridgeService {
           delete task.uncertainUpload;
           task.updatedAt = new Date().toISOString();
           this.saveState();
+        } else {
+          task.status = 'uncertain_upload';
+          task.error = 'Upload outcome remains uncertain; not reuploading';
+          this.saveState();
+          return { fulfilled: false, error: task.error };
         }
       }
 
       if (!matchedBookId) {
         // If dockFileId already exists on task, continue Book Dock staging directly
-        if (task.dockFileId) {
-          const dockResult = await this.uploadViaBookDock(task, targetLibraryId, targetFolderId, headers, fetchFn);
-          if (!dockResult.success || !dockResult.bookId) {
-            if (dockResult.finalizationFailed) {
-              task.status = 'finalization_failed';
-              task.error = dockResult.error;
-              this.saveState();
-            }
-            return { fulfilled: false, error: dockResult.error };
-          }
-          matchedBookId = dockResult.bookId;
-          task.matchedBookId = matchedBookId;
-          task.uploadMethod = 'book_dock';
-          task.status = 'imported';
-          delete task.uncertainUpload;
-          task.updatedAt = new Date().toISOString();
-          this.saveState(); // PERSISTED IMMEDIATELY BEFORE FULFILLMENT!
+        if (false) {
         } else {
           // Try direct library upload first if library and folder are configured
           let directResult = { notFound: true };
@@ -2524,24 +2488,10 @@ export class BridgeService {
             this.saveState();
             return { fulfilled: false, error: task.error };
           } else if (directResult.notFound) {
-            // Direct upload endpoint returned 404 or unsupported -> fall back to Book Dock flow
-            const dockResult = await this.uploadViaBookDock(task, targetLibraryId, targetFolderId, headers, fetchFn);
-            if (!dockResult.success || !dockResult.bookId) {
-              if (dockResult.finalizationFailed) {
-                task.status = 'finalization_failed';
-                task.error = dockResult.error;
-                this.saveState();
-              }
-              return { fulfilled: false, error: dockResult.error };
-            }
-            matchedBookId = dockResult.bookId;
-            task.matchedBookId = matchedBookId;
-            task.dockFileId = dockResult.dockFileId;
-            task.uploadMethod = 'book_dock';
-            task.status = 'imported';
-            delete task.uncertainUpload;
-            task.updatedAt = new Date().toISOString();
-            this.saveState(); // PERSISTED IMMEDIATELY BEFORE FULFILLMENT!
+            task.status = 'finalization_failed';
+            task.error = directResult.error || 'Direct library upload endpoint not available';
+            this.saveState();
+            return { fulfilled: false, error: task.error };
           } else if (directResult.networkError) {
             task.status = 'uncertain_upload';
             task.uncertainUpload = {
@@ -2630,12 +2580,23 @@ export class BridgeService {
         });
 
         if (fulfillRes.ok) {
-          task.requestFulfillments[reqId] = {
-            fulfilled: true,
-            status: fulfillRes.status,
-            fulfilledAt: new Date().toISOString(),
-          };
-          fulfilledCount++;
+          const fulfillData = await fulfillRes.json().catch(() => ({}));
+          const fulfillStatus = String(fulfillData.status || fulfillData.state || fulfillData.requestStatus || fulfillData.request_status || '').toUpperCase();
+          if (fulfillStatus === 'AVAILABLE' || fulfillStatus === 'FULFILLED' || fulfillStatus === 'SUCCESS' || fulfillStatus === 'DONE') {
+            task.requestFulfillments[reqId] = {
+              fulfilled: true,
+              status: fulfillRes.status,
+              fulfilledAt: new Date().toISOString(),
+            };
+            fulfilledCount++;
+          } else {
+            task.requestFulfillments[reqId] = {
+              fulfilled: false,
+              status: fulfillRes.status,
+              errorType: 'not_available',
+              error: `Fulfillment response was not Available: ${fulfillStatus || 'unknown'}`,
+            };
+          }
         } else if (fulfillRes.status === 400) {
           const errText = await fulfillRes.text().catch(() => '');
           const sanitizedErr = sanitizeLog(errText);
@@ -2767,14 +2728,17 @@ export class BridgeService {
     if (this.state.uncertainQueues && Object.keys(this.state.uncertainQueues).length > 0) {
       const candidates = [...parsedStatus.downloading, ...parsedStatus.queued, ...parsedStatus.complete];
       for (const [rKey, unrec] of Object.entries(this.state.uncertainQueues)) {
-        const matched = candidates.find((t) => {
+        const matchedCandidates = candidates.filter((t) => {
           const titleMatch = (t.title || '').trim().toLowerCase() === (unrec.release?.title || '').trim().toLowerCase();
           const formatMatch = !(t.format || unrec.release?.format) || (t.format || '').toLowerCase() === (unrec.release?.format || '').toLowerCase();
           const authorMatch = !unrec.release?.author || !t.author || ((t.author || '').toLowerCase().includes(unrec.release.author.toLowerCase()) || unrec.release.author.toLowerCase().includes((t.author || '').toLowerCase()));
-          return titleMatch && formatMatch && authorMatch;
+          // Also require source identity when available.
+          const sourceIdMatch = !unrec.release?.source_id || !t.source_id || String(t.source_id) === String(unrec.release.source_id);
+          return titleMatch && formatMatch && authorMatch && sourceIdMatch;
         });
 
-        if (matched) {
+        if (matchedCandidates.length === 1) {
+          const matched = matchedCandidates[0];
           const realTaskId = matched.id || matched.task_id;
           const isComplete = parsedStatus.complete.some((c) => String(c.id || c.task_id) === String(realTaskId));
 
@@ -2922,7 +2886,7 @@ export class BridgeService {
             task.filePath = verify.safePath;
             task.sizeBytes = verify.sizeBytes;
             task.error = null;
-            task.errorSource = null;
+            delete task.errorSource;
             task.updatedAt = now;
             if (task.releaseKey) {
               this.state.releases[task.releaseKey] = task.taskId;

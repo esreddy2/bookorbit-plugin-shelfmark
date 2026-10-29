@@ -34,7 +34,7 @@ const KNOWN_TITLE_EQUIVALENTS = new Map([
 
 export default {
   apiVersion: 1,
-  version: '1.5.7',
+  version: '1.5.8',
   update: {
     manifestUrl: 'https://raw.githubusercontent.com/esreddy2/bookorbit-plugin-shelfmark/main/updates/shelfmark.json',
     ed25519PublicKey: '-0aHVhXqg7cGaDchc2p1Y8tDnn8A7cJ0WREKspNv5Bc',
@@ -126,6 +126,9 @@ export default {
           error: `Shelfmark answered with HTTP ${response.status}`,
         };
       }
+      try { await response.json(); } catch (_) {
+        return { success: false, error: 'Shelfmark returned invalid JSON.' };
+      }
 
       // Check if status endpoint is accessible
       const statusRes = await safeHostFetch(host, `${baseUrl}/api/status`, {
@@ -178,6 +181,7 @@ export default {
     // Support BookOrbit v3.5.0 PluginReleaseQuery contract (isbn13, isbn13s, isbn)
     const searchIsbn = extractIsbn(null, query);
     const requestedYear = toNumber(query?.year ?? query?.publicationYear ?? query?.publishYear ?? query?.publishedYear ?? query?.publish_year);
+    const requestedLanguage = query?.language ?? query?.lang ?? null;
     const metadataQuery = searchTitle || searchIsbn || searchAuthor;
 
     if (!metadataQuery) {
@@ -256,6 +260,13 @@ export default {
       payload.author = displayAuthor || null;
       payload.year = toNumber(rel.year || rel.publish_year || rel.publication_year || rel.published_year || rel.publicationYear || rel.publishedYear || rel.extra?.year || rel.extra?.publish_year || rel.extra?.publication_year || book?.publish_year || book?.publishYear || book?.year || book?.publication_year || rel?.book?.publish_year || rel?.book?.publishYear || rel?.book?.year || null);
       payload.language = rel.language || rel.extra?.language || null;
+      // Reject known language mismatches; unknown stays unknown.
+      if (requestedLanguage && payload.language) {
+        const reqCode = normalizeLanguageCode(requestedLanguage);
+        const relCode = normalizeLanguageCode(payload.language);
+        if (reqCode && relCode && reqCode !== relCode) return;
+      }
+
       payload.isbn = authenticIsbn || null;
       payload.size = sizeBytes;
 
@@ -558,7 +569,7 @@ export default {
 
             for (const rel of directReleases) {
               const relTitle = rel.title || '';
-const relAuthor = toNaturalAuthor(rel.extra?.author || rel.extra?.Author);
+const relAuthor = toNaturalAuthor(rel.author || rel.extra?.author || rel.extra?.Author);
               // Strictly validate title and author on direct releases
               if (searchTitle && !isTitleMatch(relTitle, searchTitle)) continue;
               if (searchAuthor && relAuthor && !isAuthorMatch(relAuthor, searchAuthor)) continue;
@@ -784,14 +795,10 @@ async function doResolveFile(release, payload, resolvedFormat, fileName, baseUrl
   const isFileServable = async (taskId) => {
     const checkUrl = buildLocalDownloadUrl(baseUrl, taskId, apiKey);
     try {
-      let res = await safeHostFetch(host, checkUrl, { method: 'HEAD', headers }, signal);
-      if (res.status === 405 || !res.ok) {
-        // Fallback to GET range check if HEAD is not supported by endpoint
-        res = await safeHostFetch(host, checkUrl, {
-          method: 'GET',
-          headers: { ...headers, Range: 'bytes=0-0' },
-        }, signal);
-      }
+      const res = await safeHostFetch(host, checkUrl, {
+        method: 'GET',
+        headers: { ...headers, Range: 'bytes=0-0' },
+      }, signal);
       return res.ok;
     } catch (err) {
       return false;
@@ -1293,6 +1300,26 @@ function isValidOceanofPdfPageUrl(url, source) {
   }
 }
 
+function normalizeLanguageCode(lang) {
+  if (!lang) return null;
+  const s = String(lang).trim().toLowerCase();
+  if (!s) return null;
+  const codeMap = {
+    english: 'en', en: 'en',
+    lithuanian: 'lt', lt: 'lt',
+    french: 'fr', fr: 'fr',
+    german: 'de', de: 'de',
+    spanish: 'es', es: 'es',
+    italian: 'it', it: 'it',
+    portuguese: 'pt', pt: 'pt',
+    russian: 'ru', ru: 'ru',
+    chinese: 'zh', zh: 'zh',
+    japanese: 'ja', ja: 'ja',
+    korean: 'ko', ko: 'ko',
+  };
+  if (codeMap[s]) return codeMap[s];
+  return s.slice(0, 2);
+}
 function normalizeString(str) {
   if (!str) return '';
   return String(str)
@@ -1385,6 +1412,8 @@ function isNoiseDerivative(candidateTitle, requestedTitle) {
     'adapted by',
     'retold by',
     'simplified edition',
+    'simplified retelling',
+    'retelling',
     'abridged',
     // Graded readers
     'graded reader',
@@ -1786,6 +1815,11 @@ function matchTaskByDetails(task, payload, resolvedFormat) {
   const taskSource = (task.source || '').toLowerCase();
   const payloadSource = (payload.source || '').toLowerCase();
   if (taskSource && payloadSource && taskSource !== payloadSource) return false;
+
+  // Source-identity guard: do not adopt a task for a different release/source_id.
+  const taskSourceId = String(task.source_id || task.book_id || task.id || task.task_id || '').trim();
+  const payloadSourceId = String(payload.source_id || payload.id || '').trim();
+  if (taskSourceId && payloadSourceId && taskSourceId !== payloadSourceId) return false;
 
   // Edition-aware checks: do not adopt a task for a different year/author/ISBN.
   if (task.year && payload.year && String(task.year) !== String(payload.year)) return false;
