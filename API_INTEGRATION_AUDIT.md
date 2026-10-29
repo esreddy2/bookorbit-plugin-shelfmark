@@ -15,34 +15,27 @@
 7. Partial-permission Book Dock state can strand uploads.
 
 ### Test coverage gaps (`verify.mjs`)
-1. `parseShelfmarkStatus` aliases untested.
-2. AuthManager native-login/refresh untested.
-3. `verifyFile` directory targets untested.
-4. `/api/releases` `source` forwarding untested.
-5. Book Dock `filed`/`errorMessage` paths untested.
-6. Multi-file webhook payloads untested.
+1. AuthManager native-login/refresh untested.
+2. `/api/releases` `source` forwarding untested.
+3. Book Dock `filed`/`errorMessage` paths untested.
+4. Multi-file webhook payloads untested.
 
 ### Eighth-round additional findings
 
 #### `verify.mjs` coverage gaps
-1. `extractEpubMetadata` buffer-based export untested.
-2. `parseShelfmarkStatus` alias groups untested.
-3. `verifyFile` directory targets untested.
-4. `/api/releases` `source` forwarding untested.
-5. Book Dock `filed`/`errorMessage` paths untested.
-6. Multi-file webhook payloads untested.
-7. Webhook task ID mismatch handling untested.
-8. `BookOrbitAuthManager.login()` native login untested.
-9. `BookOrbitSocketClient` auth/reconnect/event parsing untested.
-10. `findAuthoritativeBookOrbitBook` endpoint fallback untested.
-11. Search payload contract fields unasserted.
-12. Companion HTTP server invalid JSON/404 handling untested.
+1. `/api/releases` `source` forwarding untested.
+2. Book Dock `filed`/`errorMessage` paths untested.
+3. Multi-file webhook payloads untested.
+4. Webhook task ID mismatch handling untested.
+5. `BookOrbitAuthManager.login()` native login untested.
+6. `findAuthoritativeBookOrbitBook` endpoint fallback untested.
+7. Search payload contract fields unasserted.
+8. Companion HTTP server invalid JSON/404 handling untested.
 
 ### Tenth-round additional findings
 
 #### Concurrency/races (`bridge/bridge.mjs`, `index.mjs`)
-1. HTTP handlers run concurrently with no global lock; state snapshots can interleave.
-2. Module-level `inFlightResolutions` uncoordinated across processes.
+1. Module-level `inFlightResolutions` uncoordinated across processes.
 
 #### URL construction/encoding
 1. `getRequestStatus` first probes non-admin endpoint.
@@ -70,9 +63,6 @@ Remaining risks are confined to the confirmed list above. Items previously confi
 
 ### File system / path handling
 1. Hook fallback path payload missing metadata/destination.
-
-### Exports / API surface
-1. `MAGIC_BYTES`/`sanitizeLog` untested.
 
 ### String literals / URL construction
 1. Bridge status correlation relies on nonexistent `source_id` field in Shelfmark `/api/status`.
