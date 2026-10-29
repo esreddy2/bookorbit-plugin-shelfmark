@@ -1,5 +1,5 @@
 /**
- * BookOrbit ↔ Shelfmark acceptance and regression verification, v1.5.8.
+ * BookOrbit ↔ Shelfmark acceptance and regression verification, v1.5.10.
  *
  * EXTERNAL ORACLES — NOT AN IMPLEMENTATION-DERIVED TEST PLAN:
  *   - BookOrbit v3.5.0 API/host contracts and request behavior.
@@ -15,7 +15,7 @@
  *
  * Place at repository ROOT as verify.mjs, then run:
  *   node verify.mjs                # acceptance tests while developing
- *   node verify.mjs --release      # additionally require signed v1.5.8 release
+ *   node verify.mjs --release      # additionally require signed v1.5.10 release
  *
  * A 404 for an unknown route is intentional. NEVER add a made-up endpoint
  * to the allowlist just to make a test green. Verify an API contract first.
@@ -53,7 +53,7 @@ import {
 } from './bridge/bridge.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
-const EXPECTED_VERSION = '1.5.9';
+const EXPECTED_VERSION = '1.5.10';
 const RELEASE_MODE = process.argv.includes('--release');
 const TEST_TIMEOUT_MS = 10_000;
 const tests = [];
@@ -319,7 +319,7 @@ test('DECLARATION: BookOrbit API v1, Shelfmark indexer and ebook-only', () => {
   assert.equal(plugin.type, 'shelfmark');
   assert.deepEqual(plugin.mediaKinds, ['ebook']);
 });
-test('DECLARATION: native indexer advertises v1.5.9, never a previous version', () => {
+test('DECLARATION: native indexer advertises v1.5.10, never a previous version', () => {
   assert.equal(plugin.version, EXPECTED_VERSION);
 });
 test('DECLARATION: exposes search, test, and resolveFile entry points', () => {
@@ -345,7 +345,7 @@ test('RELEASE CONTRACT: package version, plugin version and release target agree
   assert.equal(plugin.version, EXPECTED_VERSION);
 });
 if (RELEASE_MODE) {
-  test('RELEASE: signed manifest has declared format and v1.5.9 version', () => {
+  test('RELEASE: signed manifest has declared format and v1.5.10 version', () => {
     const manifest = JSON.parse(readFileSync(join(HERE, 'updates', 'shelfmark.json'), 'utf8'));
     assert.equal(manifest.schemaVersion, 1);
     assert.equal(manifest.type, 'shelfmark');
@@ -772,6 +772,48 @@ test('SEARCH: release payload carries the documented Shelfmark contract fields',
   assert.equal(payload.format, 'epub');
   assert.equal(payload.source, 'annas');
 });
+
+test('SEARCH: release payload size is string or null, and size_bytes is numeric (Shelfmark parse_size_string safety)', async () => {
+  // Case A: release reporting string size (e.g. "2.4 MB")
+  const { result: resA } = await searchScenario({
+    query: standardQuery(),
+    books: [metadata('Fahrenheit 451', 'Ray Bradbury')],
+    releases: [release('Fahrenheit 451', 'Ray Bradbury', { size: '2.4 MB', size_bytes: 2400000 })],
+  });
+  assert.ok(resA.length > 0);
+  const payloadA = resA[0].extra.releasePayload;
+  assert.equal(typeof payloadA.size, 'string', 'size must be a string');
+  assert.equal(payloadA.size, '2.4 MB');
+  assert.equal(typeof payloadA.size_bytes, 'number', 'size_bytes must be numeric');
+  assert.equal(payloadA.size_bytes, 2400000);
+  // Verify Shelfmark Python download/http.py::parse_size_string() .strip() safety
+  assert.doesNotThrow(() => payloadA.size.trim());
+
+  // Case B: release reporting numeric size (must normalize to string, never overwrite with number)
+  const { result: resB } = await searchScenario({
+    query: standardQuery(),
+    books: [metadata('Fahrenheit 451', 'Ray Bradbury')],
+    releases: [release('Fahrenheit 451', 'Ray Bradbury', { size: 550000 })],
+  });
+  assert.ok(resB.length > 0);
+  const payloadB = resB[0].extra.releasePayload;
+  assert.equal(typeof payloadB.size, 'string', 'numeric release.size must normalize to string');
+  assert.equal(payloadB.size, '550000');
+  assert.equal(typeof payloadB.size_bytes, 'number', 'size_bytes must be numeric');
+  assert.equal(payloadB.size_bytes, 550000);
+
+  // Case C: release with null/unreported size (must remain null, not overwritten with number)
+  const { result: resC } = await searchScenario({
+    query: standardQuery(),
+    books: [metadata('Fahrenheit 451', 'Ray Bradbury')],
+    releases: [release('Fahrenheit 451', 'Ray Bradbury', { size: null, size_bytes: 550000 })],
+  });
+  assert.ok(resC.length > 0);
+  const payloadC = resC[0].extra.releasePayload;
+  assert.equal(payloadC.size, null, 'unreported size must remain null');
+  assert.equal(typeof payloadC.size_bytes, 'number');
+  assert.equal(payloadC.size_bytes, 550000);
+});
 test('SEARCH: separate source IDs with same title must remain independently identifiable', async () => {
   const { result } = await searchScenario({
     query: standardQuery('Frankenstein', 'Mary Shelley'),
@@ -905,6 +947,28 @@ test('NATIVE: a successful queue POST carries the exact selected source identity
   assert.equal(payload.source_id, sourceId);
   assert.equal(payload.format, 'epub');
   tracked.assertKnownRoutes();
+});
+test('NATIVE: queue POST normalizes older payload with numeric size to string and keeps size_bytes numeric', async () => {
+  const sourceId = unique('num-size-src');
+  const taskId = unique('num-size-task');
+  const releaseWithOldNumericSize = nativeRelease(sourceId, 'Fahrenheit 451', {
+    size: 654321, // numeric size in guid/payload from older bug!
+    size_bytes: 654321,
+  });
+  let statusCalls = 0;
+  const { outcome, fake } = await nativeResolve(releaseWithOldNumericSize, {
+    'sm.status': () => response(++statusCalls < 2 ? nativeStatus() :
+      nativeStatus({ [taskId]: queued(taskId, sourceId, 'Fahrenheit 451', { status: 'completed' }) })),
+    'sm.download': { task_id: taskId },
+  });
+  assert.ok(outcome.url.includes(`id=${taskId}`));
+  const downloadCalls = fake.called('sm.download');
+  assert.equal(downloadCalls.length, 1);
+  const sentPayload = expectedJson(downloadCalls[0].options);
+  assert.equal(typeof sentPayload.size, 'string', 'Shelfmark download payload size must be string');
+  assert.equal(sentPayload.size, '654321');
+  assert.equal(typeof sentPayload.size_bytes, 'number', 'size_bytes must remain numeric');
+  assert.equal(sentPayload.size_bytes, 654321);
 });
 test('NATIVE: OceanofPDF queue POST contains the real source page URL', async () => {
   let statusCount = 0;
@@ -1249,6 +1313,41 @@ test('QUEUE: no fabricated task IDs after Shelfmark returns a real namespaced ta
   const result = await queueFixture(fake, bridge, sampleQueueRelease());
   assert.equal(result.taskId, realId);
   assert.ok(bridge.state.tasks[realId]);
+});
+test('QUEUE: bridge normalizes older release candidate with numeric size to string before POSTing to Shelfmark', async () => {
+  const bridge = new BridgeService(bridgeOpts());
+  const taskId = unique('task-numeric-size');
+  const fake = apiScenarios({ taskId });
+  const olderRelease = {
+    source: 'annas',
+    sourceId: unique('annas-old-size'),
+    title: '1984',
+    format: 'epub',
+    author: 'George Orwell',
+    size: 789123,
+    sizeBytes: 789123,
+    guid: JSON.stringify({
+      source: 'annas',
+      source_id: unique('annas-old-size-guid'),
+      title: '1984',
+      format: 'epub',
+      size: 789123,
+    }),
+  };
+  const res = await queueFixture(fake, bridge, olderRelease, 'req-size-test');
+  assert.equal(res.taskId, taskId);
+  const calls = fake.called('sm.download');
+  assert.equal(calls.length, 1, 'POST /api/releases/download must be called');
+  const downloadPayload = expectedJson(calls[0].options);
+  assert.equal(typeof downloadPayload.size, 'string', 'Shelfmark payload size must be string to prevent .strip() crash');
+  assert.equal(downloadPayload.size, '789123');
+  assert.equal(typeof downloadPayload.size_bytes, 'number', 'Shelfmark payload size_bytes must be numeric');
+  assert.equal(downloadPayload.size_bytes, 789123);
+  assert.doesNotThrow(() => {
+    if (downloadPayload.size) downloadPayload.size.trim();
+  });
+  assert.ok(bridge.state.tasks[taskId]);
+  assert.equal(bridge.state.requests['req-size-test'], taskId);
 });
 
 // ─────────────────────────────────────────────────────────────────────────────

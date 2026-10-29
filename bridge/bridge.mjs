@@ -1735,6 +1735,28 @@ export class BridgeService {
       downloadPayload.author = release.author;
     }
 
+    // Normalize numeric size to string (or null) to prevent Shelfmark parse_size_string() .strip() crash on numbers.
+    // Preserve size_bytes as numeric.
+    if (typeof downloadPayload.size === 'number') {
+      if (downloadPayload.size_bytes === undefined || downloadPayload.size_bytes === null) {
+        downloadPayload.size_bytes = downloadPayload.size;
+      }
+      downloadPayload.size = String(downloadPayload.size);
+    } else if (downloadPayload.size != null && typeof downloadPayload.size !== 'string') {
+      downloadPayload.size = String(downloadPayload.size);
+    }
+    if (downloadPayload.size === undefined && release.size !== undefined) {
+      downloadPayload.size = release.size != null ? String(release.size) : null;
+    }
+    if (downloadPayload.size_bytes === undefined && release.sizeBytes !== undefined) {
+      downloadPayload.size_bytes = typeof release.sizeBytes === 'number' ? release.sizeBytes : Number(release.sizeBytes) || null;
+    } else if (downloadPayload.size_bytes !== undefined && downloadPayload.size_bytes !== null && typeof downloadPayload.size_bytes !== 'number') {
+      const parsedBytes = Number(downloadPayload.size_bytes);
+      if (Number.isFinite(parsedBytes)) {
+        downloadPayload.size_bytes = parsedBytes;
+      }
+    }
+
     // Preserve/forward the verified source-page URL using Shelfmark's accepted field names.
     const releasePageUrl =
       release.infoUrl || release.info_url ||

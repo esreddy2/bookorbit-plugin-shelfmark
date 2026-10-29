@@ -34,7 +34,7 @@ const KNOWN_TITLE_EQUIVALENTS = new Map([
 
 export default {
   apiVersion: 1,
-  version: '1.5.9',
+  version: '1.5.10',
   update: {
     manifestUrl: 'https://raw.githubusercontent.com/esreddy2/bookorbit-plugin-shelfmark/main/updates/shelfmark.json',
     ed25519PublicKey: '-0aHVhXqg7cGaDchc2p1Y8tDnn8A7cJ0WREKspNv5Bc',
@@ -268,7 +268,12 @@ export default {
       }
 
       payload.isbn = authenticIsbn || null;
-      payload.size = sizeBytes;
+      payload.size_bytes = sizeBytes;
+      if (payload.size != null) {
+        payload.size = String(payload.size);
+      } else {
+        payload.size = null;
+      }
 
       // Authentic book title:
       // Preserves authentic metadata book title or cleaned core release title.
@@ -644,6 +649,25 @@ const relAuthor = toNaturalAuthor(rel.author || rel.extra?.author || rel.extra?.
         payload = JSON.parse(release.guid);
       } catch (_) {
         // Guid was not JSON
+      }
+    }
+
+    // Normalize numeric size to string (or null) to prevent Shelfmark parse_size_string() .strip() crash on numbers.
+    // Preserve size_bytes as numeric.
+    if (payload) {
+      if (typeof payload.size === 'number') {
+        if (payload.size_bytes === undefined || payload.size_bytes === null) {
+          payload.size_bytes = payload.size;
+        }
+        payload.size = String(payload.size);
+      } else if (payload.size != null && typeof payload.size !== 'string') {
+        payload.size = String(payload.size);
+      }
+      if (payload.size_bytes !== undefined && payload.size_bytes !== null && typeof payload.size_bytes !== 'number') {
+        const parsedBytes = Number(payload.size_bytes);
+        if (Number.isFinite(parsedBytes)) {
+          payload.size_bytes = parsedBytes;
+        }
       }
     }
 
