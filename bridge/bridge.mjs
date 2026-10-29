@@ -1936,6 +1936,16 @@ export class BridgeService {
       if (!areEditionsCompatible(existing, release)) {
         throw new Error(`Incompatible edition for existing task ${taskId}: requested "${release.title}" (${release.year || 'unknown year'}) vs task "${existing.title}" (${existing.year || 'unknown year'})`);
       }
+      const existingTaskIsbn = String(existing.requestIsbn || (existing.requestIsbns ? Object.values(existing.requestIsbns)[0] : '') || '').replace(/[^0-9X]/gi, '');
+      const incomingTaskIsbn = String(requestIsbn || '').replace(/[^0-9X]/gi, '');
+      if (existingTaskIsbn && incomingTaskIsbn && existingTaskIsbn !== incomingTaskIsbn) {
+        throw new Error(`Incompatible ISBN for existing task ${taskId}: requested ${incomingTaskIsbn} vs task ${existingTaskIsbn}`);
+      }
+      if (requestIsbn && !existing.requestIsbn) existing.requestIsbn = requestIsbn;
+      if (requestIsbn) {
+        existing.requestIsbns = existing.requestIsbns || {};
+        if (!existing.requestIsbns[requestId]) existing.requestIsbns[requestId] = requestIsbn;
+      }
 
       this.state.requests[requestId] = taskId;
       if (!existing.requestIds.includes(requestId)) {
@@ -2978,7 +2988,7 @@ export class BridgeService {
         }
       }
 
-      const reqIsbn = String((task.requestIsbns && task.requestIsbns[reqId]) || task.requestIsbn || '').replace(/[^0-9X]/gi, '');
+      const reqIsbn = String((task.requestIsbns && task.requestIsbns[reqId]) || '').replace(/[^0-9X]/gi, '');
       if (reqIsbn) {
         const opf = String(task?.filePath || '').toLowerCase().endsWith('.epub')
           ? extractEpubMetadataFromFile(task.filePath) : null;
