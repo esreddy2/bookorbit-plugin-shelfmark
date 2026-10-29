@@ -405,10 +405,8 @@ function getEditionIncompatibilityReason(req, rel) {
 
   const isbnReq = String(req.requestIsbn || req.isbn13 || req.isbn || req.extra?.isbn || '').replace(/[^0-9X]/gi, '');
   const isbnRel = String(rel.isbn13 || rel.isbn || rel.extra?.isbn || '').replace(/[^0-9X]/gi, '');
-  if (isbnReq && !isbnRel) {
-    // A requested ISBN with no authentic release ISBN cannot be verified.
-    return 'missing_release_isbn';
-  }
+  // Unknown release ISBNs are allowed into staging for later OPF verification;
+  // only known ISBN conflicts are rejected before download.
   if (isbnReq && isbnRel && isbnReq !== isbnRel) {
     return 'conflicting_isbn';
   }
@@ -2782,6 +2780,20 @@ export class BridgeService {
           : 'BookOrbit library verification unavailable';
         this.saveState();
         return { fulfilled: false, bookId: matchedBookId, error: task.error };
+      }
+    }
+
+    const requestIsbn = String(task?.requestIsbn || '').replace(/[^0-9X]/gi, '');
+    if (requestIsbn) {
+      const opf = String(task?.filePath || '').toLowerCase().endsWith('.epub')
+        ? extractEpubMetadataFromFile(task.filePath) : null;
+      const fileIsbn = String(opf?.isbn || '').replace(/[^0-9X]/gi, '');
+      if (!fileIsbn || fileIsbn !== requestIsbn) {
+        task.error = !fileIsbn
+          ? 'Release ISBN could not be verified in downloaded file'
+          : `Release ISBN ${fileIsbn} does not match requested ISBN ${requestIsbn}`;
+        this.saveState();
+        return { fulfilled: false, error: task.error };
       }
     }
 
