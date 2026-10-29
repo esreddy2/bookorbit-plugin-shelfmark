@@ -1686,6 +1686,11 @@ export class BridgeService {
       if (!areEditionsCompatible(existing, release)) {
         throw new Error(`Incompatible edition for existing task ${existingTaskId}: requested "${release.title}" (${release.year || 'unknown year'}) vs task "${existing.title}" (${existing.year || 'unknown year'})`);
       }
+      const existingTaskIsbn = String(existing.requestIsbn || (existing.requestIsbns ? Object.values(existing.requestIsbns)[0] : '') || '').replace(/[^0-9X]/gi, '');
+      const incomingTaskIsbn = String(requestIsbn || '').replace(/[^0-9X]/gi, '');
+      if (existingTaskIsbn && incomingTaskIsbn && existingTaskIsbn !== incomingTaskIsbn) {
+        throw new Error(`Incompatible ISBN for existing task ${existingTaskId}: requested ${incomingTaskIsbn} vs task ${existingTaskIsbn}`);
+      }
 
       this.state.requests[requestId] = existingTaskId;
       if (!existing.requestIds.includes(requestId)) {
@@ -1696,6 +1701,10 @@ export class BridgeService {
       }
       existing.updatedAt = new Date().toISOString();
       if (requestIsbn && !existing.requestIsbn) existing.requestIsbn = requestIsbn;
+      if (requestIsbn) {
+        existing.requestIsbns = existing.requestIsbns || {};
+        if (!existing.requestIsbns[requestId]) existing.requestIsbns[requestId] = requestIsbn;
+      }
       this.saveState();
 
       if ((existing.status === 'completed' || existing.status === 'fulfilled') && existing.filePath) {
@@ -1985,6 +1994,7 @@ export class BridgeService {
       year: parsePositiveInt(release.year || release.publicationYear || downloadPayload.year) || null,
       isbn: release.isbn13 || release.isbn || downloadPayload.isbn || null,
       requestIsbn: requestIsbn || null,
+      requestIsbns: requestIsbn ? { [requestId]: requestIsbn } : {},
       language: release.language || downloadPayload.language || null,
       format: (downloadPayload.format || release.format || 'epub').toLowerCase(),
       source: downloadPayload.source,
@@ -2963,6 +2973,26 @@ export class BridgeService {
             updatedAt: new Date().toISOString(),
           };
           this.setRequestProgress(reqId, 'review_required', { reason: 'conflicting_isbn' });
+          this.saveState();
+          continue;
+        }
+      }
+
+      const reqIsbn = String((task.requestIsbns && task.requestIsbns[reqId]) || task.requestIsbn || '').replace(/[^0-9X]/gi, '');
+      if (reqIsbn) {
+        const opf = String(task?.filePath || '').toLowerCase().endsWith('.epub')
+          ? extractEpubMetadataFromFile(task.filePath) : null;
+        const fileIsbn = String(opf?.isbn || '').replace(/[^0-9X]/gi, '');
+        if (!fileIsbn || fileIsbn !== reqIsbn) {
+          task.requestFulfillments[reqId] = {
+            fulfilled: false,
+            errorType: !fileIsbn ? 'unverified_isbn' : 'conflicting_isbn',
+            error: !fileIsbn
+              ? 'Release ISBN could not be verified in downloaded file'
+              : `Release ISBN ${fileIsbn} does not match requested ISBN ${reqIsbn}`,
+            updatedAt: new Date().toISOString(),
+          };
+          this.setRequestProgress(reqId, 'review_required', { reason: !fileIsbn ? 'unverified_isbn' : 'conflicting_isbn' });
           this.saveState();
           continue;
         }
