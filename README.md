@@ -242,19 +242,6 @@ npm run release [optional-new-version]
 
 ---
 
-## Environment Variables (Companion Bridge)
-
-The companion bridge (`bridge/bridge.mjs`) reads configuration from these environment variables (options take precedence):
-
-- `BOOKORBIT_URL` — BookOrbit base URL.
-- `BOOKORBIT_USERNAME`, `BOOKORBIT_PASSWORD` — native login credentials.
-- `BOOKORBIT_TOKEN`, `BOOKORBIT_REFRESH_TOKEN`, `BOOKORBIT_API_KEY` — alternative auth.
-- `SHELFMARK_URL`, `SHELFMARK_API_KEY` — Shelfmark connection.
-- `BRIDGE_HOST`, `BRIDGE_PORT`, `BRIDGE_SECRET`, `BRIDGE_WEBHOOK_URL` — bridge listener and hook delivery.
-- `BOOKORBIT_DEFAULT_LIBRARY_ID`, `BOOKORBIT_DEFAULT_FOLDER_ID` — default upload destination.
-- `SHELFMARK_PATH_PREFIX`, `LOCAL_PATH_PREFIX` — path rewriting.
-- `PREFER_FORMAT`, `RELEASE_SOURCE` — search defaults.
-
 ## Production One-Paste Deployment
 
 For containerized environments hosting BookOrbit v3.5.0 (`/opt/bookorbit/data/app`) and Shelfmark v1.5.1 (port 8084), run this single block inside the staged repository directory:
