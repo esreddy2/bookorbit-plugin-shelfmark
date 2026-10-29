@@ -403,8 +403,12 @@ function getEditionIncompatibilityReason(req, rel) {
     return 'language_mismatch';
   }
 
-  const isbnReq = String(req.isbn13 || req.isbn || req.extra?.isbn || '').replace(/[^0-9X]/gi, '');
+  const isbnReq = String(req.requestIsbn || req.isbn13 || req.isbn || req.extra?.isbn || '').replace(/[^0-9X]/gi, '');
   const isbnRel = String(rel.isbn13 || rel.isbn || rel.extra?.isbn || '').replace(/[^0-9X]/gi, '');
+  if (isbnReq && !isbnRel) {
+    // A requested ISBN with no authentic release ISBN cannot be verified.
+    return 'missing_release_isbn';
+  }
   if (isbnReq && isbnRel && isbnReq !== isbnRel) {
     return 'conflicting_isbn';
   }
@@ -1584,6 +1588,7 @@ export class BridgeService {
                 release: candidateRelease,
                 libraryId: req.targetLibraryId || this.defaultLibraryId,
                 folderId: req.targetFolderId || this.defaultFolderId,
+                requestIsbn: req.isbn13 || req.isbn || (Array.isArray(req.isbn13s) ? req.isbn13s[0] : undefined),
                 fetchFn,
               });
               if (queueRes.adopted || queueRes.reused) {
@@ -1654,7 +1659,7 @@ export class BridgeService {
    * Queues a release exactly once. If already queued or completed, adopts existing task.
    * If Shelfmark returns an uncertain response without a task ID, tracks in uncertain_queue state.
    */
-  async queueRelease({ requestId, userId, release, libraryId, folderId, shelfmarkUrl, apiKey, fetchFn = globalThis.fetch }) {
+  async queueRelease({ requestId, userId, release, libraryId, folderId, shelfmarkUrl, apiKey, requestIsbn, fetchFn = globalThis.fetch }) {
     if (this.isQueueingRelease) throw new Error('Queue operation already in progress');
     this.isQueueingRelease = true;
     try {
@@ -1692,6 +1697,7 @@ export class BridgeService {
         existing.userIds.push(userId);
       }
       existing.updatedAt = new Date().toISOString();
+      if (requestIsbn && !existing.requestIsbn) existing.requestIsbn = requestIsbn;
       this.saveState();
 
       if ((existing.status === 'completed' || existing.status === 'fulfilled') && existing.filePath) {
@@ -1980,6 +1986,7 @@ export class BridgeService {
       author: downloadPayload.author || release.author,
       year: parsePositiveInt(release.year || release.publicationYear || downloadPayload.year) || null,
       isbn: release.isbn13 || release.isbn || downloadPayload.isbn || null,
+      requestIsbn: requestIsbn || null,
       language: release.language || downloadPayload.language || null,
       format: (downloadPayload.format || release.format || 'epub').toLowerCase(),
       source: downloadPayload.source,
@@ -2920,6 +2927,35 @@ export class BridgeService {
         this.saveState();
         continue;
       }
+      const requestIsbn = String(task?.requestIsbn || '').replace(/[^0-9X]/gi, '');
+      if (requestIsbn) {
+        const opf = String(task?.filePath || '').toLowerCase().endsWith('.epub')
+          ? extractEpubMetadataFromFile(task.filePath) : null;
+        const fileIsbn = String(opf?.isbn || '').replace(/[^0-9X]/gi, '');
+        if (!fileIsbn) {
+          task.requestFulfillments[reqId] = {
+            fulfilled: false,
+            errorType: 'unverified_isbn',
+            error: 'Release ISBN could not be verified in downloaded file',
+            updatedAt: new Date().toISOString(),
+          };
+          this.setRequestProgress(reqId, 'review_required', { reason: 'unverified_isbn' });
+          this.saveState();
+          continue;
+        }
+        if (fileIsbn !== requestIsbn) {
+          task.requestFulfillments[reqId] = {
+            fulfilled: false,
+            errorType: 'conflicting_isbn',
+            error: `Release ISBN ${fileIsbn} does not match requested ISBN ${requestIsbn}`,
+            updatedAt: new Date().toISOString(),
+          };
+          this.setRequestProgress(reqId, 'review_required', { reason: 'conflicting_isbn' });
+          this.saveState();
+          continue;
+        }
+      }
+
       try {
         const fulfillDto = {
           matchedBookId,
