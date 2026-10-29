@@ -84,45 +84,54 @@ if command -v curl >/dev/null 2>&1; then
     HTTP_BODY="$RESPONSE"
   fi
 else
-  # Node.js fallback
+  # Node.js fallback (used when curl is unavailable). Configuration and the
+  # exact stdin payload are passed through the environment and stdin; nothing
+  # is interpolated into JavaScript source.
   set +e
-  NODE_OUT=$(node -e "
-    const http = require('http');
-    const url = new URL('$BRIDGE_URL');
-    const req = http.request({
-      hostname: url.hostname,
-      port: url.port,
-      path: url.pathname,
-      method: 'POST',
-      timeout: 15000,
-      headers: {
-        'Content-Type': 'application/json',
-        'X-Bridge-Secret': '$BRIDGE_SECRET',
-        'Content-Length': Buffer.byteLength(process.env.PAYLOAD)
-      }
-    }, (res) => {
-      let data = '';
-      res.on('data', chunk => data += chunk);
-      res.on('end', () => {
-        if (res.statusCode >= 200 && res.statusCode < 300) {
-          process.exit(0);
-        } else {
-          console.error('HTTP ' + res.statusCode + ': ' + data);
-          process.exit(2);
+  NODE_OUT=$(printf '%s' "$PAYLOAD" | BRIDGE_URL="$BRIDGE_URL" BRIDGE_SECRET="$BRIDGE_SECRET" node -e '
+    const http = require("http");
+    const url = new URL(process.env.BRIDGE_URL);
+    const secret = process.env.BRIDGE_SECRET || "";
+    const chunks = [];
+    process.stdin.setEncoding("utf8");
+    process.stdin.on("data", (chunk) => chunks.push(chunk));
+    process.stdin.on("end", () => {
+      const payload = chunks.join("");
+      const req = http.request({
+        hostname: url.hostname,
+        port: url.port || (url.protocol === "https:" ? 443 : 80),
+        path: url.pathname + url.search,
+        method: "POST",
+        timeout: 15000,
+        headers: {
+          "Content-Type": "application/json",
+          "X-Bridge-Secret": secret,
+          "Content-Length": Buffer.byteLength(payload)
         }
+      }, (res) => {
+        let data = "";
+        res.on("data", (chunk) => data += chunk);
+        res.on("end", () => {
+          if (res.statusCode >= 200 && res.statusCode < 300) {
+            process.exit(0);
+          } else {
+            console.error("HTTP " + res.statusCode + ": " + data);
+            process.exit(2);
+          }
+        });
       });
+      req.on("error", (e) => {
+        console.error(e.message);
+        process.exit(3);
+      });
+      req.on("timeout", () => {
+        req.destroy();
+        process.exit(4);
+      });
+      req.write(payload);
+      req.end();
     });
-    req.on('error', (e) => {
-      console.error(e.message);
-      process.exit(3);
-    });
-    req.on('timeout', () => {
-      req.destroy();
-      process.exit(4);
-    });
-    req.write(process.env.PAYLOAD);
-    req.end();
-  " 2>&1)
+  ' 2>&1)
   NODE_EXIT=$?
   set -e
 

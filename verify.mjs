@@ -1,5 +1,5 @@
 /**
- * BookOrbit ↔ Shelfmark acceptance and regression verification, v1.5.19.
+ * BookOrbit ↔ Shelfmark acceptance and regression verification, v1.5.20.
  *
  * EXTERNAL ORACLES — NOT AN IMPLEMENTATION-DERIVED TEST PLAN:
  *   - BookOrbit v3.5.0 API/host contracts and request behavior.
@@ -15,7 +15,7 @@
  *
  * Place at repository ROOT as verify.mjs, then run:
  *   node verify.mjs                # acceptance tests while developing
- *   node verify.mjs --release      # additionally require signed v1.5.19 release
+ *   node verify.mjs --release      # additionally require signed v1.5.20 release
  *
  * A 404 for an unknown route is intentional. NEVER add a made-up endpoint
  * to the allowlist just to make a test green. Verify an API contract first.
@@ -53,7 +53,7 @@ import {
 } from './bridge/bridge.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
-const EXPECTED_VERSION = '1.5.19';
+const EXPECTED_VERSION = '1.5.20';
 const RELEASE_MODE = process.argv.includes('--release');
 const TEST_TIMEOUT_MS = 10_000;
 const tests = [];
@@ -373,7 +373,7 @@ test('DECLARATION: BookOrbit API v1, Shelfmark indexer and ebook-only', () => {
   assert.equal(plugin.type, 'shelfmark');
   assert.deepEqual(plugin.mediaKinds, ['ebook']);
 });
-test('DECLARATION: native indexer advertises v1.5.19, never a previous version', () => {
+test('DECLARATION: native indexer advertises v1.5.20, never a previous version', () => {
   assert.equal(plugin.version, EXPECTED_VERSION);
 });
 test('DECLARATION: exposes search, test, and resolveFile entry points', () => {
@@ -399,7 +399,7 @@ test('RELEASE CONTRACT: package version, plugin version and release target agree
   assert.equal(plugin.version, EXPECTED_VERSION);
 });
 if (RELEASE_MODE) {
-  test('RELEASE: signed manifest has declared format and v1.5.19 version', () => {
+  test('RELEASE: signed manifest has declared format and v1.5.20 version', () => {
     const manifest = JSON.parse(readFileSync(join(HERE, 'updates', 'shelfmark.json'), 'utf8'));
     assert.equal(manifest.schemaVersion, 1);
     assert.equal(manifest.type, 'shelfmark');
@@ -2879,6 +2879,55 @@ test('HOOK: Shelfmark gives executable $1 plus nested JSON stdin and bridge secr
     assert.equal(deliveries[0].body.paths.target, FILES.validEpub);
   } finally { await closeServer(server); }
 }, 8000);
+
+test('HOOK: Node fallback delivers when curl is unavailable', async () => {
+  const script = join(HERE, 'scripts', 'shelfmark-hook.sh');
+  assert.ok(existsSync(script), 'post-download hook script missing');
+  const noCurlDir = mkdtempSync(join(tmpdir(), 'nocurl-'));
+  for (const bin of ['bash', 'node', 'cat', 'basename', 'sed', 'tail']) {
+    const src = ['/bin/' + bin, '/usr/bin/' + bin].find(existsSync);
+    if (src) symlinkSync(src, join(noCurlDir, bin));
+  }
+  const deliveries = [];
+  const server = http.createServer((req, res) => {
+    const chunks = [];
+    req.on('data', (c) => chunks.push(c));
+    req.on('end', () => {
+      deliveries.push({ url: req.url, method: req.method,
+        secret: req.headers['x-bridge-secret'],
+        body: JSON.parse(Buffer.concat(chunks).toString('utf8')) });
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: true }));
+    });
+  });
+  const url = await listen(server);
+  try {
+    const nested = { version: 1, phase: 'post_transfer',
+      task: { task_id: 'hook-real-id', source: 'annas', title: '1984', format: 'epub' },
+      paths: { destination: root, target: FILES.validEpub, final_paths: [FILES.validEpub] },
+      output: { mode: 'folder' },
+    };
+    const result = await new Promise((resolve, reject) => {
+      const child = execFile('bash', [script, FILES.validEpub], { cwd: HERE, timeout: 4_500,
+        maxBuffer: 1024 * 1024,
+        env: { ...process.env, PATH: noCurlDir, BRIDGE_WEBHOOK_URL: `${url}/webhook/shelfmark`, BRIDGE_SECRET: 'hook-fixture-secret' },
+      }, (error, stdout, stderr) => resolve({ error, stdout, stderr, code: error?.code ?? 0 }));
+      child.once('error', reject);
+      child.stdin.end(JSON.stringify(nested));
+    });
+    assert.equal(result.code, 0, result.stderr);
+    assert.equal(deliveries.length, 1);
+    assert.equal(deliveries[0].url, '/webhook/shelfmark');
+    assert.equal(deliveries[0].method, 'POST');
+    assert.equal(deliveries[0].secret, 'hook-fixture-secret');
+    assert.equal(deliveries[0].body.task.task_id, 'hook-real-id');
+    assert.equal(deliveries[0].body.paths.target, FILES.validEpub);
+  } finally {
+    await closeServer(server);
+    rmSync(noCurlDir, { recursive: true, force: true });
+  }
+}, 8000);
+
 test('HOOK: unavailable companion webhook must not mark Shelfmark download failed', async () => {
   const script = join(HERE, 'scripts', 'shelfmark-hook.sh');
   assert.ok(existsSync(script));
