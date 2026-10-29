@@ -1779,15 +1779,12 @@ export class BridgeService {
           const statusJson = await statusRes.json().catch(() => ({}));
           const parsed = parseShelfmarkStatus(statusJson);
           const candidates = [...parsed.downloading, ...parsed.queued, ...parsed.complete];
-          const matched = candidates.find((t) => {
-            const sid = t.source_id || t.release?.source_id;
-            const tid = String(t.id || t.task_id || '');
-            return (sid && sid === downloadPayload.source_id) || (tid && tid === String(downloadPayload.source_id));
-          }) || candidates.find((t) => {
-            const titleMatch = (t.title || '').trim().toLowerCase() === (downloadPayload.title || '').trim().toLowerCase();
-            const formatMatch = (t.format || '').toLowerCase() === (downloadPayload.format || '').toLowerCase();
-            return titleMatch && formatMatch;
-          });
+           const matched = candidates.find((t) => {
+             const titleMatch = (t.title || '').trim().toLowerCase() === (downloadPayload.title || '').trim().toLowerCase();
+             const formatMatch = (t.format || '').toLowerCase() === (downloadPayload.format || '').toLowerCase();
+             const sourceMatch = !downloadPayload.source || !(t.source) || String(t.source).toLowerCase() === String(downloadPayload.source).toLowerCase();
+             return titleMatch && formatMatch && sourceMatch;
+           });
           if (matched) {
             taskId = matched.id || matched.task_id;
           }
@@ -1825,15 +1822,12 @@ export class BridgeService {
           const statusJson = await statusRes.json().catch(() => ({}));
           const parsed = parseShelfmarkStatus(statusJson);
           const candidates = [...parsed.downloading, ...parsed.queued, ...parsed.complete];
-          const matched = candidates.find((t) => {
-            const sid = t.source_id || t.release?.source_id;
-            const tid = String(t.id || t.task_id || '');
-            return (sid && sid === downloadPayload.source_id) || (tid && tid === String(downloadPayload.source_id));
-          }) || candidates.find((t) => {
-            const titleMatch = (t.title || '').trim().toLowerCase() === (downloadPayload.title || '').trim().toLowerCase();
-            const formatMatch = (t.format || '').toLowerCase() === (downloadPayload.format || '').toLowerCase();
-            return titleMatch && formatMatch;
-          });
+           const matched = candidates.find((t) => {
+             const titleMatch = (t.title || '').trim().toLowerCase() === (downloadPayload.title || '').trim().toLowerCase();
+             const formatMatch = (t.format || '').toLowerCase() === (downloadPayload.format || '').toLowerCase();
+             const sourceMatch = !downloadPayload.source || !(t.source) || String(t.source).toLowerCase() === String(downloadPayload.source).toLowerCase();
+             return titleMatch && formatMatch && sourceMatch;
+           });
           if (matched) {
             taskId = matched.id || matched.task_id;
           }
@@ -2114,8 +2108,11 @@ export class BridgeService {
           }
         }
 
-        // 3. Third priority: return candidate with matching title for authoritative inspection
-        const titleMatch = books.find((b) => (b.title || b.name || '').trim().toLowerCase() === (task.title || '').trim().toLowerCase());
+        // 3. Third priority: return candidate with matching title only if edition-compatible
+        const titleMatch = books.find((b) => {
+          if ((b.title || b.name || '').trim().toLowerCase() !== (task.title || '').trim().toLowerCase()) return false;
+          return areEditionsCompatible(task, b);
+        });
         if (titleMatch) {
           const bId = parsePositiveInt(titleMatch.id || titleMatch.bookId);
           if (bId) return { ...titleMatch, id: bId };
