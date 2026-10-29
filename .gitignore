@@ -7,3 +7,4 @@ node_modules/
 *.key
 .kilo/
 fixtures/bridge_test_*
+API_INTEGRATION_AUDIT.md

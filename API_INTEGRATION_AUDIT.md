@@ -2,9 +2,6 @@
 
 ## Confirmed (still present)
 
-### Hook (`scripts/shelfmark-hook.sh`)
-1. Fallback payload lacks `task_id`.
-
 ### BookOrbit permissions / ownership
 1. Library access separate from `LibraryUpload`.
 2. Target library must be type `books`.
@@ -15,10 +12,9 @@
 7. Partial-permission Book Dock state can strand uploads.
 
 ### Test coverage gaps (`verify.mjs`)
-1. AuthManager native-login/refresh untested.
-2. `/api/releases` `source` forwarding untested.
-3. Book Dock `filed`/`errorMessage` paths untested.
-4. Multi-file webhook payloads untested.
+1. `/api/releases` `source` forwarding untested.
+2. Book Dock `filed`/`errorMessage` paths untested.
+3. Multi-file webhook payloads untested.
 
 ### Eighth-round additional findings
 
@@ -26,11 +22,9 @@
 1. `/api/releases` `source` forwarding untested.
 2. Book Dock `filed`/`errorMessage` paths untested.
 3. Multi-file webhook payloads untested.
-4. Webhook task ID mismatch handling untested.
-5. `BookOrbitAuthManager.login()` native login untested.
-6. `findAuthoritativeBookOrbitBook` endpoint fallback untested.
-7. Search payload contract fields unasserted.
-8. Companion HTTP server invalid JSON/404 handling untested.
+4. `findAuthoritativeBookOrbitBook` endpoint fallback untested.
+5. Search payload contract fields unasserted.
+6. Companion HTTP server invalid JSON/404 handling untested.
 
 ### Tenth-round additional findings
 
