@@ -2162,9 +2162,10 @@ export class BridgeService {
    * and that its edition remains compatible.
    *
    * Returns:
-   *   'exists'  - Authoritatively found in library and edition is compatible
-   *   'deleted' - Authoritative query succeeded but bookId is missing from library
-   *   'unknown' - Outage / auth failure / network error / ambiguous query (fail closed)
+   *   'exists'        - Authoritatively found in library and edition is compatible
+   *   'deleted'       - Authoritative query succeeded but bookId is missing from library
+   *   'incompatible' - Book exists in library but edition is incompatible
+   *   'unknown'       - Outage / auth failure / network error / ambiguous query (fail closed)
    */
   async verifyBookInLibrary(task, targetLibraryId, bookId, headers, fetchFn = globalThis.fetch) {
     const bId = parsePositiveInt(bookId);
@@ -2173,42 +2174,84 @@ export class BridgeService {
     if (!libId) return 'unknown';
 
     const authHeaders = headers || await this.getAuthHeaders();
-    const cards = await this.listAuthoritativeBookOrbitBooks(task, libId, authHeaders, fetchFn);
-    if (cards === null) {
-      // Outage, auth failure, or ambiguous query: fail closed!
-      return 'unknown';
-    }
+    const boUrl = this.bookorbitUrl;
 
-    const foundCard = cards.find((c) => parsePositiveInt(c?.id ?? c?.bookId) === bId);
-    if (!foundCard) {
-      // Authoritative list of books for this title does not contain this bookId: definitively deleted!
-      return 'deleted';
-    }
-
-    // Book found; verify edition compatibility
-    const expectedAuthor = String(task?.author || (Array.isArray(task?.authors) ? task.authors[0] : '') || '').trim();
-    const authors = Array.isArray(foundCard.authors) ? foundCard.authors : [];
-    const author = typeof foundCard.author === 'string' && foundCard.author.trim()
-      ? foundCard.author : (typeof authors[0] === 'string' ? authors[0] : authors[0]?.name || '');
-    const formats = Array.isArray(foundCard.formats)
-      ? foundCard.formats.map((f) => typeof f === 'string' ? f.toLowerCase() : String(f?.format || '').toLowerCase()) : [];
-    const wantedFormat = String(task?.format || '').toLowerCase();
-    const primaryFormat = String(foundCard.primaryFormat || foundCard.format || '').toLowerCase();
-
-    const book = {
-      ...foundCard,
-      id: bId,
-      author: String(author).trim(),
-      year: foundCard.year || foundCard.publishedYear || foundCard.publicationYear || null,
-      isbn: foundCard.isbn13 || foundCard.isbn || null,
-      format: wantedFormat && formats.includes(wantedFormat) ? wantedFormat : primaryFormat,
+    // Helper to evaluate edition compatibility for a found card.
+    const evaluateCard = (card, ignoreTitleMismatch = false) => {
+      const authors = Array.isArray(card?.authors) ? card.authors : [];
+      const author = typeof card?.author === 'string' && card.author.trim()
+        ? card.author : (typeof authors[0] === 'string' ? authors[0] : authors[0]?.name || '');
+      const formats = Array.isArray(card?.formats)
+        ? card.formats.map((f) => typeof f === 'string' ? f.toLowerCase() : String(f?.format || '').toLowerCase()) : [];
+      const wantedFormat = String(task?.format || '').toLowerCase();
+      const primaryFormat = String(card?.primaryFormat || card?.format || '').toLowerCase();
+      const book = {
+        ...card,
+        id: bId,
+        author: String(author).trim(),
+        year: card?.year || card?.publishedYear || card?.publicationYear || card?.publishedDate || null,
+        isbn: card?.isbn13 || card?.isbn || null,
+        format: wantedFormat && formats.includes(wantedFormat) ? wantedFormat : primaryFormat,
+      };
+      const expectedAuthor = String(task?.author || (Array.isArray(task?.authors) ? task.authors[0] : '') || '').trim();
+      const compatTask = { ...task, author: expectedAuthor };
+      const compatBook = { ...book };
+      if (ignoreTitleMismatch) {
+        // A renamed book keeps its identity by ID; title drift alone is not a different edition.
+        compatTask.title = book.title || compatTask.title;
+        compatTask.bookTitle = book.title || compatTask.bookTitle;
+        compatBook.title = book.title || compatBook.title;
+        compatBook.bookTitle = book.title || compatBook.bookTitle;
+      }
+      if (expectedAuthor && book.author && !areEditionsCompatible(compatTask, compatBook)) {
+        return 'incompatible';
+      }
+      return 'exists';
     };
 
-    if (expectedAuthor && book.author && !areEditionsCompatible({ ...task, author: expectedAuthor }, book)) {
-      return 'deleted';
+    // 1. Prefer a supported exact-ID verification route when available.
+    if (boUrl) {
+      let exactResolved = false;
+      let exactStatus = null;
+      try {
+        const res = await fetchFn(`${boUrl}/api/v1/books/${bId}`, { headers: authHeaders });
+        exactStatus = res?.status ?? null;
+        if (res?.ok) {
+          const data = await res.json().catch(() => null);
+          if (data && (data.id === undefined || parsePositiveInt(data.id ?? data.bookId) === bId)) {
+            // Verify library membership when the route exposes it.
+            const bookLibId = parsePositiveInt(data.libraryId ?? data.library?.id ?? data.library_id);
+            if (bookLibId && bookLibId !== libId) {
+              // Book exists, but not in the target library.
+              return 'deleted';
+            }
+            exactResolved = true;
+            return evaluateCard(data, true);
+          }
+        }
+        if (exactStatus === 404) {
+          // Authoritative: book no longer exists.
+          return 'deleted';
+        }
+      } catch (err) {
+        console.warn(`[Bridge] Exact book lookup unavailable: ${sanitizeLog(err?.message || err)}`);
+      }
+      // Non-404 failure: do not treat as deletion; fall through to title search.
+      if (exactResolved) return 'exists';
     }
 
-    return 'exists';
+    // 2. Fall back to library-scoped title search. A missing saved ID here is
+    //    NOT proof of deletion (renamed books, stale title index, etc.).
+    const cards = await this.listAuthoritativeBookOrbitBooks(task, libId, authHeaders, fetchFn);
+    if (cards === null) {
+      return 'unknown';
+    }
+    const foundCard = cards.find((c) => parsePositiveInt(c?.id ?? c?.bookId) === bId);
+    if (!foundCard) {
+      // Inconclusive: title search does not contain this ID. Do not declare deletion.
+      return 'unknown';
+    }
+    return evaluateCard(foundCard, false);
   }
 
   /**
