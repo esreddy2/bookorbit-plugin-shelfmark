@@ -2232,8 +2232,24 @@ export class BridgeService {
         compatBook.title = book.title || compatBook.title;
         compatBook.bookTitle = book.title || compatBook.bookTitle;
       }
-      if (expectedAuthor && book.author && !areEditionsCompatible(compatTask, compatBook)) {
+
+      // Always evaluate known edition fields, even when author metadata is missing.
+      if (!areEditionsCompatible(compatTask, compatBook)) {
         return 'incompatible';
+      }
+
+      // Fail closed when no durable edition identity can be established.
+      const taskYear = parsePositiveInt(task?.year || task?.publishedYear || task?.publicationYear);
+      const bookYear = parsePositiveInt(book?.year || book?.publishedYear || book?.publicationYear);
+      const taskIsbn = String(task?.isbn13 || task?.isbn || task?.extra?.isbn || '').replace(/[^0-9X]/gi, '');
+      const bookIsbn = String(book?.isbn13 || book?.isbn || '').replace(/[^0-9X]/gi, '');
+      const identityEstablished = Boolean(
+        (expectedAuthor && book.author) ||
+        (taskYear && bookYear) ||
+        (taskIsbn && bookIsbn)
+      );
+      if (!identityEstablished) {
+        return 'unknown';
       }
       return 'exists';
     };

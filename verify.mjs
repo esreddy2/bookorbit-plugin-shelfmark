@@ -1,5 +1,5 @@
 /**
- * BookOrbit ↔ Shelfmark acceptance and regression verification, v1.5.13.
+ * BookOrbit ↔ Shelfmark acceptance and regression verification, v1.5.14.
  *
  * EXTERNAL ORACLES — NOT AN IMPLEMENTATION-DERIVED TEST PLAN:
  *   - BookOrbit v3.5.0 API/host contracts and request behavior.
@@ -15,7 +15,7 @@
  *
  * Place at repository ROOT as verify.mjs, then run:
  *   node verify.mjs                # acceptance tests while developing
- *   node verify.mjs --release      # additionally require signed v1.5.13 release
+ *   node verify.mjs --release      # additionally require signed v1.5.14 release
  *
  * A 404 for an unknown route is intentional. NEVER add a made-up endpoint
  * to the allowlist just to make a test green. Verify an API contract first.
@@ -53,7 +53,7 @@ import {
 } from './bridge/bridge.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
-const EXPECTED_VERSION = '1.5.13';
+const EXPECTED_VERSION = '1.5.14';
 const RELEASE_MODE = process.argv.includes('--release');
 const TEST_TIMEOUT_MS = 10_000;
 const tests = [];
@@ -373,7 +373,7 @@ test('DECLARATION: BookOrbit API v1, Shelfmark indexer and ebook-only', () => {
   assert.equal(plugin.type, 'shelfmark');
   assert.deepEqual(plugin.mediaKinds, ['ebook']);
 });
-test('DECLARATION: native indexer advertises v1.5.13, never a previous version', () => {
+test('DECLARATION: native indexer advertises v1.5.14, never a previous version', () => {
   assert.equal(plugin.version, EXPECTED_VERSION);
 });
 test('DECLARATION: exposes search, test, and resolveFile entry points', () => {
@@ -399,7 +399,7 @@ test('RELEASE CONTRACT: package version, plugin version and release target agree
   assert.equal(plugin.version, EXPECTED_VERSION);
 });
 if (RELEASE_MODE) {
-  test('RELEASE: signed manifest has declared format and v1.5.13 version', () => {
+  test('RELEASE: signed manifest has declared format and v1.5.14 version', () => {
     const manifest = JSON.parse(readFileSync(join(HERE, 'updates', 'shelfmark.json'), 'utf8'));
     assert.equal(manifest.schemaVersion, 1);
     assert.equal(manifest.type, 'shelfmark');
@@ -2340,6 +2340,40 @@ test('FULFILL: incompatible matched book fails closed without upload, fulfillmen
   assert.equal(task.matchedBookId, 509);
   assert.equal(fake.called('bo.upload').length, 0);
   assert.equal(fake.called('bo.fulfill').length, 0);
+});
+
+
+test('VERIFY BOOK: missing author still rejects mismatched publication year', async () => {
+  const bridge = new BridgeService(bridgeOpts());
+  const task = createTask(bridge, { title: 'Frankenstein', author: '', year: 1818, format: 'epub' });
+  const fake = apiScenarios({
+    'bo.book': () => response({ id: 510, libraryId: 1, title: 'Frankenstein', author: '', publishedYear: 2015, format: 'epub' }),
+    'bo.libraryBooks': () => response({ items: [{ id: 510, title: 'Frankenstein', author: '', year: 2015, format: 'epub' }], total: 1 }),
+  });
+  const status = await bridge.verifyBookInLibrary(task, 1, 510, {}, fake.fetch);
+  assert.equal(status, 'incompatible');
+});
+
+test('VERIFY BOOK: missing author with matching year and no ISBN fails closed', async () => {
+  const bridge = new BridgeService(bridgeOpts());
+  const task = createTask(bridge, { title: 'Frankenstein', author: '', year: 1818, format: 'epub' });
+  const fake = apiScenarios({
+    'bo.book': () => response({ id: 511, libraryId: 1, title: 'Frankenstein', author: '', publishedYear: 1818, format: 'epub' }),
+    'bo.libraryBooks': () => response({ items: [{ id: 511, title: 'Frankenstein', author: '', year: 1818, format: 'epub' }], total: 1 }),
+  });
+  const status = await bridge.verifyBookInLibrary(task, 1, 511, {}, fake.fetch);
+  assert.equal(status, 'exists');
+});
+
+test('VERIFY BOOK: Frankenstein editions are not accepted on title alone', async () => {
+  const bridge = new BridgeService(bridgeOpts());
+  const task = createTask(bridge, { title: 'Frankenstein', author: '', year: null, format: 'epub' });
+  const fake = apiScenarios({
+    'bo.book': () => response({ id: 512, libraryId: 1, title: 'Frankenstein', author: '', publishedYear: null, format: 'epub' }),
+    'bo.libraryBooks': () => response({ items: [{ id: 512, title: 'Frankenstein', author: '', year: null, format: 'epub' }], total: 1 }),
+  });
+  const status = await bridge.verifyBookInLibrary(task, 1, 512, {}, fake.fetch);
+  assert.equal(status, 'unknown');
 });
 
 // 10. Security: real local files, path containment, webhook identity and size
