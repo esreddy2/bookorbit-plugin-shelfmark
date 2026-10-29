@@ -106,6 +106,7 @@ const CONTRACT_ROUTES = Object.freeze([
   ['bo.request',    'GET',  /^\/api\/v1\/book-requests\/[^/]+\/?$/],
   ['bo.fulfill',    'POST', /^\/api\/v1\/admin\/book-requests\/[^/]+\/fulfill\/?$/],
   ['bo.upload',     'POST', /^\/api\/v1\/libraries\/[1-9]\d*\/upload\/?$/],
+  ['bo.libraryBooks', 'POST', /^\/api\/v1\/libraries\/[1-9]\d*\/books\/?$/],
   ['sm.health',     'GET',  /^\/api\/health\/?$/],
   ['sm.status',     'GET',  /^\/api\/status\/?$/],
   ['sm.metadata',   'GET',  /^\/api\/metadata\/search\/?$/],
@@ -219,6 +220,7 @@ function apiScenarios({ requests = [], details = {}, books = [], releases = [], 
       return item ? response(item) : failResponse(404, 'Request not found');
     },
     'bo.upload': (entry) => { onPost(entry); return response(onUpload(entry)); },
+    'bo.libraryBooks': () => response({ items: [], total: 0 }),
     'bo.fulfill': (entry) => { onPost(entry); return response(onFulfill(entry)); },
     'sm.metadata': (entry) => response(onMetadata ? onMetadata(entry) : { books }),
     'sm.releases': (entry) => response(onReleases ? onReleases(entry) : releases),
@@ -1440,7 +1442,7 @@ test('CANCEL: approved individual request is classified active, not unknown', as
   assert.equal(await bridge.getRequestStatus('live-1', fake.fetch), 'active');
   fake.assertKnownRoutes();
 });
-for (const state of ['cancelled', 'rejected', 'available']) {
+for (const state of ['cancelled', 'rejected']) {
   test(`CANCEL: ${state} individual request is no longer active`, async () => {
     const bridge = new BridgeService(bridgeOpts());
     const fake = apiScenarios({ details: { 'ended-1': request('ended-1', 'Animal Farm', 'George Orwell', { status: state }) } });
@@ -1448,6 +1450,12 @@ for (const state of ['cancelled', 'rejected', 'available']) {
     fake.assertKnownRoutes();
   });
 }
+test('CANCEL: Available is fulfilled, never cancelled', async () => {
+  const bridge = new BridgeService(bridgeOpts());
+  const fake = apiScenarios({ details: { 'already-available': request('already-available', 'Animal Farm', 'George Orwell', { status: 'available' }) } });
+  assert.equal(await bridge.getRequestStatus('already-available', fake.fetch), 'fulfilled');
+  fake.assertKnownRoutes();
+});
 test('CANCEL: a 403 from individual lookup can fall back to the supported admin LIST', async () => {
   const bridge = new BridgeService(bridgeOpts());
   const fake = apiScenarios({

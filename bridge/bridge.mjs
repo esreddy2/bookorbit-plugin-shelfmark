@@ -1,3 +1,4 @@
+// v158-recovery-hotfix-v3 (companion-only; BookOrbit v3.5.0 API contract)
 /**
  * BookOrbit ↔ Shelfmark Asynchronous Companion Bridge
  *
@@ -1283,8 +1284,8 @@ export class BridgeService {
       if (res && res.ok) {
         const data = await res.json().catch(() => ({}));
         const status = String(data.status || data.state || data.requestStatus || data.request_status || '').toLowerCase();
-        if (status === 'cancelled' || status === 'canceled' || status === 'rejected' || status === 'available') return 'cancelled';
-        if (!status) return 'active';
+        if (status === 'cancelled' || status === 'canceled' || status === 'rejected') return 'cancelled';
+        if (!status) return 'unknown';
         if (['approved', 'active', 'pending', 'searching', 'queued', 'downloading', 'resolving', 'locating', 'grabbed', 'importing', 'needs_review'].includes(status)) return 'active';
         if (['completed', 'fulfilled', 'available', 'done', 'success'].includes(status)) return 'fulfilled';
         return status;
@@ -1306,8 +1307,8 @@ export class BridgeService {
         const found = items.find((r) => String(r?.id ?? r?.requestId ?? r?.request_id ?? r?.taskId ?? r?.task_id) === String(reqId));
         if (found) {
           const status = String(found.status || found.state || found.requestStatus || found.request_status || '').toLowerCase();
-          if (status === 'cancelled' || status === 'canceled' || status === 'rejected' || status === 'available') return 'cancelled';
-          if (!status) return 'active';
+          if (status === 'cancelled' || status === 'canceled' || status === 'rejected') return 'cancelled';
+          if (!status) return 'unknown';
           if (['approved', 'active', 'pending', 'searching', 'queued', 'downloading', 'resolving', 'locating', 'grabbed', 'importing', 'needs_review'].includes(status)) return 'active';
           if (['completed', 'fulfilled', 'available', 'done', 'success'].includes(status)) return 'fulfilled';
           return status;
@@ -2091,13 +2092,97 @@ export class BridgeService {
    * Authoritatively searches BookOrbit library and books API to locate an existing book
    * for edition verification, handling 409 destination conflicts and uncertain upload reconciliation.
    */
-  async findAuthoritativeBookOrbitBook(task, targetLibraryId, headers, fetchFn = globalThis.fetch) {
-    // No BookOrbit route in the supported contract can authoritatively enumerate library
-    // books, so never fabricate an ID or call undeclared endpoints.
+  /**
+   * Read actual BookOrbit v3.5.0 library book cards without inventing GET routes.
+   * A failed, truncated or unauthorized query is UNKNOWN, never an empty library.
+   */
+  async listAuthoritativeBookOrbitBooks(task, targetLibraryId, headers, fetchFn = globalThis.fetch) {
+    const libraryId = parsePositiveInt(targetLibraryId);
+    const title = String(task?.bookTitle || task?.title || '').trim();
+    if (!libraryId || !title || title.length > 200) return null;
+    const url = `${this.bookorbitUrl}/api/v1/libraries/${libraryId}/books`;
+    const size = 100;
+    const all = [];
+    try {
+      for (let page = 0; page < 5; page++) {
+        const result = await fetchFn(url, {
+          method: 'POST',
+          headers: { ...headers, 'Content-Type': 'application/json' },
+          body: JSON.stringify({ q: title, sort: [], pagination: { page, size } }),
+        });
+        if (!result?.ok) return null;
+        const data = await result.json();
+        if (!data || !Array.isArray(data.items)) return null;
+        all.push(...data.items);
+        const total = Number(data.total);
+        // A shortened page when total says more results remain is not full evidence.
+        if (Number.isFinite(total) && total >= 0) {
+          if (all.length >= total) return all;
+          if (data.items.length < size) return null;
+        } else if (data.items.length < size) {
+          return all;
+        }
+      }
+    } catch (err) {
+      console.warn(`[Bridge] Library lookup unavailable: ${sanitizeLog(err?.message || err)}`);
+    }
+    // A >500-match query is not complete evidence. Fail closed rather than guess.
     return null;
-
   }
 
+  /**
+   * Only adopt one uniquely identified, edition-compatible BookOrbit library book.
+   * For an uncertain upload, prefer a NEW id absent from the pre-upload snapshot.
+   * Without a snapshot, require a matching publication year or ISBN; title alone
+   * is not proof of the correct edition (especially for multiple Frankenstein editions).
+   */
+  async findAuthoritativeBookOrbitBook(task, targetLibraryId, headers, fetchFn = globalThis.fetch, mode = 'conflict') {
+    const cards = await this.listAuthoritativeBookOrbitBooks(task, targetLibraryId, headers, fetchFn);
+    if (!cards) return null;
+    const baselineKnown = task?.uploadBaselineChecked === true && Array.isArray(task.uploadBaselineIds);
+    const beforeIds = new Set(baselineKnown ? task.uploadBaselineIds.map(Number) : []);
+    const opf = String(task?.filePath || '').toLowerCase().endsWith('.epub')
+      ? extractEpubMetadataFromFile(task.filePath) : null;
+    const expectedYear = parsePositiveInt(task?.year || task?.publishedYear || task?.publicationYear || opf?.year);
+    const expectedIsbn = String(task?.isbn13 || task?.isbn || task?.extra?.isbn || opf?.isbn || '')
+      .replace(/[^0-9X]/gi, '');
+    const expectedAuthor = String(task?.author || (Array.isArray(task?.authors) ? task.authors[0] : '') || opf?.author || '').trim();
+    const matched = new Map();
+    for (const card of cards) {
+      const id = parsePositiveInt(card?.id ?? card?.bookId);
+      if (!id) continue;
+      const authors = Array.isArray(card.authors) ? card.authors : [];
+      const author = typeof card.author === 'string' && card.author.trim()
+        ? card.author : (typeof authors[0] === 'string' ? authors[0] : authors[0]?.name || '');
+      const formats = Array.isArray(card.formats)
+        ? card.formats.map((f) => typeof f === 'string' ? f.toLowerCase() : String(f?.format || '').toLowerCase()) : [];
+      const wantedFormat = String(task?.format || '').toLowerCase();
+      const primaryFormat = String(card.primaryFormat || card.format || '').toLowerCase();
+      if (wantedFormat && ((formats.length && !formats.includes(wantedFormat)) ||
+          (!formats.length && primaryFormat && primaryFormat !== wantedFormat))) continue;
+      const book = {
+        ...card, id, author: String(author).trim(),
+        year: card.year || card.publishedYear || card.publicationYear || null,
+        isbn: card.isbn13 || card.isbn || null,
+        format: wantedFormat && formats.includes(wantedFormat) ? wantedFormat : primaryFormat,
+      };
+      // Both explicit title and author are required: missing metadata is not identity.
+      if (!String(book.title || '').trim() || !expectedAuthor || !book.author) continue;
+      if (!areEditionsCompatible({ ...task, author: expectedAuthor }, book)) continue;
+      const observedYear = parsePositiveInt(book.year);
+      const observedIsbn = String(book.isbn || '').replace(/[^0-9X]/gi, '');
+      const editionVerified = Boolean(
+        (expectedIsbn && observedIsbn && expectedIsbn === observedIsbn) ||
+        (expectedYear && observedYear && expectedYear === observedYear)
+      );
+      const newlyImported = baselineKnown && !beforeIds.has(id);
+      if (mode === 'uncertain' && baselineKnown && !newlyImported) continue;
+      if (!newlyImported && !editionVerified) continue;
+      matched.set(id, book);
+    }
+    // Never pick the first of multiple plausible editions. Require unique identity.
+    return matched.size === 1 ? [...matched.values()][0] : null;
+  }
   /**
    * Uploads file directly into BookOrbit Library:
    * POST /api/v1/libraries/:id/upload?folderId=:folderId
@@ -2144,8 +2229,8 @@ export class BridgeService {
       const data = await uploadRes.json().catch(() => ({}));
       const bookId = parsePositiveInt(data.bookId || data.id || data.book?.id);
       if (!bookId) {
-        // Empty response or missing book ID (e.g. unhandled route in mocks): fall back to Book Dock
-        return { notFound: true };
+        // A 2xx response without book ID is an uncertain upload, not a missing route.
+        return { networkError: true, error: 'Upload succeeded but returned no usable book ID' };
       }
       return { success: true, bookId };
     }
@@ -2188,7 +2273,7 @@ export class BridgeService {
 
       // If 409 response did NOT contain a usable existing book ID:
       // Authoritatively inspect BookOrbit library books!
-      const authoritativeBook = await this.findAuthoritativeBookOrbitBook(task, targetLibraryId, headers, fetchFn);
+      const authoritativeBook = await this.findAuthoritativeBookOrbitBook(task, targetLibraryId, headers, fetchFn, 'conflict');
       if (authoritativeBook) {
         if (areEditionsCompatible(task, authoritativeBook)) {
           return { success: true, bookId: authoritativeBook.id, adoptedFromConflict: true };
@@ -2388,46 +2473,63 @@ export class BridgeService {
       ...(token && isJwt(token) ? { 'Authorization': `Bearer ${token}` } : {}),
       ...(this.bookorbitApiKey ? { 'X-Api-Key': this.bookorbitApiKey } : {}),
     };
-
     let matchedBookId = parsePositiveInt(task.matchedBookId) || null;
-
-    // Cancellation-aware: determine which requests are still active before importing
+    // A transient 401/403/network error is UNKNOWN, not evidence of cancellation.
+    // Never let a status outage mark a completed Shelfmark task permanently cancelled.
     const activeRequestIds = [];
+    const unknownRequestIds = [];
+    let explicitlyCancelled = 0;
+    let alreadyAvailable = 0;
+    if (!task.requestFulfillments) task.requestFulfillments = {};
     for (const rid of (task.requestIds || [])) {
+      // A prior successful fulfillment is durable proof; a later API outage must
+      // not overwrite it or cause a duplicate POST.
+      if (task.requestFulfillments[rid]?.fulfilled) {
+        alreadyAvailable++;
+        continue;
+      }
       const ridState = await this.getRequestStatus(rid, fetchFn);
-      if (ridState === 'cancelled') {
-        if (!task.requestFulfillments) task.requestFulfillments = {};
+      if (ridState === 'fulfilled') {
         task.requestFulfillments[rid] = {
-          fulfilled: false,
-          errorType: 'cancelled',
-          error: 'Request cancelled',
+          fulfilled: true, alreadyAvailable: true, fulfilledAt: new Date().toISOString(),
+        };
+        alreadyAvailable++;
+        this.setRequestProgress(rid, 'available', { reason: 'already_available' });
+      } else if (ridState === 'cancelled') {
+        explicitlyCancelled++;
+        task.requestFulfillments[rid] = {
+          fulfilled: false, errorType: 'cancelled', error: 'Request cancelled',
           updatedAt: new Date().toISOString(),
         };
         this.setRequestProgress(rid, 'cancelled', { reason: 'cancelled' });
-      } else if (ridState !== 'active') {
-        if (!task.requestFulfillments) task.requestFulfillments = {};
+      } else if (ridState === 'active') {
+        activeRequestIds.push(rid);
+      } else {
+        unknownRequestIds.push(rid);
         task.requestFulfillments[rid] = {
-          fulfilled: false,
-          errorType: 'status_unknown',
-          error: 'Request status unknown',
+          fulfilled: false, errorType: 'status_unknown', error: 'Request status unknown',
           updatedAt: new Date().toISOString(),
         };
         this.setRequestProgress(rid, 'status_unknown', { reason: 'status_unknown' });
-      } else {
-        activeRequestIds.push(rid);
       }
     }
     this.saveState();
-
     if ((task.requestIds || []).length > 0 && activeRequestIds.length === 0) {
-      // All requests cancelled; preserve shared download but skip import/fulfillment
-      task.status = 'cancelled';
+      if (unknownRequestIds.length > 0) {
+        // Keep completed/imported/uncertain_upload recoverable for reconciliation.
+        task.error = `BookOrbit request status temporarily unknown for ${unknownRequestIds.length} request(s)`;
+        this.saveState();
+        return { fulfilled: false, error: task.error };
+      }
+      task.fulfilledRequestIds = task.requestIds.filter((id) => task.requestFulfillments[id]?.fulfilled);
+      task.unfulfilledRequestIds = task.requestIds.filter((id) => !task.requestFulfillments[id]?.fulfilled);
+      task.status = explicitlyCancelled === task.requestIds.length ? 'cancelled'
+        : task.unfulfilledRequestIds.length ? 'partially_fulfilled' : 'fulfilled';
       task.updatedAt = new Date().toISOString();
-      this.setRequestProgress((task.requestIds || [])[0], 'cancelled', { reason: 'cancelled' });
       this.saveState();
-      return { fulfilled: false, error: 'All requests cancelled' };
+      return { fulfilled: task.status === 'fulfilled', count: alreadyAvailable,
+        bookId: matchedBookId, error: task.status === 'cancelled' ? 'All requests cancelled' : undefined };
     }
-
     for (const rid of activeRequestIds) {
       this.setRequestProgress(rid, 'importing', { reason: 'importing' });
     }
@@ -2449,7 +2551,7 @@ export class BridgeService {
 
       // Reconcile uncertain upload state: check authoritative BookOrbit library before re-uploading
       if (task.status === 'uncertain_upload' || task.uncertainUpload) {
-        const resolved = await this.findAuthoritativeBookOrbitBook(task, targetLibraryId, headers, fetchFn);
+        const resolved = await this.findAuthoritativeBookOrbitBook(task, targetLibraryId, headers, fetchFn, 'uncertain');
         if (resolved && areEditionsCompatible(task, resolved)) {
           matchedBookId = resolved.id;
           task.matchedBookId = matchedBookId;
@@ -2472,6 +2574,15 @@ export class BridgeService {
           // Try direct library upload first if library and folder are configured
           let directResult = { notFound: true };
           if (targetLibraryId && targetFolderId) {
+            // Capture a read-only baseline before any potentially non-idempotent POST.
+            if (task.uploadBaselineChecked !== true) {
+              const before = await this.listAuthoritativeBookOrbitBooks(task, targetLibraryId, headers, fetchFn);
+              if (before !== null) {
+                task.uploadBaselineChecked = true;
+                task.uploadBaselineIds = before.map((b) => parsePositiveInt(b?.id ?? b?.bookId)).filter(Boolean);
+                this.saveState();
+              }
+            }
             directResult = await this.uploadDirectToLibrary(task, targetLibraryId, targetFolderId, headers, fetchFn);
           }
           if (directResult.success && directResult.bookId) {
@@ -2536,9 +2647,20 @@ export class BridgeService {
 
     let fulfilledCount = 0;
     for (const reqId of task.requestIds) {
+      if (task.requestFulfillments[reqId]?.fulfilled) {
+        fulfilledCount++;
+        continue;
+      }
       const step2State = await this.getRequestStatus(reqId, fetchFn);
+      if (step2State === 'fulfilled') {
+        task.requestFulfillments[reqId] = {
+          fulfilled: true, alreadyAvailable: true, fulfilledAt: new Date().toISOString(),
+        };
+        fulfilledCount++;
+        this.saveState();
+        continue;
+      }
       if (step2State === 'cancelled') {
-        if (!task.requestFulfillments) task.requestFulfillments = {};
         task.requestFulfillments[reqId] = {
           fulfilled: false,
           errorType: 'cancelled',
@@ -2550,7 +2672,6 @@ export class BridgeService {
         continue;
       }
       if (step2State !== 'active') {
-        if (!task.requestFulfillments) task.requestFulfillments = {};
         task.requestFulfillments[reqId] = {
           fulfilled: false,
           errorType: 'status_unknown',
@@ -2561,11 +2682,6 @@ export class BridgeService {
         this.saveState();
         continue;
       }
-      if (task.requestFulfillments[reqId]?.fulfilled) {
-        fulfilledCount++;
-        continue;
-      }
-
       try {
         const fulfillDto = {
           matchedBookId,
@@ -2972,13 +3088,22 @@ export class BridgeService {
         // Task completed or partially fulfilled mid-flight; retry fulfillment
         if (this.bookorbitUrl) {
           // Do not retry fulfillment for tasks whose requests are all cancelled.
+          // Only skip when every request is VERIFIED terminated/settled.
+          // UNKNOWN is a temporary state and must remain eligible for a future retry.
           const activeIds = [];
+          const unknownIds = [];
           for (const rid of (task.requestIds || [])) {
+            if (task.requestFulfillments?.[rid]?.fulfilled) continue;
             const st = await this.getRequestStatus(rid, fetchFn);
             if (st === 'active') activeIds.push(rid);
+            else if (st !== 'cancelled' && st !== 'fulfilled') unknownIds.push(rid);
           }
-          if ((task.requestIds || []).length > 0 && activeIds.length === 0) {
-            // Preserve historical state and skip repeated fulfillment retries.
+          if ((task.requestIds || []).length > 0 && activeIds.length === 0 && unknownIds.length === 0) {
+            // Terminal requests; nothing to upload or retry.
+            continue;
+          }
+          if (activeIds.length === 0) {
+            // The only unresolved requests cannot currently be checked. Keep task as-is.
             continue;
           }
           if (task.matchedBookId) {
