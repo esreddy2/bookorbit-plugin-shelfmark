@@ -45,9 +45,6 @@
 #### Regex/title matching (`index.mjs`)
 1. `rel.author` is not part of Shelfmark `Release` API (dead branch).
 
-#### Env/config handling
-1. Undocumented/option-only env handling.
-
 ### Twelfth-round additional findings
 
 #### `index.mjs`
@@ -59,14 +56,6 @@ Remaining risks are confined to the confirmed list above. Items previously confi
 
 " filePath">
 /home/dev/projects/personal/bookorbit-plugin-shelfmark/API_INTEGRATION_AUDIT.md
-## Thirteenth-round additional findings
-
-### File system / path handling
-1. Hook fallback path payload missing metadata/destination.
-
-### String literals / URL construction
-1. Bridge status correlation relies on nonexistent `source_id` field in Shelfmark `/api/status`.
-
 
 ## Testing policy note
 Tests must catch present errors and assert real behavior; they must not be written with predetermined expected values merely to pass. New test additions are not secondary implementations—they will be audited in the next audit and must be completed thoroughly. Do not weaken assertions to make tests pass.

@@ -1613,6 +1613,12 @@ async function runTests() {
 
       const auth = await bridge.handleWebhook({ task_id: 't-nonexistent' }, 'correct-secret');
       ok('bridge accepts webhook with valid secret (200)', auth.statusCode === 200 && auth.ok);
+
+      // Task ID mismatch returns 409
+      const bridge2 = new BridgeService({ stateFilePath: testStateFile + '.mismatch', secret: 'correct-secret' });
+      bridge2.state.tasks['t-real'] = { taskId: 't-real', title: 'Mismatch Book', format: 'epub', status: 'queued', requestIds: [], userIds: [] };
+      const mismatch = await bridge2.handleWebhook({ task: { task_id: 't-real', id: 'different-id' }, paths: { target: '/tmp/x.epub' } }, 'correct-secret');
+      ok('webhook task ID mismatch returns 409', mismatch.statusCode === 409 && !mismatch.ok);
     }
 
     // Test B5: File verification, directory traversal protection, and path mapping
@@ -2665,6 +2671,26 @@ async function runTests() {
       ok('refreshes session prior to expiration using refresh token', refreshCalls === 1 && validToken === freshJwt);
       ok('validates JWT format and decodes expiration', isJwt(validToken) && typeof decodeJwtExp(validToken) === 'number');
       ok('rejects static API keys as valid session JWTs', isJwt('my-static-api-key-12345') === false);
+    }
+
+    // Test B23b: AuthManager native login posts clientKind native and stores token
+    {
+      let loginCalls = 0;
+      let capturedBody = null;
+      const fakeLoginFetch = async (url, opts) => {
+        if (url.includes('/api/v1/auth/login')) {
+          loginCalls++;
+          capturedBody = JSON.parse(opts.body || '{}');
+          return mockResponse({ token: 'native-jwt-token-xyz', refreshToken: 'native-refresh-xyz', expiresAt: new Date(Date.now() + 3600000).toISOString() });
+        }
+        return mockResponse({});
+      };
+      const mgr = new BookOrbitAuthManager({ url: 'http://localhost:8104', username: 'svc', password: 'pw', fetchFn: fakeLoginFetch });
+      const tok = await mgr.login();
+      ok('AuthManager native login posts to /api/v1/auth/login', loginCalls === 1);
+      ok('AuthManager native login sends clientKind native', capturedBody && capturedBody.clientKind === 'native' && capturedBody.username === 'svc');
+      ok('AuthManager native login returns and stores token', tok === 'native-jwt-token-xyz' && mgr.token === 'native-jwt-token-xyz');
+      ok('AuthManager native login stores refresh token', mgr.refreshToken === 'native-refresh-xyz');
     }
 
     // Test B24: Book Dock readiness settlement, already-filed file adoption, and crash recovery

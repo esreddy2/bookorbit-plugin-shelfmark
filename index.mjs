@@ -240,7 +240,7 @@ export default {
       // Authentic author attribution:
       // Prefer authentic author reported by the release if present.
       // Otherwise fall back to validated book metadata author or searchAuthor.
-      const releaseAuthor = toNaturalAuthor(rel.author || rel.extra?.author || rel.extra?.Author);
+      const releaseAuthor = toNaturalAuthor(rel.extra?.author || rel.extra?.Author);
       const metadataAuthor = Array.isArray(book?.authors)
         ? book.authors.map(toNaturalAuthor).filter(Boolean).join(', ')
         : toNaturalAuthor(book?.author);
@@ -558,7 +558,7 @@ export default {
 
             for (const rel of directReleases) {
               const relTitle = rel.title || '';
-              const relAuthor = toNaturalAuthor(rel.author || rel.extra?.author || rel.extra?.Author);
+const relAuthor = toNaturalAuthor(rel.extra?.author || rel.extra?.Author);
               // Strictly validate title and author on direct releases
               if (searchTitle && !isTitleMatch(relTitle, searchTitle)) continue;
               if (searchAuthor && relAuthor && !isAuthorMatch(relAuthor, searchAuthor)) continue;

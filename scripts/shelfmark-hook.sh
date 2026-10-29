@@ -42,8 +42,15 @@ fi
 if [ -z "$PAYLOAD" ]; then
   if [ -n "$TARGET_PATH" ]; then
     FILE_NAME=$(basename "$TARGET_PATH")
-    PAYLOAD=$(printf '{"version":1,"phase":"post_transfer","task":{"title":"%s"},"metadata":{"source":"shelfmark_hook","destination":"%s"},"paths":{"target":"%s","final_paths":["%s"],"destination":"%s"},"target_path":"%s","destination":"%s"}' \
-      "$FILE_NAME" "$TARGET_PATH" "$TARGET_PATH" "$TARGET_PATH" "$TARGET_PATH" "$TARGET_PATH" "$TARGET_PATH")
+    # Include task_id when Shelfmark provides it via environment; otherwise null.
+TASK_ID_VAL="${SHELFMARK_TASK_ID:-}"
+if [ -z "$TASK_ID_VAL" ]; then
+  TASK_JSON="null"
+else
+  TASK_JSON="\"$TASK_ID_VAL\""
+fi
+PAYLOAD=$(printf '{"version":1,"phase":"post_transfer","task":{"task_id":%s,"title":"%s"},"metadata":{"source":"shelfmark_hook","destination":"%s"},"paths":{"target":"%s","final_paths":["%s"],"destination":"%s"},"target_path":"%s","destination":"%s"}' \
+      "$TASK_JSON" "$FILE_NAME" "$TARGET_PATH" "$TARGET_PATH" "$TARGET_PATH" "$TARGET_PATH" "$TARGET_PATH" "$TARGET_PATH")
   else
     echo "[Shelfmark Hook] Warning: No target path in \$1 and no stdin JSON received." >&2
     exit 0
