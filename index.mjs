@@ -34,7 +34,7 @@ const KNOWN_TITLE_EQUIVALENTS = new Map([
 
 export default {
   apiVersion: 1,
-  version: '1.5.8',
+  version: '1.5.9',
   update: {
     manifestUrl: 'https://raw.githubusercontent.com/esreddy2/bookorbit-plugin-shelfmark/main/updates/shelfmark.json',
     ed25519PublicKey: '-0aHVhXqg7cGaDchc2p1Y8tDnn8A7cJ0WREKspNv5Bc',
@@ -463,7 +463,9 @@ export default {
             releasesUrl.searchParams.set('isbn', isbn);
           }
           releasesUrl.searchParams.set('content_type', 'ebook');
-          releasesUrl.searchParams.set('source', source || 'all');
+          if (source && source !== 'all') {
+            releasesUrl.searchParams.set('source', source);
+          }
 
           let relRes;
           try {
@@ -537,7 +539,7 @@ export default {
         if (queriedKeys.has(queryKey)) continue;
         queriedKeys.add(queryKey);
 
-        if (source === 'all' && !queryTitle && !naturalSearchAuthor && !queryIsbn) {
+        if ((!source || source === 'all') && !queryTitle && !naturalSearchAuthor && !queryIsbn) {
           continue;
         }
         const directRelUrl = new URL(`${baseUrl}/api/releases`);
@@ -551,7 +553,9 @@ export default {
           directRelUrl.searchParams.set('isbn', queryIsbn);
         }
         directRelUrl.searchParams.set('content_type', 'ebook');
-        directRelUrl.searchParams.set('source', source || 'all');
+        if (source && source !== 'all') {
+          directRelUrl.searchParams.set('source', source);
+        }
 
         try {
           const directRelRes = await safeHostFetch(host, directRelUrl.href, { headers }, signal);

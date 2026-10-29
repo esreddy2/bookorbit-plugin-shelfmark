@@ -53,7 +53,7 @@ import {
 } from './bridge/bridge.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
-const EXPECTED_VERSION = '1.5.8';
+const EXPECTED_VERSION = '1.5.9';
 const RELEASE_MODE = process.argv.includes('--release');
 const TEST_TIMEOUT_MS = 10_000;
 const tests = [];
@@ -319,7 +319,7 @@ test('DECLARATION: BookOrbit API v1, Shelfmark indexer and ebook-only', () => {
   assert.equal(plugin.type, 'shelfmark');
   assert.deepEqual(plugin.mediaKinds, ['ebook']);
 });
-test('DECLARATION: native indexer advertises v1.5.8, never a previous version', () => {
+test('DECLARATION: native indexer advertises v1.5.9, never a previous version', () => {
   assert.equal(plugin.version, EXPECTED_VERSION);
 });
 test('DECLARATION: exposes search, test, and resolveFile entry points', () => {
@@ -345,7 +345,7 @@ test('RELEASE CONTRACT: package version, plugin version and release target agree
   assert.equal(plugin.version, EXPECTED_VERSION);
 });
 if (RELEASE_MODE) {
-  test('RELEASE: signed manifest has declared format and v1.5.8 version', () => {
+  test('RELEASE: signed manifest has declared format and v1.5.9 version', () => {
     const manifest = JSON.parse(readFileSync(join(HERE, 'updates', 'shelfmark.json'), 'utf8'));
     assert.equal(manifest.schemaVersion, 1);
     assert.equal(manifest.type, 'shelfmark');
@@ -704,6 +704,56 @@ test('SEARCH: configured release source is forwarded to /api/releases', async ()
   assert.ok(calls.length > 0, 'must query releases');
   assert.ok(calls.every((c) => c.query.get('source') === 'libgen'),
     'configured source must be forwarded');
+});
+
+test('SEARCH: release source "all" or empty omits the source query parameter entirely', async () => {
+  // Test source = 'all'
+  const { fake: fakeAll } = await searchScenario({
+    query: standardQuery(),
+    books: [metadata('Fahrenheit 451', 'Ray Bradbury')],
+    releases: [release('Fahrenheit 451', 'Ray Bradbury')],
+    settings: { releaseSource: 'all' },
+  });
+  const callsAll = fakeAll.called('sm.releases');
+  assert.ok(callsAll.length > 0, 'must query releases for source=all');
+  assert.ok(callsAll.every((c) => !c.query.has('source')),
+    'source parameter must be omitted when releaseSource is "all"');
+
+  // Test source = '' (empty)
+  const { fake: fakeEmpty } = await searchScenario({
+    query: standardQuery(),
+    books: [metadata('Fahrenheit 451', 'Ray Bradbury')],
+    releases: [release('Fahrenheit 451', 'Ray Bradbury')],
+    settings: { releaseSource: '' },
+  });
+  const callsEmpty = fakeEmpty.called('sm.releases');
+  assert.ok(callsEmpty.length > 0, 'must query releases for empty source');
+  assert.ok(callsEmpty.every((c) => !c.query.has('source')),
+    'source parameter must be omitted when releaseSource is empty');
+
+  // Test source = 'direct_download' preserves explicit source
+  const { fake: fakeDirect } = await searchScenario({
+    query: standardQuery(),
+    books: [metadata('Fahrenheit 451', 'Ray Bradbury')],
+    releases: [release('Fahrenheit 451', 'Ray Bradbury')],
+    settings: { releaseSource: 'direct_download' },
+  });
+  const callsDirect = fakeDirect.called('sm.releases');
+  assert.ok(callsDirect.length > 0, 'must query releases for direct_download');
+  assert.ok(callsDirect.every((c) => c.query.get('source') === 'direct_download'),
+    'explicit source direct_download must be preserved');
+
+  // Test direct fallback search (metadata returns empty) also omits source for 'all'
+  const { fake: fakeFallbackAll } = await searchScenario({
+    query: standardQuery('Rare Book Title', 'Unknown Author'),
+    books: [],
+    releases: [release('Rare Book Title', 'Unknown Author')],
+    settings: { releaseSource: 'all' },
+  });
+  const callsFallbackAll = fakeFallbackAll.called('sm.releases');
+  assert.ok(callsFallbackAll.length > 0, 'must query releases on direct fallback');
+  assert.ok(callsFallbackAll.every((c) => !c.query.has('source')),
+    'direct fallback must omit source parameter when releaseSource is "all"');
 });
 
 test('SEARCH: release payload carries the documented Shelfmark contract fields', async () => {
