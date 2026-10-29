@@ -114,6 +114,7 @@ test('previously fulfilled sibling remains fulfilled after status lookup failure
   const fulfilled = [];
   const http = async (url, opts = {}) => {
     const path = new URL(url).pathname;
+    if (path === '/api/v1/libraries/1/books') return reply({ items: [bookCard(321)], total: 1 });
     if (path.endsWith('/req-pending')) return reply({ id: 'req-pending', status: 'approved' });
     if (path.includes('/admin/book-requests/') && path.endsWith('/fulfill')) {
       fulfilled.push(path);

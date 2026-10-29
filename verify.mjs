@@ -1,5 +1,5 @@
 /**
- * BookOrbit ↔ Shelfmark acceptance and regression verification, v1.5.10.
+ * BookOrbit ↔ Shelfmark acceptance and regression verification, v1.5.11.
  *
  * EXTERNAL ORACLES — NOT AN IMPLEMENTATION-DERIVED TEST PLAN:
  *   - BookOrbit v3.5.0 API/host contracts and request behavior.
@@ -15,7 +15,7 @@
  *
  * Place at repository ROOT as verify.mjs, then run:
  *   node verify.mjs                # acceptance tests while developing
- *   node verify.mjs --release      # additionally require signed v1.5.10 release
+ *   node verify.mjs --release      # additionally require signed v1.5.11 release
  *
  * A 404 for an unknown route is intentional. NEVER add a made-up endpoint
  * to the allowlist just to make a test green. Verify an API contract first.
@@ -53,7 +53,7 @@ import {
 } from './bridge/bridge.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
-const EXPECTED_VERSION = '1.5.10';
+const EXPECTED_VERSION = '1.5.11';
 const RELEASE_MODE = process.argv.includes('--release');
 const TEST_TIMEOUT_MS = 10_000;
 const tests = [];
@@ -210,8 +210,17 @@ function request(id, title, author, extra = {}) {
     requesterUserId: `user-${id}`, createdAt: '2026-10-29T00:00:00.000Z', ...extra };
 }
 function apiScenarios({ requests = [], details = {}, books = [], releases = [], taskId = unique('task'),
-  onPost = () => {}, onUpload = () => ({ id: 901 }), onFulfill = () => ({ status: 'AVAILABLE' }),
+  libraryBooks,
+  onPost = () => {}, onUpload, onFulfill,
   onMetadata, onReleases, ...handlers } = {}) {
+  const libraryCards = Array.isArray(libraryBooks) ? [...libraryBooks] : [];
+  const rawUpload = handlers['bo.upload'] ?? onUpload ?? (() => ({ id: 901 }));
+  delete handlers['bo.upload'];
+  const rawLibraryBooks = handlers['bo.libraryBooks'] ?? libraryBooks;
+  delete handlers['bo.libraryBooks'];
+  const rawFulfill = handlers['bo.fulfill'] ?? onFulfill ?? (() => ({ status: 'AVAILABLE' }));
+  delete handlers['bo.fulfill'];
+
   return contractFetch({
     'bo.requests': () => response({ items: requests, total: requests.length, page: 1, limit: 50 }),
     'bo.request': ({ path }) => {
@@ -219,9 +228,53 @@ function apiScenarios({ requests = [], details = {}, books = [], releases = [], 
       const item = details[id] ?? requests.find((r) => String(r.id) === id);
       return item ? response(item) : failResponse(404, 'Request not found');
     },
-    'bo.upload': (entry) => { onPost(entry); return response(onUpload(entry)); },
-    'bo.libraryBooks': () => response({ items: [], total: 0 }),
-    'bo.fulfill': (entry) => { onPost(entry); return response(onFulfill(entry)); },
+    'bo.upload': async (entry) => {
+      onPost(entry);
+      const res = typeof rawUpload === 'function' ? await rawUpload(entry) : rawUpload;
+      if (res instanceof Response) {
+        if (res.ok) {
+          try {
+            const data = await res.clone().json();
+            const upId = parsePositiveInt(data?.id ?? data?.bookId);
+            if (upId && !libraryCards.some((c) => parsePositiveInt(c?.id ?? c?.bookId) === upId)) {
+              libraryCards.push({
+                id: upId,
+                title: data?.title ?? data?.existingBook?.title ?? requests[0]?.title ?? 'A Tale of Two Cities',
+                author: data?.author ?? data?.existingBook?.author ?? requests[0]?.author ?? 'Charles Dickens',
+                year: data?.year ?? data?.existingBook?.year ?? requests[0]?.year ?? 1859,
+                format: 'epub',
+              });
+            }
+          } catch {}
+        }
+        return res;
+      }
+      const upId = parsePositiveInt(res?.id ?? res?.bookId);
+      if (upId && !libraryCards.some((c) => parsePositiveInt(c?.id ?? c?.bookId) === upId)) {
+        libraryCards.push({
+          id: upId,
+          title: res?.title ?? res?.existingBook?.title ?? requests[0]?.title ?? 'A Tale of Two Cities',
+          author: res?.author ?? res?.existingBook?.author ?? requests[0]?.author ?? 'Charles Dickens',
+          year: res?.year ?? res?.existingBook?.year ?? requests[0]?.year ?? 1859,
+          format: 'epub',
+        });
+      }
+      return response(res);
+    },
+    'bo.libraryBooks': async (entry) => {
+      if (rawLibraryBooks !== undefined) {
+        const res = typeof rawLibraryBooks === 'function' ? await rawLibraryBooks(entry) : rawLibraryBooks;
+        if (res instanceof Response) return res;
+        const cards = Array.isArray(res) ? res : (res?.items || []);
+        return response({ items: cards, total: Number(res?.total ?? cards.length) });
+      }
+      return response({ items: libraryCards, total: libraryCards.length });
+    },
+    'bo.fulfill': (entry) => {
+      onPost(entry);
+      const res = typeof rawFulfill === 'function' ? rawFulfill(entry) : rawFulfill;
+      return res instanceof Response ? res : response(res);
+    },
     'sm.metadata': (entry) => response(onMetadata ? onMetadata(entry) : { books }),
     'sm.releases': (entry) => response(onReleases ? onReleases(entry) : releases),
     'sm.status': () => response({ complete: {}, downloading: {}, queued: {}, error: {} }),
@@ -319,7 +372,7 @@ test('DECLARATION: BookOrbit API v1, Shelfmark indexer and ebook-only', () => {
   assert.equal(plugin.type, 'shelfmark');
   assert.deepEqual(plugin.mediaKinds, ['ebook']);
 });
-test('DECLARATION: native indexer advertises v1.5.10, never a previous version', () => {
+test('DECLARATION: native indexer advertises v1.5.11, never a previous version', () => {
   assert.equal(plugin.version, EXPECTED_VERSION);
 });
 test('DECLARATION: exposes search, test, and resolveFile entry points', () => {
@@ -345,7 +398,7 @@ test('RELEASE CONTRACT: package version, plugin version and release target agree
   assert.equal(plugin.version, EXPECTED_VERSION);
 });
 if (RELEASE_MODE) {
-  test('RELEASE: signed manifest has declared format and v1.5.10 version', () => {
+  test('RELEASE: signed manifest has declared format and v1.5.11 version', () => {
     const manifest = JSON.parse(readFileSync(join(HERE, 'updates', 'shelfmark.json'), 'utf8'));
     assert.equal(manifest.schemaVersion, 1);
     assert.equal(manifest.type, 'shelfmark');
@@ -1907,6 +1960,7 @@ test('FULFILL: persisted matchedBookId prevents another upload after process res
   assert.equal(first.state.tasks[task.taskId].matchedBookId, 502);
   const second = new BridgeService(bridgeOpts({ stateFilePath }));
   const successful = apiScenarios({ requests: [request('restart-fulfill-1', task.title, task.author)],
+    libraryBooks: [{ id: 502, title: task.title, author: task.author, year: 1859, isbn: '9780141439600', format: task.format }],
     'bo.upload': failResponse(500, 'duplicate upload forbidden'),
     'bo.fulfill': { id: 'restart-fulfill-1', status: 'AVAILABLE' },
   });
@@ -1996,6 +2050,181 @@ test('FULFILL: service API secret and fake user credentials never appear in erro
   const outcome = await bridge.fulfillBookOrbitRequests(task, fake.fetch);
   noSecrets(JSON.stringify(outcome), key);
   noSecrets(JSON.stringify(bridge.state.tasks[task.taskId].error || ''), key);
+});
+
+test('STALE BOOK: deleting an imported book and requesting it again safely invalidates stale ID and re-imports from verified file', async () => {
+  const bridge = new BridgeService(bridgeOpts());
+  const task = createTask(bridge, {
+    title: 'Fahrenheit 451',
+    author: 'Ray Bradbury',
+    year: 1953,
+    isbn: '9781451673319',
+    format: 'epub',
+    filePath: FILES.fahrenheitEpub,
+    requestIds: ['req-first'],
+  });
+
+  // Step 1: Initial request fulfilled with book ID 1001
+  let libraryCards = [];
+  let uploadCount = 0;
+  const fake1 = apiScenarios({
+    requests: [request('req-first', task.title, task.author, { year: 1953, isbn: '9781451673319' })],
+    'bo.upload': () => {
+      uploadCount++;
+      const id = 1001;
+      libraryCards.push({ id, title: task.title, author: task.author, year: 1953, isbn: '9781451673319', format: 'epub' });
+      return { id };
+    },
+    'bo.libraryBooks': () => response({ items: libraryCards, total: libraryCards.length }),
+    'bo.fulfill': { id: 'req-first', status: 'AVAILABLE' },
+  });
+
+  const res1 = await bridge.fulfillBookOrbitRequests(task, fake1.fetch);
+  assert.equal(res1.fulfilled, true);
+  assert.equal(task.matchedBookId, 1001);
+  assert.equal(task.status, 'fulfilled');
+  assert.equal(task.requestFulfillments['req-first'].fulfilled, true);
+  assert.equal(uploadCount, 1);
+
+  // Step 2: Book 1001 is deleted from BookOrbit library
+  libraryCards = []; // definitively deleted!
+
+  // Step 3: Same book requested again (new request req-second)
+  task.requestIds.push('req-second');
+  const fake2 = apiScenarios({
+    requests: [
+      request('req-first', task.title, task.author, { year: 1953, isbn: '9781451673319', status: 'fulfilled' }),
+      request('req-second', task.title, task.author, { year: 1953, isbn: '9781451673319', status: 'approved' }),
+    ],
+    'bo.upload': () => {
+      uploadCount++;
+      const id = 1002;
+      libraryCards.push({ id, title: task.title, author: task.author, year: 1953, isbn: '9781451673319', format: 'epub' });
+      return { id };
+    },
+    'bo.libraryBooks': () => response({ items: libraryCards, total: libraryCards.length }),
+    'bo.fulfill': ({ path }) => {
+      const reqId = decodeURIComponent(path.split('/').at(-2));
+      return response({ id: reqId, status: 'AVAILABLE' });
+    },
+  });
+
+  const res2 = await bridge.fulfillBookOrbitRequests(task, fake2.fetch);
+  assert.equal(res2.fulfilled, true);
+  // Stale ID 1001 was invalidated and replaced with new import ID 1002
+  assert.equal(task.matchedBookId, 1002);
+  assert.equal(task.status, 'fulfilled');
+  // Re-imported from verified file: uploadCount is now 2
+  assert.equal(uploadCount, 2);
+  // Historical fulfilled request req-first was preserved and NOT changed
+  assert.equal(task.requestFulfillments['req-first'].fulfilled, true);
+  // New request req-second was fulfilled
+  assert.equal(task.requestFulfillments['req-second'].fulfilled, true);
+});
+
+test('STALE BOOK: API outage during library verification fails closed without duplicate upload or losing matchedBookId', async () => {
+  const bridge = new BridgeService(bridgeOpts());
+  const task = createTask(bridge, {
+    title: 'Nineteen Eighty-Four',
+    author: 'George Orwell',
+    year: 1949,
+    format: 'epub',
+    filePath: FILES.validEpub,
+    matchedBookId: 1001,
+    requestIds: ['req-outage'],
+  });
+
+  let uploadAttempts = 0;
+  const fakeOutage = apiScenarios({
+    requests: [request('req-outage', task.title, task.author, { year: 1949 })],
+    'bo.libraryBooks': failResponse(503, 'Library index service unavailable'),
+    'bo.upload': () => { uploadAttempts++; return response({ id: 9999 }); },
+    'bo.fulfill': { status: 'AVAILABLE' },
+  });
+
+  const res = await bridge.fulfillBookOrbitRequests(task, fakeOutage.fetch);
+  assert.equal(res.fulfilled, false);
+  // Failed closed: did NOT upload duplicate
+  assert.equal(uploadAttempts, 0);
+  // Did NOT invalidate matchedBookId on transient outage
+  assert.equal(task.matchedBookId, 1001);
+});
+
+test('FULFILL: HTTP 400 "That book no longer exists" is classified as inaccessible_book, never invalid_request_state', async () => {
+  const bridge = new BridgeService(bridgeOpts());
+  const task = createTask(bridge, {
+    title: 'Nineteen Eighty-Four',
+    author: 'George Orwell',
+    year: 1949,
+    format: 'epub',
+    filePath: FILES.validEpub,
+    matchedBookId: 2001,
+    requestIds: ['req-stale-fulfill'],
+  });
+
+  const fake = apiScenarios({
+    requests: [request('req-stale-fulfill', task.title, task.author, { year: 1949 })],
+    libraryBooks: [{ id: 2001, title: task.title, author: task.author, year: 1949, format: 'epub' }],
+    'bo.fulfill': failResponse(400, '{"statusCode": 400, "message": "That book no longer exists"}'),
+  });
+
+  await bridge.fulfillBookOrbitRequests(task, fake.fetch);
+  const fulfillment = task.requestFulfillments['req-stale-fulfill'];
+  assert.ok(fulfillment);
+  assert.equal(fulfillment.fulfilled, false);
+  assert.equal(fulfillment.errorType, 'inaccessible_book');
+  assert.notEqual(fulfillment.errorType, 'invalid_request_state');
+  // Stale matchedBookId invalidated upon BookOrbit definitive report
+  assert.equal(task.matchedBookId, null);
+});
+
+test('STALE BOOK: queueRelease adopting task with deleted book invalidates matchedBookId and reports reused: false', async () => {
+  const bridge = new BridgeService(bridgeOpts());
+  const taskId = unique('task-adopted-deleted');
+  const releaseKey = 'annas:adopted-del-1';
+  bridge.state.releases[releaseKey] = taskId;
+  bridge.state.tasks[taskId] = {
+    taskId,
+    releaseKey,
+    title: 'Frankenstein',
+    author: 'Mary Shelley',
+    year: 1818,
+    format: 'epub',
+    status: 'completed',
+    filePath: FILES.validEpub,
+    matchedBookId: 3001,
+    libraryId: 1,
+    folderId: 1,
+    requestIds: ['hist-req-1'],
+    userIds: ['user-1'],
+    requestFulfillments: { 'hist-req-1': { fulfilled: true, status: 200 } },
+  };
+
+  const fake = apiScenarios({
+    requests: [
+      request('hist-req-1', 'Frankenstein', 'Mary Shelley', { status: 'fulfilled' }),
+      request('new-req-2', 'Frankenstein', 'Mary Shelley', { status: 'approved' }),
+    ],
+    'bo.libraryBooks': () => response({ items: [], total: 0 }),
+    'bo.upload': () => response({ id: 3002 }),
+    'bo.fulfill': { status: 'AVAILABLE' },
+  });
+
+  const cand = {
+    source: 'annas',
+    sourceId: 'adopted-del-1',
+    title: 'Frankenstein',
+    author: 'Mary Shelley',
+    year: 1818,
+    format: 'epub',
+    guid: JSON.stringify({ source: 'annas', source_id: 'adopted-del-1', title: 'Frankenstein', author: 'Mary Shelley', year: 1818, format: 'epub' }),
+  };
+
+  const res = await bridge.queueRelease({ requestId: 'new-req-2', userId: 'user-2', release: cand, fetchFn: fake.fetch });
+  assert.equal(res.status, 'completed');
+  assert.equal(res.reused, false, 'Stale book ID must not be reported as reused');
+  assert.equal(bridge.state.tasks[taskId].matchedBookId, null);
+  assert.equal(bridge.state.tasks[taskId].requestFulfillments['hist-req-1'].fulfilled, true);
 });
 
 // ─────────────────────────────────────────────────────────────────────────────

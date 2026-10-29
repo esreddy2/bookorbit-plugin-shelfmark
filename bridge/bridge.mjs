@@ -1697,7 +1697,24 @@ export class BridgeService {
       if ((existing.status === 'completed' || existing.status === 'fulfilled') && existing.filePath) {
         const verify = this.verifyFile(existing.filePath, existing.format);
         if (verify.ok) {
-          if (existing.matchedBookId && this.bookorbitUrl) {
+          const targetLibId = parsePositiveInt(existing.libraryId ?? this.defaultLibraryId);
+          if (existing.matchedBookId && targetLibId && this.bookorbitUrl) {
+            const authHeaders = await this.getAuthHeaders();
+            const bookStatus = await this.verifyBookInLibrary(existing, targetLibId, existing.matchedBookId, authHeaders, fetchFn);
+            if (bookStatus === 'deleted') {
+              console.warn(`[Bridge] Book ${existing.matchedBookId} on adopted task ${existingTaskId} was definitively deleted; invalidating stale mapping.`);
+              existing.matchedBookId = null;
+              existing.dockFileId = null;
+              delete existing.uploadBaselineChecked;
+              delete existing.uploadBaselineIds;
+              delete existing.uncertainUpload;
+              if (existing.status === 'fulfilled' || existing.status === 'imported') {
+                existing.status = 'completed';
+              }
+              this.saveState();
+            }
+          }
+          if (this.bookorbitUrl) {
             this.fulfillBookOrbitRequests(existing, fetchFn).catch((err) => {
               console.warn(`[Bridge] Fulfillment error on adopted task ${existingTaskId}: ${sanitizeLog(err.message)}`);
             });
@@ -1706,7 +1723,7 @@ export class BridgeService {
             status: 'completed',
             taskId: existingTaskId,
             filePath: existing.filePath,
-            reused: true,
+            reused: Boolean(existing.matchedBookId),
           };
         }
       }
@@ -1921,6 +1938,26 @@ export class BridgeService {
       this.saveState();
 
       if (existing.matchedBookId && this.bookorbitUrl) {
+        const targetLibId = parsePositiveInt(existing.libraryId ?? this.defaultLibraryId);
+        if (targetLibId) {
+          const authHeaders = await this.getAuthHeaders();
+          const bookStatus = await this.verifyBookInLibrary(existing, targetLibId, existing.matchedBookId, authHeaders, fetchFn);
+          if (bookStatus === 'deleted') {
+            console.warn(`[Bridge] Book ${existing.matchedBookId} on adopted task ${taskId} was definitively deleted; invalidating stale mapping.`);
+            existing.matchedBookId = null;
+            existing.dockFileId = null;
+            delete existing.uploadBaselineChecked;
+            delete existing.uploadBaselineIds;
+            delete existing.uncertainUpload;
+            if (existing.status === 'fulfilled' || existing.status === 'imported') {
+              existing.status = 'completed';
+            }
+            this.saveState();
+          }
+        }
+      }
+
+      if (this.bookorbitUrl && (existing.status === 'completed' || existing.status === 'fulfilled' || existing.status === 'imported') && existing.filePath) {
         this.fulfillBookOrbitRequests(existing, fetchFn).catch((err) => {
           console.warn(`[Bridge] Fulfillment error on adopted task ${taskId}: ${sanitizeLog(err.message)}`);
         });
@@ -2108,6 +2145,70 @@ export class BridgeService {
       fulfilled: fulfillResult?.fulfilled || false,
       error: fulfillResult?.error || null,
     };
+  }
+
+  async getAuthHeaders() {
+    let token = '';
+    try { token = await this.authManager.getValidToken(); } catch {}
+    token = token || this.bookorbitToken || this.bookorbitApiKey;
+    return {
+      ...(token && isJwt(token) ? { 'Authorization': `Bearer ${token}` } : {}),
+      ...(this.bookorbitApiKey ? { 'X-Api-Key': this.bookorbitApiKey } : {}),
+    };
+  }
+
+  /**
+   * Verifies that a specific bookId still exists in the target BookOrbit library
+   * and that its edition remains compatible.
+   *
+   * Returns:
+   *   'exists'  - Authoritatively found in library and edition is compatible
+   *   'deleted' - Authoritative query succeeded but bookId is missing from library
+   *   'unknown' - Outage / auth failure / network error / ambiguous query (fail closed)
+   */
+  async verifyBookInLibrary(task, targetLibraryId, bookId, headers, fetchFn = globalThis.fetch) {
+    const bId = parsePositiveInt(bookId);
+    if (!bId) return 'deleted';
+    const libId = parsePositiveInt(targetLibraryId);
+    if (!libId) return 'unknown';
+
+    const authHeaders = headers || await this.getAuthHeaders();
+    const cards = await this.listAuthoritativeBookOrbitBooks(task, libId, authHeaders, fetchFn);
+    if (cards === null) {
+      // Outage, auth failure, or ambiguous query: fail closed!
+      return 'unknown';
+    }
+
+    const foundCard = cards.find((c) => parsePositiveInt(c?.id ?? c?.bookId) === bId);
+    if (!foundCard) {
+      // Authoritative list of books for this title does not contain this bookId: definitively deleted!
+      return 'deleted';
+    }
+
+    // Book found; verify edition compatibility
+    const expectedAuthor = String(task?.author || (Array.isArray(task?.authors) ? task.authors[0] : '') || '').trim();
+    const authors = Array.isArray(foundCard.authors) ? foundCard.authors : [];
+    const author = typeof foundCard.author === 'string' && foundCard.author.trim()
+      ? foundCard.author : (typeof authors[0] === 'string' ? authors[0] : authors[0]?.name || '');
+    const formats = Array.isArray(foundCard.formats)
+      ? foundCard.formats.map((f) => typeof f === 'string' ? f.toLowerCase() : String(f?.format || '').toLowerCase()) : [];
+    const wantedFormat = String(task?.format || '').toLowerCase();
+    const primaryFormat = String(foundCard.primaryFormat || foundCard.format || '').toLowerCase();
+
+    const book = {
+      ...foundCard,
+      id: bId,
+      author: String(author).trim(),
+      year: foundCard.year || foundCard.publishedYear || foundCard.publicationYear || null,
+      isbn: foundCard.isbn13 || foundCard.isbn || null,
+      format: wantedFormat && formats.includes(wantedFormat) ? wantedFormat : primaryFormat,
+    };
+
+    if (expectedAuthor && book.author && !areEditionsCompatible({ ...task, author: expectedAuthor }, book)) {
+      return 'deleted';
+    }
+
+    return 'exists';
   }
 
   /**
@@ -2556,6 +2657,34 @@ export class BridgeService {
       this.setRequestProgress(rid, 'importing', { reason: 'importing' });
     }
 
+    const rawLibraryId = task.libraryId ?? this.defaultLibraryId;
+    const rawFolderId = task.folderId ?? this.defaultFolderId;
+    const targetLibraryId = parsePositiveInt(rawLibraryId);
+    const targetFolderId = parsePositiveInt(rawFolderId);
+
+    // Verify existing matchedBookId is still in the correct BookOrbit library
+    if (matchedBookId && targetLibraryId && boUrl) {
+      const bookStatus = await this.verifyBookInLibrary(task, targetLibraryId, matchedBookId, headers, fetchFn);
+      if (bookStatus === 'deleted') {
+        console.warn(`[Bridge] Book ${matchedBookId} was definitively deleted from BookOrbit library ${targetLibraryId}; invalidating stale mapping.`);
+        matchedBookId = null;
+        task.matchedBookId = null;
+        task.dockFileId = null;
+        delete task.uploadBaselineChecked;
+        delete task.uploadBaselineIds;
+        delete task.uncertainUpload;
+        if (task.status === 'fulfilled' || task.status === 'imported') {
+          task.status = 'completed';
+        }
+        this.saveState();
+      } else if (bookStatus === 'unknown') {
+        console.warn(`[Bridge] BookOrbit library check unavailable for book ${matchedBookId}; failing closed without re-uploading.`);
+        task.error = 'BookOrbit library verification unavailable';
+        this.saveState();
+        return { fulfilled: false, bookId: matchedBookId, error: task.error };
+      }
+    }
+
     // Step 1: Import file into Library if not already uploaded/matched
     if (!matchedBookId) {
       if (!task.filePath) {
@@ -2564,12 +2693,6 @@ export class BridgeService {
         this.saveState();
         return { fulfilled: false, error: task.error };
       }
-
-      const rawLibraryId = task.libraryId ?? this.defaultLibraryId;
-      const rawFolderId = task.folderId ?? this.defaultFolderId;
-
-      const targetLibraryId = parsePositiveInt(rawLibraryId);
-      const targetFolderId = parsePositiveInt(rawFolderId);
 
       // Reconcile uncertain upload state: check authoritative BookOrbit library before re-uploading
       if (task.status === 'uncertain_upload' || task.uncertainUpload) {
@@ -2738,6 +2861,18 @@ export class BridgeService {
         } else if (fulfillRes.status === 400) {
           const errText = await fulfillRes.text().catch(() => '');
           const sanitizedErr = sanitizeLog(errText);
+          let parsedMsg = '';
+          try {
+            const parsed = JSON.parse(errText);
+            parsedMsg = String(parsed.message || parsed.error || '').toLowerCase();
+          } catch {}
+          const lowerErr = errText.toLowerCase();
+          const isBookMissing = lowerErr.includes('no longer exists') ||
+            lowerErr.includes('book does not exist') ||
+            lowerErr.includes('book not found') ||
+            parsedMsg.includes('no longer exists') ||
+            parsedMsg.includes('book does not exist');
+
           if (errText.includes('already fulfilled') || errText.includes('already AVAILABLE')) {
             task.requestFulfillments[reqId] = {
               fulfilled: true,
@@ -2746,7 +2881,29 @@ export class BridgeService {
               fulfilledAt: new Date().toISOString(),
             };
             fulfilledCount++;
-          } else if (errText.includes('status') || errText.includes('invalid state') || errText.includes('not in approved state')) {
+          } else if (isBookMissing) {
+            task.requestFulfillments[reqId] = {
+              fulfilled: false,
+              status: 400,
+              errorType: 'inaccessible_book',
+              error: sanitizedErr,
+            };
+            task.matchedBookId = null;
+            task.dockFileId = null;
+            delete task.uploadBaselineChecked;
+            delete task.uploadBaselineIds;
+            delete task.uncertainUpload;
+            if (task.status === 'fulfilled' || task.status === 'imported') {
+              task.status = 'completed';
+            }
+            console.warn(`[Bridge] Request ${reqId} fulfillment rejected (book no longer exists): ${sanitizedErr}`);
+          } else if (
+            lowerErr.includes('request status') ||
+            lowerErr.includes('invalid state') ||
+            lowerErr.includes('not in approved state') ||
+            lowerErr.includes('not approved') ||
+            lowerErr.includes('invalid request state')
+          ) {
             task.requestFulfillments[reqId] = {
               fulfilled: false,
               status: 400,
