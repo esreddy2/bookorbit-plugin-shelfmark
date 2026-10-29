@@ -40,7 +40,7 @@
  *
  * 8. Real BookOrbit v3.5.0 Book Dock & Fulfillment:
  *    - Ingests file via BookDockController (`POST /api/v1/book-dock/upload`).
- *    - Awaits genuine finalizable state (`ready_to_file`) or adopts already-`filed` files.
+ *    - Awaits genuine finalizable state (`ready`) or adopts already-`filed` files.
  *    - Finalizes into library requiring both library and destination folder.
  *    - Strictly checks `results[].success === true` and valid positive `bookId`.
  *    - Fulfills via BookRequestAdminController (`POST /api/v1/admin/book-requests/:id/fulfill`).
@@ -54,6 +54,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import zlib from 'node:zlib';
+import { fileURLToPath } from 'node:url';
 
 import plugin from '../index.mjs';
 
@@ -105,11 +106,13 @@ export function extractEpubMetadata(buffer) {
                             opfText.match(/<dc:identifier[^>]*scheme=["']ISBN["'][^>]*>.*?([0-9X-]{10,17}).*?<\/dc:identifier>/i) ||
                             opfText.match(/<dc:identifier[^>]*>.*?([0-9X-]{10,17}).*?<\/dc:identifier>/i);
 
+          const rawYear = dateMatch ? parseInt(dateMatch[1], 10) : null;
+          const rawIsbn = isbnMatch ? isbnMatch[1].replace(/[^0-9X]/gi, '') : null;
           return {
             title: titleMatch ? titleMatch[1].trim() : null,
             author: authorMatch ? authorMatch[1].trim() : null,
-            year: dateMatch ? parseInt(dateMatch[1], 10) : null,
-            isbn: isbnMatch ? isbnMatch[1].replace(/[^0-9X]/gi, '') : null,
+            year: Number.isFinite(rawYear) ? rawYear : null,
+            isbn: rawIsbn && rawIsbn.length > 0 ? rawIsbn : null,
           };
         }
       }
@@ -176,29 +179,48 @@ export function decodeJwtExp(token) {
  * Retains each original task ID from the object key or element.
  */
 export function normalizeTaskGroup(group) {
-  if (!group || typeof group !== 'object') {
+  if (group === null || group === undefined) {
     return [];
   }
   if (Array.isArray(group)) {
     return group.map((item) => {
       if (!item || typeof item !== 'object') return item;
-      const id = item.id || item.task_id;
+      const id = item.id ?? item.taskId ?? item.task_id ?? item.taskID;
       return {
         ...item,
         id,
-        task_id: item.task_id || id,
+        taskId: item.taskId ?? id,
+        task_id: item.task_id ?? id,
       };
     });
   }
+  if (typeof group !== 'object') {
+    return [];
+  }
+  // Support wrappers such as { tasks: [...] } or { items: [...] }.
+  if (Array.isArray(group.tasks)) return normalizeTaskGroup(group.tasks);
+  if (Array.isArray(group.items)) return normalizeTaskGroup(group.items);
+  if (Array.isArray(group.results)) return normalizeTaskGroup(group.results);
+  // Support a single task object passed directly.
+  if (group.id !== undefined || group.task_id !== undefined || group.taskId !== undefined || group.title !== undefined) {
+    const id = group.id ?? group.taskId ?? group.task_id;
+    return [{
+      ...group,
+      id,
+      taskId: group.taskId ?? id,
+      task_id: group.task_id ?? id,
+    }];
+  }
   return Object.entries(group).map(([key, val]) => {
     if (!val || typeof val !== 'object') {
-      return { id: key, task_id: key };
+      return { id: key, taskId: key, task_id: key };
     }
-    const id = val.id || val.task_id || key;
+    const id = val.id ?? val.taskId ?? val.task_id ?? key;
     return {
       ...val,
       id,
-      task_id: val.task_id || id,
+      taskId: val.taskId ?? id,
+      task_id: val.task_id ?? id,
     };
   });
 }
@@ -212,11 +234,25 @@ export function parseShelfmarkStatus(statusJson) {
   if (!statusJson || typeof statusJson !== 'object') {
     return { complete: [], downloading: [], queued: [], error: [] };
   }
+  const resolving = normalizeTaskGroup(statusJson.resolving || statusJson.resolvingTasks || statusJson.resolving_tasks);
+  const locating = normalizeTaskGroup(statusJson.locating || statusJson.locatingTasks || statusJson.locating_tasks);
+  const cancelled = normalizeTaskGroup(statusJson.cancelled || statusJson.canceled || statusJson.cancelledTasks || statusJson.cancelled_tasks);
+  const active = normalizeTaskGroup(statusJson.active || statusJson.activeTasks || statusJson.active_tasks);
+  const completed = normalizeTaskGroup(statusJson.completed || statusJson.completedTasks || statusJson.completed_tasks);
+  const failed = normalizeTaskGroup(statusJson.failed || statusJson.failedTasks || statusJson.failed_tasks);
+  const pending = normalizeTaskGroup(statusJson.pending || statusJson.pendingTasks || statusJson.pending_tasks);
   return {
-    complete: normalizeTaskGroup(statusJson.complete || statusJson.completed_tasks),
-    downloading: normalizeTaskGroup(statusJson.downloading || statusJson.active_tasks),
-    queued: normalizeTaskGroup(statusJson.queued || statusJson.queued_tasks),
-    error: normalizeTaskGroup(statusJson.error || statusJson.failed_tasks),
+    complete: [...normalizeTaskGroup(statusJson.complete || statusJson.completeTasks || statusJson.completed_tasks), ...completed],
+    downloading: [...normalizeTaskGroup(statusJson.downloading || statusJson.downloadingTasks || statusJson.active_tasks), ...active, ...resolving, ...locating],
+    queued: [...normalizeTaskGroup(statusJson.queued || statusJson.queuedTasks || statusJson.queued_tasks), ...pending],
+    error: [...normalizeTaskGroup(statusJson.error || statusJson.errorTasks || statusJson.failed_tasks), ...failed],
+    resolving,
+    locating,
+    cancelled,
+    active,
+    completed,
+    failed,
+    pending,
   };
 }
 
@@ -414,6 +450,7 @@ export class BookOrbitAuthManager {
     this.expiresAt = options.expiresAt || (this.token ? decodeJwtExp(this.token) : null);
     this.refreshBufferMs = options.refreshBufferMs || 5 * 60 * 1000; // Refresh 5m before expiry
     this.fetchFn = options.fetchFn || globalThis.fetch;
+    this._authLock = null;
   }
 
   isTokenExpired() {
@@ -421,21 +458,31 @@ export class BookOrbitAuthManager {
     if (!this.expiresAt) {
       this.expiresAt = decodeJwtExp(this.token);
     }
-    if (!this.expiresAt) return false;
+    if (!this.expiresAt) return true;
     return Date.now() >= (this.expiresAt - this.refreshBufferMs);
   }
 
   async login() {
+    while (this._authLock) await this._authLock;
+    let __resolveLock;
+    this._authLock = new Promise((r) => { __resolveLock = r; });
+    try {
     if (!this.username || !this.password) {
-      if (this.token && isJwt(this.token)) {
+      if (this.token) {
         return this.token;
       }
-      throw new Error('BookOrbit credentials missing: provide BOOKORBIT_USERNAME and BOOKORBIT_PASSWORD or BOOKORBIT_TOKEN');
+      if (this.apiKey) {
+        this.token = this.apiKey;
+        return this.token;
+      }
+      throw new Error('BookOrbit credentials missing: provide BOOKORBIT_USERNAME and BOOKORBIT_PASSWORD or BOOKORBIT_TOKEN or BOOKORBIT_API_KEY');
     }
 
-    const payload = this.username.includes('@')
-      ? { email: this.username, password: this.password }
-      : { username: this.username, password: this.password };
+    const payload = {
+      username: this.username,
+      password: this.password,
+      clientKind: 'native',
+    };
 
     const res = await this.fetchFn(`${this.baseUrl}/api/v1/auth/login`, {
       method: 'POST',
@@ -445,7 +492,7 @@ export class BookOrbitAuthManager {
 
     if (!res.ok) {
       const errText = await res.text().catch(() => '');
-      throw new Error(`BookOrbit login failed (HTTP ${res.status}): ${errText}`);
+      throw new Error(`BookOrbit login failed (HTTP ${res.status})`);
     }
 
     const data = await res.json().catch(() => ({}));
@@ -456,29 +503,36 @@ export class BookOrbitAuthManager {
 
     this.token = newToken;
     this.refreshToken = data.refreshToken || this.refreshToken;
-    this.expiresAt = data.expiresAt ? new Date(data.expiresAt).getTime() : decodeJwtExp(newToken);
+    this.expiresAt = (data.accessTokenExpiresAt || data.expiresAt) ? new Date(data.accessTokenExpiresAt || data.expiresAt).getTime() : decodeJwtExp(newToken);
     return this.token;
+    } finally {
+      this._authLock = null;
+      if (__resolveLock) __resolveLock();
+    }
   }
 
   async refreshSession() {
+    while (this._authLock) await this._authLock;
+    let __resolveLock;
+    this._authLock = new Promise((r) => { __resolveLock = r; });
+    try {
     if (this.refreshToken) {
       try {
         const res = await this.fetchFn(`${this.baseUrl}/api/v1/auth/refresh`, {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',
-            ...(this.token ? { 'Authorization': `Bearer ${this.token}` } : {}),
           },
           body: JSON.stringify({ refreshToken: this.refreshToken }),
         });
 
         if (res.ok) {
           const data = await res.json().catch(() => ({}));
-          const newToken = data.token || data.accessToken;
+          const newToken = data.token || data.accessToken || data.jwt;
           if (newToken) {
             this.token = newToken;
             this.refreshToken = data.refreshToken || this.refreshToken;
-            this.expiresAt = data.expiresAt ? new Date(data.expiresAt).getTime() : decodeJwtExp(newToken);
+            this.expiresAt = (data.accessTokenExpiresAt || data.expiresAt) ? new Date(data.accessTokenExpiresAt || data.expiresAt).getTime() : decodeJwtExp(newToken);
             return this.token;
           }
         }
@@ -492,6 +546,10 @@ export class BookOrbitAuthManager {
     }
 
     return this.token;
+    } finally {
+      this._authLock = null;
+      if (__resolveLock) __resolveLock();
+    }
   }
 
   async getValidToken() {
@@ -557,9 +615,19 @@ export class BookOrbitSocketClient {
       console.warn('[SocketClient] Notice: Configured token is not in JWT format. BookOrbit gateway requires a session JWT.');
     }
 
-    const wsProto = this.baseUrl.startsWith('https') ? 'wss' : 'ws';
-    const hostPort = this.baseUrl.replace(/^https?:\/\//, '');
-    const wsUrl = `${wsProto}://${hostPort}/socket.io/?EIO=4&transport=websocket`;
+    let wsProto = this.baseUrl.startsWith('https') ? 'wss' : 'ws';
+    let wsHost = this.baseUrl;
+    let wsPathPrefix = '';
+    try {
+      const u = new URL(this.baseUrl);
+      wsProto = u.protocol === 'https:' ? 'wss' : 'ws';
+      wsHost = u.host;
+      wsPathPrefix = u.pathname.replace(/\/+$/, '');
+    } catch {
+      wsProto = this.baseUrl.startsWith('https') ? 'wss' : 'ws';
+      wsHost = this.baseUrl.replace(/^https?:\/\//, '').replace(/\/.*/, '');
+    }
+    const wsUrl = `${wsProto}://${wsHost}${wsPathPrefix}/socket.io/?EIO=4&transport=websocket`;
 
     try {
       this.ws = new WebSocket(wsUrl);
@@ -732,8 +800,8 @@ export class BridgeService {
     this.bookorbitToken = options.bookorbitToken || process.env.BOOKORBIT_TOKEN || '';
     this.shelfmarkUrl = (options.shelfmarkUrl || process.env.SHELFMARK_URL || 'http://localhost:8084').replace(/\/$/, '');
     this.shelfmarkApiKey = options.shelfmarkApiKey || process.env.SHELFMARK_API_KEY || '';
-    this.defaultLibraryId = options.defaultLibraryId !== undefined ? options.defaultLibraryId : (process.env.BOOKORBIT_DEFAULT_LIBRARY_ID ? parseInt(process.env.BOOKORBIT_DEFAULT_LIBRARY_ID, 10) : null);
-    this.defaultFolderId = options.defaultFolderId !== undefined ? options.defaultFolderId : (process.env.BOOKORBIT_DEFAULT_FOLDER_ID ? parseInt(process.env.BOOKORBIT_DEFAULT_FOLDER_ID, 10) : null);
+    this.defaultLibraryId = options.defaultLibraryId !== undefined ? options.defaultLibraryId : parsePositiveInt(process.env.BOOKORBIT_DEFAULT_LIBRARY_ID);
+    this.defaultFolderId = options.defaultFolderId !== undefined ? options.defaultFolderId : parsePositiveInt(process.env.BOOKORBIT_DEFAULT_FOLDER_ID);
     this.dockReadinessAttempts = options.dockReadinessAttempts || 25;
     this.dockReadinessIntervalMs = options.dockReadinessIntervalMs || 100;
     this.reconcileIntervalMs = options.reconcileIntervalMs || 15 * 60 * 1000; // 15 minutes
@@ -742,6 +810,7 @@ export class BridgeService {
     this.fileVisibilityBackoff = options.fileVisibilityBackoff ?? 1.5;
     this.releaseFailureCooldownMs = options.releaseFailureCooldownMs ?? (60 * 60 * 1000); // 1 hour cooldown
     this.maxSourceAttempts = options.maxSourceAttempts ?? 3; // Maximum bounded attempts per request
+    this._fulfillLocks = new Map();
 
     // Path translation & containment
     this.shelfmarkPathPrefix = options.shelfmarkPathPrefix || process.env.SHELFMARK_PATH_PREFIX || '';
@@ -751,6 +820,8 @@ export class BridgeService {
       '/staging',
       '/downloads',
       '/tmp',
+      '/books',
+      '/data',
     ];
 
     // BookOrbit Authentication Session Manager
@@ -785,6 +856,9 @@ export class BridgeService {
     this.reconcileTimer = null;
     this.debounceTimer = null;
     this.isProcessingRequests = false;
+    this.isReconciling = false;
+    this.isInitializingBaseline = false;
+    this.isQueueingRelease = false;
     this.socketClient = null;
 
     this.loadState();
@@ -798,8 +872,15 @@ export class BridgeService {
       if (fs.existsSync(this.stateFilePath)) {
         const raw = fs.readFileSync(this.stateFilePath, 'utf8');
         const parsed = JSON.parse(raw);
+        const loadedTasks = parsed.tasks || {};
+        for (const task of Object.values(loadedTasks)) {
+          if (!Array.isArray(task.requestIds)) task.requestIds = [];
+          if (!Array.isArray(task.userIds)) task.userIds = [];
+          if (!task.requestFulfillments || typeof task.requestFulfillments !== 'object' || Array.isArray(task.requestFulfillments)) task.requestFulfillments = {};
+          if (!task.progress || typeof task.progress !== 'object' || Array.isArray(task.progress)) task.progress = {};
+        }
         this.state = {
-          tasks: parsed.tasks || {},
+          tasks: loadedTasks,
           requests: parsed.requests || {},
           releases: parsed.releases || {},
           baselineRequestIds: parsed.baselineRequestIds || {},
@@ -809,9 +890,9 @@ export class BridgeService {
           requestSourceAttempts: parsed.requestSourceAttempts || {},
           requestAttempts: parsed.requestAttempts || {},
           requestErrors: parsed.requestErrors || {},
-          requestProgress: parsed.requestProgress || parsed.requestStages || parsed.requestStatus || {},
-          requestStages: parsed.requestStages || parsed.requestProgress || parsed.requestStatus || {},
-          requestStatus: parsed.requestStatus || parsed.requestProgress || parsed.requestStages || {},
+          requestProgress: { ...(parsed.requestProgress || {}), ...(parsed.requestStages || {}), ...(parsed.requestStatus || {}) },
+          requestStages: { ...(parsed.requestStages || {}), ...(parsed.requestProgress || {}), ...(parsed.requestStatus || {}) },
+          requestStatus: { ...(parsed.requestStatus || {}), ...(parsed.requestProgress || {}), ...(parsed.requestStages || {}) },
           requestFailureReasons: parsed.requestFailureReasons || {},
         };
       }
@@ -850,6 +931,11 @@ export class BridgeService {
     if (this.state.baselineEstablishedAt) {
       return { established: true, count: Object.keys(this.state.baselineRequestIds || {}).length };
     }
+    if (this.isInitializingBaseline) {
+      return { established: false, count: 0 };
+    }
+    this.isInitializingBaseline = true;
+    try {
 
     console.log('[Bridge] First-run: Establishing baseline of existing historical BookOrbit requests...');
     let token = '';
@@ -859,7 +945,7 @@ export class BridgeService {
     token = token || this.bookorbitToken || this.bookorbitApiKey;
 
     const headers = {
-      ...(token ? { 'Authorization': `Bearer ${token}` } : {}),
+      ...(token && isJwt(token) ? { 'Authorization': `Bearer ${token}` } : {}),
       ...(this.bookorbitApiKey ? { 'X-Api-Key': this.bookorbitApiKey } : {}),
     };
 
@@ -906,8 +992,9 @@ export class BridgeService {
       }
 
       for (const item of items) {
-        if (item && item.id) {
-          collectedIds.push(item.id);
+        const itemId = item?.id ?? item?.requestId ?? item?.request_id ?? item?.taskId ?? item?.task_id;
+        if (itemId !== undefined && itemId !== null) {
+          collectedIds.push(itemId);
           count++;
         }
       }
@@ -944,6 +1031,9 @@ export class BridgeService {
 
     console.log(`[Bridge] First-run baseline established with ${count} existing requests. Historical backlog will not be processed.`);
     return { established: true, count };
+    } finally {
+      this.isInitializingBaseline = false;
+    }
   }
 
   /**
@@ -955,8 +1045,17 @@ export class BridgeService {
     if (rawPath.includes('\0')) return null;
 
     let candidate = rawPath;
-    if (this.shelfmarkPathPrefix && this.localPathPrefix && candidate.startsWith(this.shelfmarkPathPrefix)) {
-      candidate = path.join(this.localPathPrefix, candidate.slice(this.shelfmarkPathPrefix.length));
+    // Only translate absolute Shelfmark container paths; relative inputs are not allowed
+    // because resolving them against the process cwd weakens containment guarantees.
+    if (this.shelfmarkPathPrefix && this.localPathPrefix && path.isAbsolute(candidate)) {
+      const prefix = this.shelfmarkPathPrefix.replace(/\/+$/, '');
+      if (candidate === prefix || candidate.startsWith(prefix + '/') || candidate.startsWith(prefix + path.sep)) {
+        candidate = path.join(this.localPathPrefix, candidate.slice(prefix.length).replace(/^[/\\]/, ''));
+      }
+    }
+
+    if (!path.isAbsolute(candidate)) {
+      return null;
     }
 
     const resolved = path.resolve(candidate);
@@ -975,7 +1074,7 @@ export class BridgeService {
         try {
           canonicalBase = fs.realpathSync(path.resolve(base));
         } catch {
-          canonicalBase = path.resolve(base);
+          return false;
         }
         return real === canonicalBase || real.startsWith(canonicalBase + path.sep);
       });
@@ -1003,7 +1102,7 @@ export class BridgeService {
       } catch {}
     }
     const source = release.source || release.extra?.source;
-    const sourceId = release.sourceId || release.extra?.sourceId || release.id;
+    const sourceId = release.sourceId || release.source_id || release.extra?.sourceId || release.extra?.source_id || release.id;
     if (source && sourceId) {
       return `${source}:${sourceId}`;
     }
@@ -1031,6 +1130,10 @@ export class BridgeService {
       stats = fs.statSync(safePath);
     } catch (err) {
       return { ok: false, notFound: true, error: `Failed to stat file: ${err.message}` };
+    }
+
+    if (stats.isDirectory()) {
+      return { ok: false, notFound: true, error: `Path is a directory, not a file: ${safePath}` };
     }
 
     if (stats.size === 0) {
@@ -1160,21 +1263,69 @@ export class BridgeService {
     this.saveState();
   }
 
-  async isRequestCancelled(reqId, fetchFn = globalThis.fetch) {
-    if (!reqId) return false;
+  async getRequestStatus(reqId, fetchFn = globalThis.fetch) {
+    if (!reqId) return 'unknown';
+    let token = '';
+    try { token = await this.authManager.getValidToken(); } catch {}
+    token = token || this.bookorbitToken || this.bookorbitApiKey;
+    const headers = token ? (isJwt(token) ? { 'Authorization': `Bearer ${token}` } : { 'X-Api-Key': token }) : {};
+
+    // 1. Try BookOrbit v3.5.0's valid individual request endpoint when authorized.
     try {
-      const token = this.bookorbitToken || this.bookorbitApiKey;
-      const headers = token ? { 'Authorization': `Bearer ${token}`, 'X-Api-Key': token } : {};
-      const res = await fetchFn(`${this.bookorbitUrl}/api/v1/admin/book-requests/${reqId}`, { headers });
+      const res = await fetchFn(`${this.bookorbitUrl}/api/v1/book-requests/${encodeURIComponent(reqId)}`, { headers });
       if (res && res.ok) {
         const data = await res.json().catch(() => ({}));
-        const status = String(data.status || data.state || '').toLowerCase();
-        return status === 'cancelled' || status === 'canceled';
+        const status = String(data.status || data.state || data.requestStatus || data.request_status || '').toLowerCase();
+        if (status === 'cancelled' || status === 'canceled') return 'cancelled';
+        if (!status) return 'active';
+        if (['approved', 'active', 'pending', 'searching', 'queued', 'downloading', 'resolving', 'locating', 'grabbed', 'importing', 'needs_review'].includes(status)) return 'active';
+        if (['completed', 'fulfilled', 'available', 'done', 'success'].includes(status)) return 'fulfilled';
+        return status;
       }
     } catch (e) {
-      // Best effort only
+      console.warn(`[Bridge] Individual request lookup failed: ${sanitizeLog(e?.message || e)}`);
+      // Fall through to administrative list fallback
     }
-    return false;
+
+    // 2. Reliable fallback to the administrative list (requires ManageBookRequests).
+    try {
+      let page = 1;
+      const limit = 100;
+      while (page <= 10) {
+        const res = await fetchFn(`${this.bookorbitUrl}/api/v1/admin/book-requests?page=${page}&limit=${limit}`, { headers });
+        if (!res || !res.ok) return 'unknown';
+        const data = await res.json().catch(() => ({}));
+        const items = Array.isArray(data) ? data : (data.items || data.results || data.books || []);
+        const found = items.find((r) => String(r?.id ?? r?.requestId ?? r?.request_id ?? r?.taskId ?? r?.task_id) === String(reqId));
+        if (found) {
+          const status = String(found.status || found.state || found.requestStatus || found.request_status || '').toLowerCase();
+          if (status === 'cancelled' || status === 'canceled') return 'cancelled';
+          if (!status) return 'active';
+          if (['approved', 'active', 'pending', 'searching', 'queued', 'downloading', 'resolving', 'locating', 'grabbed', 'importing', 'needs_review'].includes(status)) return 'active';
+          if (['completed', 'fulfilled', 'available', 'done', 'success'].includes(status)) return 'fulfilled';
+          return status;
+        }
+        if (items.length < limit) break;
+        page++;
+      }
+    } catch (e) {
+      console.warn(`[Bridge] Administrative request lookup failed: ${sanitizeLog(e?.message || e)}`);
+      // Lookup failed; never treat as active
+    }
+    return 'unknown';
+  }
+
+  async isRequestCancelled(reqId, fetchFn = globalThis.fetch) {
+    const status = await this.getRequestStatus(reqId, fetchFn);
+    return status === 'cancelled' || status === 'canceled';
+  }
+
+  async getRequestState(reqId, fetchFn = globalThis.fetch) {
+    return this.getRequestStatus(reqId, fetchFn);
+  }
+
+  async classifyRequestStatus(reqId, fetchFn = globalThis.fetch) {
+    return this.getRequestStatus(reqId, fetchFn);
   }
 
   /**
@@ -1201,7 +1352,7 @@ export class BridgeService {
       token = token || this.bookorbitToken || this.bookorbitApiKey;
 
       const boHeaders = {
-        ...(token ? { 'Authorization': `Bearer ${token}` } : {}),
+        ...(token && isJwt(token) ? { 'Authorization': `Bearer ${token}` } : {}),
         ...(this.bookorbitApiKey ? { 'X-Api-Key': this.bookorbitApiKey } : {}),
       };
 
@@ -1238,7 +1389,8 @@ export class BridgeService {
 
         for (const req of requests) {
           // 1. Skip if part of historical baseline
-          if (this.state.baselineRequestIds && this.state.baselineRequestIds[req.id]) {
+          const reqId = req?.id ?? req?.requestId ?? req?.request_id ?? req?.taskId ?? req?.task_id;
+          if (this.state.baselineRequestIds && this.state.baselineRequestIds[reqId]) {
             continue;
           }
           if (req.createdAt && this.state.baselineEstablishedAt) {
@@ -1262,8 +1414,13 @@ export class BridgeService {
           }
 
           // Cancellation-aware: check request status before queueing/searching
-          if (await this.isRequestCancelled(req.id, fetchFn)) {
+          const requestState = await this.getRequestStatus(req.id, fetchFn);
+          if (requestState === 'cancelled') {
             this.setRequestProgress(req.id, 'cancelled', { reason: 'cancelled' });
+            continue;
+          }
+          if (requestState !== 'active') {
+            this.setRequestProgress(req.id, 'status_unknown', { reason: 'status_unknown' });
             continue;
           }
 
@@ -1282,7 +1439,8 @@ export class BridgeService {
             baseUrl: this.shelfmarkUrl,
             settings: {
               apiKey: this.shelfmarkApiKey,
-              preferFormat: 'epub',
+              preferFormat: process.env.PREFER_FORMAT || 'epub',
+              releaseSource: process.env.RELEASE_SOURCE || 'all',
             },
           };
 
@@ -1297,19 +1455,32 @@ export class BridgeService {
             },
             logger: { log: () => {}, warn: () => {}, error: () => {} },
             buildSearchText: (q) => [q.title, q.author].filter(Boolean).join(' ').trim(),
-            fail: () => {},
+            fail: (code, message) => {
+              const validCodes = ['unauthorized', 'throttled', 'timeout', 'unreachable', 'unsupportedMedium', 'error'];
+              if (!validCodes.includes(code)) {
+                throw new Error(`INVALID_BOOKORBIT_FAILURE_CODE: "${code}" is not supported by BookOrbit!`);
+              }
+              const err = new Error(message);
+              err.code = code;
+              return err;
+            },
           };
 
           let searchResults = [];
           const searchController = new AbortController();
-          const searchTimeout = setTimeout(() => searchController.abort(), 30000);
+          const searchTimeout = setTimeout(() => {
+            const timeoutErr = new Error('Shelfmark search timed out before completion.');
+            timeoutErr.name = 'TimeoutError';
+            searchController.abort(timeoutErr);
+          }, 70000);
           try {
             searchResults = await plugin.search(query, config, host, searchController.signal);
           } catch (err) {
-            console.warn(`[Bridge] Plugin search error for "${query.title}": ${sanitizeLog(err.message)}`);
-            this.setRequestProgress(req.id, 'search_failed', { reason: 'search_failed', error: err.message });
+            const errorMessage = err instanceof Error ? err.message : String(err ?? 'unknown error');
+            console.warn(`[Bridge] Plugin search error for "${query.title}": ${sanitizeLog(errorMessage)}`);
+            this.setRequestProgress(req.id, 'search_failed', { reason: 'search_failed', error: errorMessage });
             this.state.requestErrors[req.id] = {
-              error: err.message,
+              error: errorMessage,
               errorType: 'search_failed',
               reason: 'search_failed',
               lastAttemptAt: new Date().toISOString(),
@@ -1386,16 +1557,22 @@ export class BridgeService {
             }
 
             // Cancellation-aware before queueing
-            if (await this.isRequestCancelled(req.id, fetchFn)) {
+            const candidateRequestState = await this.getRequestStatus(req.id, fetchFn);
+            if (candidateRequestState === 'cancelled') {
               this.setRequestProgress(req.id, 'cancelled', { reason: 'cancelled' });
               queuedSuccessfully = true; // stop trying candidates
+              break;
+            }
+            if (candidateRequestState !== 'active') {
+              this.setRequestProgress(req.id, 'status_unknown', { reason: 'status_unknown' });
+              queuedSuccessfully = true;
               break;
             }
 
             try {
               const queueRes = await this.queueRelease({
                 requestId: req.id,
-                userId: req.requesterUserId || req.userId,
+                userId: req.userId || req.requesterUserId || req.requester_user_id || req.user_id,
                 release: candidateRelease,
                 libraryId: req.targetLibraryId || this.defaultLibraryId,
                 folderId: req.targetFolderId || this.defaultFolderId,
@@ -1412,7 +1589,7 @@ export class BridgeService {
             } catch (err) {
               const isEditionConflict = err.message && (err.message.toLowerCase().includes('incompatible edition') || err.message.toLowerCase().includes('incompatible'));
               if (isEditionConflict) {
-                console.warn(`[Bridge] Candidate release "${candidateRelease.title}" conflicted with existing task edition: ${err.message}. Trying next candidate release...`);
+                console.warn(`[Bridge] Candidate release "${candidateRelease.title}" conflicted with existing task edition: ${sanitizeLog(err.message)}. Trying next candidate release...`);
                 // DO NOT blacklist candidate in failedReleases! Try next candidate release.
                 continue;
               }
@@ -1470,6 +1647,9 @@ export class BridgeService {
    * If Shelfmark returns an uncertain response without a task ID, tracks in uncertain_queue state.
    */
   async queueRelease({ requestId, userId, release, libraryId, folderId, shelfmarkUrl, apiKey, fetchFn = globalThis.fetch }) {
+    if (this.isQueueingRelease) throw new Error('Queue operation already in progress');
+    this.isQueueingRelease = true;
+    try {
     if (!requestId) throw new Error('requestId is required');
     if (!release) throw new Error('release is required');
 
@@ -1477,11 +1657,6 @@ export class BridgeService {
     const smKey = apiKey || this.shelfmarkApiKey;
     const releaseKey = this.getReleaseKey(release);
 
-    // Cancellation-aware: do not queue for a cancelled request
-    if (requestId && await this.isRequestCancelled(requestId, fetchFn)) {
-      this.setRequestProgress(requestId, 'cancelled', { reason: 'cancelled' });
-      throw new Error('Request cancelled');
-    }
 
     // 1. Check if release already tracked or in uncertain queue
     const existingTaskId = this.state.releases[releaseKey];
@@ -1595,7 +1770,7 @@ export class BridgeService {
     let taskId = null;
     if (res.ok) {
       const json = await res.json().catch(() => ({}));
-      taskId = json.task_id || json.id || null;
+      taskId = json.task_id || json.taskId || json.id || json.task?.id || json.task?.task_id || json.download_task_id || null;
 
       if (!taskId) {
         // Shelfmark returned 200 without task ID. Correlate with /api/status.
@@ -1606,7 +1781,8 @@ export class BridgeService {
           const candidates = [...parsed.downloading, ...parsed.queued, ...parsed.complete];
           const matched = candidates.find((t) => {
             const sid = t.source_id || t.release?.source_id;
-            return sid && sid === downloadPayload.source_id;
+            const tid = String(t.id || t.task_id || '');
+            return (sid && sid === downloadPayload.source_id) || (tid && tid === String(downloadPayload.source_id));
           }) || candidates.find((t) => {
             const titleMatch = (t.title || '').trim().toLowerCase() === (downloadPayload.title || '').trim().toLowerCase();
             const formatMatch = (t.format || '').toLowerCase() === (downloadPayload.format || '').toLowerCase();
@@ -1651,7 +1827,8 @@ export class BridgeService {
           const candidates = [...parsed.downloading, ...parsed.queued, ...parsed.complete];
           const matched = candidates.find((t) => {
             const sid = t.source_id || t.release?.source_id;
-            return sid && sid === downloadPayload.source_id;
+            const tid = String(t.id || t.task_id || '');
+            return (sid && sid === downloadPayload.source_id) || (tid && tid === String(downloadPayload.source_id));
           }) || candidates.find((t) => {
             const titleMatch = (t.title || '').trim().toLowerCase() === (downloadPayload.title || '').trim().toLowerCase();
             const formatMatch = (t.format || '').toLowerCase() === (downloadPayload.format || '').toLowerCase();
@@ -1746,6 +1923,9 @@ export class BridgeService {
       taskId,
       adopted: false,
     };
+    } finally {
+      this.isQueueingRelease = false;
+    }
   }
 
   /**
@@ -1764,12 +1944,17 @@ export class BridgeService {
     const taskObj = payload.task || {};
     const pathsObj = payload.paths || {};
 
-    const taskId = taskObj.task_id || payload.task_id || payload.taskId || payload.id;
-    const rawTarget = pathsObj.target || (pathsObj.final_paths && pathsObj.final_paths[0]) || payload.target_path || payload.download_path || payload.file_path;
+    const taskId = taskObj.task_id ?? taskObj.taskId ?? taskObj.id ?? payload.task_id ?? payload.taskId ?? payload.id;
+    const rawTarget = pathsObj.target || pathsObj.target_path || pathsObj.final_path || (Array.isArray(pathsObj.final_paths) && pathsObj.final_paths[0]) || payload.target_path || payload.download_path || payload.file_path || payload.final_path;
+    const allFinalPaths = Array.isArray(pathsObj.final_paths) ? pathsObj.final_paths : (Array.isArray(pathsObj.final_paths_list) ? pathsObj.final_paths_list : (pathsObj.final_path ? [pathsObj.final_path] : (rawTarget ? [rawTarget] : [])));
     const title = taskObj.title || payload.title;
     const format = taskObj.format || payload.format || (rawTarget ? path.extname(rawTarget).replace('.', '') : 'epub');
 
     let task = taskId ? (this.state.tasks[taskId] || this.state.tasks[String(taskId)]) : null;
+    if (task && taskObj.id && String(taskObj.id) !== String(task.taskId || task.id)) {
+      return { ok: false, statusCode: 409, error: 'Task ID mismatch' };
+    }
+    if (task && allFinalPaths.length) task.finalPaths = allFinalPaths;
 
     if (!task && (title || rawTarget)) {
       const rawBase = path.basename(rawTarget || '').replace(/\.[^/.]+$/, '').trim().toLowerCase();
@@ -1797,8 +1982,23 @@ export class BridgeService {
     }
 
     // Strict file verification & containment with bounded visibility retries
-    const targetFile = rawTarget || task.filePath;
-    const verification = await this.verifyFileWithRetry(targetFile, task.format);
+    const candidatePaths = [...new Set([...(allFinalPaths || []), rawTarget, task?.filePath].filter(Boolean))];
+    if (candidatePaths.length === 0) candidatePaths.push(rawTarget || task?.filePath);
+    let targetFile = candidatePaths[0];
+    let verification = null;
+    for (const cp of candidatePaths) {
+      if (!cp) continue;
+      const v = await this.verifyFileWithRetry(cp, task.format);
+      if (v.ok) {
+        verification = v;
+        targetFile = cp;
+        break;
+      }
+      verification = v;
+    }
+    if (!verification) {
+      verification = await this.verifyFileWithRetry(targetFile, task.format);
+    }
     if (!verification.ok) {
       if (verification.notFound) {
         console.warn(`[Bridge] File not visible for task ${task.taskId}: ${verification.error}. Preserving recoverable awaiting_file state.`);
@@ -1864,23 +2064,31 @@ export class BridgeService {
    */
   async findAuthoritativeBookOrbitBook(task, targetLibraryId, headers, fetchFn = globalThis.fetch) {
     const boUrl = this.bookorbitUrl;
-    const queryUrls = [];
+    const attempts = [];
     if (targetLibraryId) {
-      queryUrls.push(`${boUrl}/api/v1/libraries/${targetLibraryId}/books?search=${encodeURIComponent(task.title || '')}`);
-      queryUrls.push(`${boUrl}/api/v1/books?libraryId=${targetLibraryId}&search=${encodeURIComponent(task.title || '')}`);
-      queryUrls.push(`${boUrl}/api/v1/libraries/${targetLibraryId}/books`);
+      attempts.push({
+        url: `${boUrl}/api/v1/libraries/${targetLibraryId}/books`,
+        init: { method: 'POST', headers: { ...headers, 'Content-Type': 'application/json' }, body: JSON.stringify({ sort: [], pagination: { page: 0, size: 100 } }) },
+      });
+      attempts.push({
+        url: `${boUrl}/api/v1/books/query`,
+        init: { method: 'POST', headers: { ...headers, 'Content-Type': 'application/json' }, body: JSON.stringify({ q: task.title || '', sort: [], pagination: { page: 0, size: 100 } }) },
+      });
     }
-    queryUrls.push(`${boUrl}/api/v1/books?search=${encodeURIComponent(task.title || '')}`);
+    attempts.push({
+      url: `${boUrl}/api/v1/books/search?q=${encodeURIComponent(task.title || '')}&limit=100`,
+      init: { headers },
+    });
 
     const baseFileName = task.filePath ? path.basename(task.filePath).toLowerCase() : '';
 
-    for (const url of queryUrls) {
+    for (const attempt of attempts) {
       try {
-        const res = await fetchFn(url, { headers });
+        const res = await fetchFn(attempt.url, attempt.init);
         if (!res.ok) continue;
         const data = await res.json().catch(() => null);
         if (!data) continue;
-        const books = Array.isArray(data) ? data : (data.items || data.books || []);
+        const books = Array.isArray(data) ? data : (data.items || data.books || data.results || []);
         if (!Array.isArray(books) || books.length === 0) continue;
 
         // 1. First priority: match by destination file path / filename if reported on book files
@@ -1925,9 +2133,9 @@ export class BridgeService {
    */
   async uploadDirectToLibrary(task, targetLibraryId, targetFolderId, headers, fetchFn = globalThis.fetch) {
     const boUrl = this.bookorbitUrl;
-    let uploadUrl = `${boUrl}/api/v1/libraries/${targetLibraryId}/upload`;
+    let uploadUrl = `${boUrl}/api/v1/libraries/${encodeURIComponent(targetLibraryId)}/upload`;
     if (targetFolderId) {
-      uploadUrl += `?folderId=${targetFolderId}`;
+      uploadUrl += `?folderId=${encodeURIComponent(targetFolderId)}`;
     }
 
     const fileName = path.basename(task.filePath);
@@ -1962,7 +2170,7 @@ export class BridgeService {
 
     if (uploadRes.ok) {
       const data = await uploadRes.json().catch(() => ({}));
-      const bookId = parsePositiveInt(data.id || data.bookId || data.book?.id);
+      const bookId = parsePositiveInt(data.bookId || data.id || data.book?.id);
       if (!bookId) {
         // Empty response or missing book ID (e.g. unhandled route in mocks): fall back to Book Dock
         return { notFound: true };
@@ -1973,7 +2181,7 @@ export class BridgeService {
     if (uploadRes.status === 409) {
       // Conflict: Book already exists. Inspect whether it is genuinely the same edition.
       const conflictData = await uploadRes.json().catch(() => ({}));
-      const existingBook = conflictData.existingBook || conflictData.book || conflictData;
+      const existingBook = conflictData.existingBook || conflictData.book || (conflictData.title || conflictData.name ? conflictData : null);
       let existingBookId = parsePositiveInt(conflictData.id || conflictData.bookId || existingBook?.id);
 
       if (existingBook && (existingBook.title || existingBook.name)) {
@@ -2032,7 +2240,7 @@ export class BridgeService {
 
   /**
    * Uploads file via Book Dock fallback:
-   * POST /api/v1/book-dock/upload -> wait ready_to_file -> POST /api/v1/book-dock/finalize
+   * POST /api/v1/book-dock/upload -> wait ready -> POST /api/v1/book-dock/finalize
    */
   async uploadViaBookDock(task, targetLibraryId, targetFolderId, headers, fetchFn = globalThis.fetch) {
     const boUrl = this.bookorbitUrl;
@@ -2066,9 +2274,9 @@ export class BridgeService {
 
         if (uploadRes.ok) {
           const uploadJson = await uploadRes.json().catch(() => ({}));
-          bookDockFileId = uploadJson.id || uploadJson.fileId;
+          bookDockFileId = uploadJson.id ?? uploadJson.fileId ?? uploadJson.file_id;
           task.dockFileId = bookDockFileId;
-          if ((uploadJson.status || '').toLowerCase() === 'ready_to_file') {
+          if ((uploadJson.status || '').toLowerCase() === 'ready') {
             readyToFinalize = true;
           }
           this.saveState();
@@ -2085,16 +2293,16 @@ export class BridgeService {
       return { success: false, error: 'Book Dock file ID could not be obtained' };
     }
 
-    // Wait for upload to reach ready_to_file
+    // Wait for upload to reach ready
     if (!readyToFinalize) {
       try {
         for (let attempt = 0; attempt < this.dockReadinessAttempts; attempt++) {
-          const checkRes = await fetchFn(`${boUrl}/api/v1/book-dock/files/${bookDockFileId}`, { headers });
+          const checkRes = await fetchFn(`${boUrl}/api/v1/book-dock/files/${encodeURIComponent(bookDockFileId)}`, { headers });
           if (checkRes.ok) {
             const fileInfo = await checkRes.json().catch(() => ({}));
             const fileStatus = (fileInfo.status || '').toLowerCase();
             if (fileStatus === 'filed' || fileStatus === 'finalized') {
-              const bId = parsePositiveInt(fileInfo.bookId);
+              const bId = parsePositiveInt(fileInfo.bookId || fileInfo.book_id || fileInfo.book?.id);
               if (bId) {
                 isAlreadyFinalized = true;
                 matchedBookId = bId;
@@ -2103,12 +2311,12 @@ export class BridgeService {
                 return { success: false, finalizationFailed: true, error: 'Book Dock file reported filed but missing valid bookId' };
               }
             }
-            if (fileStatus === 'ready_to_file') {
+            if (fileStatus === 'ready') {
               readyToFinalize = true;
               break;
             }
             if (fileStatus === 'error' || fileStatus === 'failed') {
-              return { success: false, finalizationFailed: true, error: fileInfo.error || fileInfo.message || 'Book Dock file reported error state' };
+              return { success: false, finalizationFailed: true, error: fileInfo.errorMessage || fileInfo.error || fileInfo.message || 'Book Dock file reported error state' };
             }
           }
           await new Promise((r) => setTimeout(r, this.dockReadinessIntervalMs));
@@ -2119,7 +2327,7 @@ export class BridgeService {
     }
 
     if (!readyToFinalize && !isAlreadyFinalized && !matchedBookId) {
-      return { success: false, finalizationFailed: true, error: `Book Dock file ${bookDockFileId} timed out waiting for ready_to_file state (still processing)` };
+      return { success: false, finalizationFailed: true, error: `Book Dock file ${bookDockFileId} timed out waiting for ready state (still processing)` };
     }
 
     // Finalize into Library
@@ -2151,10 +2359,11 @@ export class BridgeService {
         }
 
         const finalizeJson = await finalizeRes.json().catch(() => ({}));
-        const resultItem = finalizeJson.results?.find((r) => r.fileId === bookDockFileId) || finalizeJson.results?.[0];
+        const resultItem = finalizeJson.results?.find((r) => String(r?.fileId ?? r?.file_id ?? r?.id) === String(bookDockFileId)) || finalizeJson.results?.[0];
 
-        const resultBookId = parsePositiveInt(resultItem?.bookId);
-        const isSuccess = Boolean(resultItem) && resultItem.success === true && Boolean(resultBookId);
+        const duplicateBookId = resultItem?.isDuplicate ? parsePositiveInt(resultItem?.existingBookId) : null;
+        const resultBookId = duplicateBookId || parsePositiveInt(resultItem?.bookId || resultItem?.book_id);
+        const isSuccess = Boolean(resultItem) && (resultItem.success === true || resultItem.isDuplicate === true) && Boolean(resultBookId);
         if (!resultItem || !isSuccess) {
           return { success: false, finalizationFailed: true, error: resultItem?.message || 'Finalization returned failed or needs review' };
         }
@@ -2181,6 +2390,21 @@ export class BridgeService {
    * 3. Fulfills Book Requests independently per request ID (POST /api/v1/admin/book-requests/:id/fulfill)
    */
   async fulfillBookOrbitRequests(task, fetchFn = globalThis.fetch) {
+    const key = String(task?.taskId || task?.id || '');
+    const prev = this._fulfillLocks.get(key) || Promise.resolve();
+    let resolveLock;
+    const lock = new Promise((r) => { resolveLock = r; });
+    this._fulfillLocks.set(key, lock);
+    await prev;
+    try {
+      return await this._fulfillBookOrbitRequestsImpl(task, fetchFn);
+    } finally {
+      resolveLock();
+      if (this._fulfillLocks.get(key) === lock) this._fulfillLocks.delete(key);
+    }
+  }
+
+  async _fulfillBookOrbitRequestsImpl(task, fetchFn = globalThis.fetch) {
     const boUrl = this.bookorbitUrl;
     let token = '';
     try {
@@ -2189,7 +2413,7 @@ export class BridgeService {
     token = token || this.bookorbitToken || this.bookorbitApiKey;
 
     const headers = {
-      ...(token ? { 'Authorization': `Bearer ${token}` } : {}),
+      ...(token && isJwt(token) ? { 'Authorization': `Bearer ${token}` } : {}),
       ...(this.bookorbitApiKey ? { 'X-Api-Key': this.bookorbitApiKey } : {}),
     };
 
@@ -2198,7 +2422,8 @@ export class BridgeService {
     // Cancellation-aware: determine which requests are still active before importing
     const activeRequestIds = [];
     for (const rid of (task.requestIds || [])) {
-      if (await this.isRequestCancelled(rid, fetchFn)) {
+      const ridState = await this.getRequestStatus(rid, fetchFn);
+      if (ridState === 'cancelled') {
         if (!task.requestFulfillments) task.requestFulfillments = {};
         task.requestFulfillments[rid] = {
           fulfilled: false,
@@ -2207,6 +2432,15 @@ export class BridgeService {
           updatedAt: new Date().toISOString(),
         };
         this.setRequestProgress(rid, 'cancelled', { reason: 'cancelled' });
+      } else if (ridState !== 'active') {
+        if (!task.requestFulfillments) task.requestFulfillments = {};
+        task.requestFulfillments[rid] = {
+          fulfilled: false,
+          errorType: 'status_unknown',
+          error: 'Request status unknown',
+          updatedAt: new Date().toISOString(),
+        };
+        this.setRequestProgress(rid, 'status_unknown', { reason: 'status_unknown' });
       } else {
         activeRequestIds.push(rid);
       }
@@ -2215,7 +2449,10 @@ export class BridgeService {
 
     if ((task.requestIds || []).length > 0 && activeRequestIds.length === 0) {
       // All requests cancelled; preserve shared download but skip import/fulfillment
+      task.status = 'cancelled';
+      task.updatedAt = new Date().toISOString();
       this.setRequestProgress((task.requestIds || [])[0], 'cancelled', { reason: 'cancelled' });
+      this.saveState();
       return { fulfilled: false, error: 'All requests cancelled' };
     }
 
@@ -2341,21 +2578,19 @@ export class BridgeService {
     // Do not reset successful per-request results merely because a task re-enters completed state.
     if (!task.requestFulfillments) {
       task.requestFulfillments = {};
-    } else if (task.status === 'completed' && Object.values(task.requestFulfillments).some((r) => r?.fulfilled) && Object.values(task.requestFulfillments).some((r) => !r?.fulfilled)) {
+    } else if ((task.status === 'completed' || task.status === 'imported') && Object.values(task.requestFulfillments).some((r) => r?.fulfilled) && Object.values(task.requestFulfillments).some((r) => !r?.fulfilled)) {
       // Partially fulfilled task in completed state: preserve successful results, retry only unfulfilled
       for (const [id, r] of Object.entries(task.requestFulfillments)) {
         if (!r?.fulfilled) {
           delete task.requestFulfillments[id];
         }
       }
-    } else if (task.status === 'completed' && !Object.values(task.requestFulfillments).some((r) => !r?.fulfilled) && Object.keys(task.requestFulfillments).length > 0) {
-      // Explicitly reset completed task simulating fulfillment retry across all requests
-      task.requestFulfillments = {};
     }
 
     let fulfilledCount = 0;
     for (const reqId of task.requestIds) {
-      if (await this.isRequestCancelled(reqId, fetchFn)) {
+      const step2State = await this.getRequestStatus(reqId, fetchFn);
+      if (step2State === 'cancelled') {
         if (!task.requestFulfillments) task.requestFulfillments = {};
         task.requestFulfillments[reqId] = {
           fulfilled: false,
@@ -2364,6 +2599,18 @@ export class BridgeService {
           updatedAt: new Date().toISOString(),
         };
         this.setRequestProgress(reqId, 'cancelled', { reason: 'cancelled' });
+        this.saveState();
+        continue;
+      }
+      if (step2State !== 'active') {
+        if (!task.requestFulfillments) task.requestFulfillments = {};
+        task.requestFulfillments[reqId] = {
+          fulfilled: false,
+          errorType: 'status_unknown',
+          error: 'Request status unknown',
+          updatedAt: new Date().toISOString(),
+        };
+        this.setRequestProgress(reqId, 'status_unknown', { reason: 'status_unknown' });
         this.saveState();
         continue;
       }
@@ -2379,7 +2626,7 @@ export class BridgeService {
           note: `Automatically fulfilled via Shelfmark task ${task.taskId}`,
         };
 
-        const fulfillRes = await fetchFn(`${boUrl}/api/v1/admin/book-requests/${reqId}/fulfill`, {
+        const fulfillRes = await fetchFn(`${boUrl}/api/v1/admin/book-requests/${encodeURIComponent(reqId)}/fulfill`, {
           method: 'POST',
           headers: { ...headers, 'Content-Type': 'application/json' },
           body: JSON.stringify(fulfillDto),
@@ -2479,6 +2726,11 @@ export class BridgeService {
    * Runs periodically (e.g. every 15m) without continuous 5s polling.
    */
   async reconcile({ fetchFn = globalThis.fetch } = {}) {
+    if (this.isReconciling) {
+      return { ok: false, error: 'Reconciliation already in progress' };
+    }
+    this.isReconciling = true;
+    try {
     // 1. Reconcile pending BookOrbit requests
     if (this.bookorbitUrl) {
       if (!this.state.baselineEstablishedAt) {
@@ -2519,11 +2771,8 @@ export class BridgeService {
       const candidates = [...parsedStatus.downloading, ...parsedStatus.queued, ...parsedStatus.complete];
       for (const [rKey, unrec] of Object.entries(this.state.uncertainQueues)) {
         const matched = candidates.find((t) => {
-          const sid = t.source_id || t.release?.source_id;
-          return sid && sid === unrec.release?.source_id;
-        }) || candidates.find((t) => {
           const titleMatch = (t.title || '').trim().toLowerCase() === (unrec.release?.title || '').trim().toLowerCase();
-          const formatMatch = (t.format || '').toLowerCase() === (unrec.release?.format || '').toLowerCase();
+          const formatMatch = !(t.format || unrec.release?.format) || (t.format || '').toLowerCase() === (unrec.release?.format || '').toLowerCase();
           const authorMatch = !unrec.release?.author || !t.author || ((t.author || '').toLowerCase().includes(unrec.release.author.toLowerCase()) || unrec.release.author.toLowerCase().includes((t.author || '').toLowerCase()));
           return titleMatch && formatMatch && authorMatch;
         });
@@ -2624,6 +2873,12 @@ export class BridgeService {
       if (id !== undefined && id !== null) queuedMap.set(String(id), t);
     }
 
+    const cancelledMap = new Map();
+    for (const t of parsedStatus.cancelled || []) {
+      const id = t.id || t.task_id;
+      if (id !== undefined && id !== null) cancelledMap.set(String(id), t);
+    }
+
     for (const task of Object.values(this.state.tasks)) {
       if (task.status === 'fulfilled') {
         continue;
@@ -2642,7 +2897,17 @@ export class BridgeService {
         }
       }
 
-      if (completedMap.has(taskIdStr)) {
+      if (cancelledMap.has(taskIdStr)) {
+        task.status = 'cancelled';
+        task.error = 'Shelfmark cancelled task';
+        task.errorSource = 'shelfmark';
+        task.updatedAt = now;
+        for (const rid of (task.requestIds || [])) {
+          this.setRequestProgress(rid, 'cancelled', { reason: 'cancelled' });
+        }
+      }
+
+      if (completedMap.has(taskIdStr) && task.status !== 'cancelled' && task.status !== 'fulfilled') {
         // Shelfmark positively reports completion for this exact task ID!
         // Recovers tasks in 'queued', 'downloading', 'awaiting_file', 'completed', 'finalization_failed',
         // or earlier 'failed' (from transient verification failure)
@@ -2686,7 +2951,7 @@ export class BridgeService {
         // Shelfmark genuinely reports failure for this task ID!
         const smError = failedMap.get(taskIdStr);
         task.status = 'failed';
-        task.error = smError?.error || smError?.message || 'Shelfmark reported failure';
+        task.error = smError?.status_message || smError?.error || smError?.message || smError?.status || 'Shelfmark reported failure';
         task.errorSource = 'shelfmark';
         task.updatedAt = now;
         if (task.releaseKey && this.state.releases[task.releaseKey] === task.taskId) {
@@ -2742,9 +3007,19 @@ export class BridgeService {
         if (newlyFailed) {
           updatedCount++;
         }
-      } else if (task.status === 'completed' || task.status === 'finalization_failed' || task.status === 'partially_fulfilled' || task.status === 'uncertain_upload') {
+      } else if (task.status === 'completed' || task.status === 'imported' || task.status === 'finalization_failed' || task.status === 'partially_fulfilled' || task.status === 'uncertain_upload') {
         // Task completed or partially fulfilled mid-flight; retry fulfillment
         if (this.bookorbitUrl) {
+          // Do not retry fulfillment for tasks whose requests are all cancelled.
+          const activeIds = [];
+          for (const rid of (task.requestIds || [])) {
+            const st = await this.getRequestStatus(rid, fetchFn);
+            if (st === 'active') activeIds.push(rid);
+          }
+          if ((task.requestIds || []).length > 0 && activeIds.length === 0) {
+            // Preserve historical state and skip repeated fulfillment retries.
+            continue;
+          }
           if (task.matchedBookId) {
             // Already uploaded! Retry fulfillment for unfulfilled requests directly without re-uploading
             await this.fulfillBookOrbitRequests(task, fetchFn);
@@ -2765,6 +3040,9 @@ export class BridgeService {
     }
 
     return { ok: true, updatedCount };
+    } finally {
+      this.isReconciling = false;
+    }
   }
 
   /**
@@ -2812,6 +3090,12 @@ export class BridgeService {
    * and local/private network binding.
    */
   createServer(port = 8085, host = this.host) {
+    if (!this._httpLock) this._httpLock = Promise.resolve();
+    const runLocked = (fn) => {
+      const next = this._httpLock.then(() => fn(), () => fn());
+      this._httpLock = next.then(() => {}, () => {});
+      return next;
+    };
     const server = http.createServer(async (req, res) => {
       const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
 
@@ -2848,17 +3132,24 @@ export class BridgeService {
 
       // Webhook endpoint: POST /webhook/shelfmark
       if (req.method === 'POST' && url.pathname === '/webhook/shelfmark') {
+        if (!checkAuth()) {
+          res.writeHead(401, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: 'Unauthorized: Invalid bridge secret' }));
+          return;
+        }
         readCappedBody(async (body) => {
-          const authHeader = req.headers['x-bridge-secret'] || req.headers['authorization'];
-          try {
-            const payload = body ? JSON.parse(body) : {};
-            const result = await this.handleWebhook(payload, authHeader);
-            res.writeHead(result.statusCode || 200, { 'Content-Type': 'application/json' });
-            res.end(JSON.stringify(result));
-          } catch (err) {
-            res.writeHead(400, { 'Content-Type': 'application/json' });
-            res.end(JSON.stringify({ ok: false, error: err.message }));
-          }
+          await runLocked(async () => {
+            try {
+              const payload = body ? JSON.parse(body) : {};
+              const authHeader = req.headers['x-bridge-secret'] || req.headers['authorization'];
+              const result = await this.handleWebhook(payload, authHeader);
+              res.writeHead(result.statusCode || 200, { 'Content-Type': 'application/json' });
+              res.end(JSON.stringify(result));
+            } catch (err) {
+              res.writeHead(400, { 'Content-Type': 'application/json' });
+              res.end(JSON.stringify({ ok: false, error: sanitizeLog(err.message) }));
+            }
+          });
         });
         return;
       }
@@ -2871,15 +3162,18 @@ export class BridgeService {
           return;
         }
         readCappedBody(async (body) => {
-          try {
-            const payload = body ? JSON.parse(body) : {};
-            const result = await this.queueRelease(payload);
-            res.writeHead(200, { 'Content-Type': 'application/json' });
-            res.end(JSON.stringify(result));
-          } catch (err) {
-            res.writeHead(500, { 'Content-Type': 'application/json' });
-            res.end(JSON.stringify({ ok: false, error: err.message }));
-          }
+          await runLocked(async () => {
+            try {
+              const payload = body ? JSON.parse(body) : {};
+              const result = await this.queueRelease(payload);
+              res.writeHead(200, { 'Content-Type': 'application/json' });
+              res.end(JSON.stringify(result));
+            } catch (err) {
+              const status = /required|invalid|required field/i.test(err.message || '') ? 400 : 500;
+              res.writeHead(status, { 'Content-Type': 'application/json' });
+              res.end(JSON.stringify({ ok: false, error: sanitizeLog(err.message) }));
+            }
+          });
         });
         return;
       }
@@ -2891,28 +3185,34 @@ export class BridgeService {
           res.end(JSON.stringify({ ok: false, error: 'Unauthorized: Invalid bridge secret' }));
           return;
         }
-        try {
-          const result = await this.reconcile();
-          res.writeHead(200, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify(result));
-        } catch (err) {
-          res.writeHead(500, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ ok: false, error: err.message }));
-        }
+        readCappedBody(async (body) => {
+          await runLocked(async () => {
+            try {
+              const result = await this.reconcile();
+              res.writeHead(200, { 'Content-Type': 'application/json' });
+              res.end(JSON.stringify(result));
+            } catch (err) {
+              res.writeHead(500, { 'Content-Type': 'application/json' });
+              res.end(JSON.stringify({ ok: false, error: sanitizeLog(err.message) }));
+            }
+          });
+        });
         return;
       }
 
       // Health and status endpoint: GET /api/status
       if (req.method === 'GET' && url.pathname === '/api/status') {
-        res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({
-          status: 'healthy',
-          tasksCount: Object.keys(this.state.tasks).length,
-          requestsCount: Object.keys(this.state.requests).length,
-          baselineCount: Object.keys(this.state.baselineRequestIds || {}).length,
-          uncertainCount: Object.keys(this.state.uncertainQueues || {}).length,
-          socketConnected: this.socketClient ? this.socketClient.isConnected : false,
-        }));
+        await runLocked(async () => {
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({
+            status: 'healthy',
+            tasksCount: Object.keys(this.state.tasks).length,
+            requestsCount: Object.keys(this.state.requests).length,
+            baselineCount: Object.keys(this.state.baselineRequestIds || {}).length,
+            uncertainCount: Object.keys(this.state.uncertainQueues || {}).length,
+            socketConnected: this.socketClient ? this.socketClient.isConnected : false,
+          }));
+        });
         return;
       }
 
@@ -2925,8 +3225,9 @@ export class BridgeService {
 }
 
 // Standalone execution entrypoint
-if (process.argv[1] && path.resolve(process.argv[1]) === path.resolve(new URL(import.meta.url).pathname)) {
-  const port = process.env.BRIDGE_PORT ? parseInt(process.env.BRIDGE_PORT, 10) : 8085;
+if (process.argv[1] && path.resolve(process.argv[1]) === path.resolve(fileURLToPath(import.meta.url))) {
+  const parsedPort = parsePositiveInt(process.env.BRIDGE_PORT);
+  const port = parsedPort || 8085;
   const host = process.env.BRIDGE_HOST || '127.0.0.1';
   const bridge = new BridgeService({ host });
   bridge.startReconciliation();

@@ -86,6 +86,13 @@ export default {
       hint: 'Maximum time to wait for Shelfmark to finish downloading a release before timing out (default: 240).',
       default: 240,
     },
+    {
+      key: 'pollIntervalMs',
+      type: 'number',
+      label: 'Poll Interval (ms)',
+      hint: 'Interval between status polls while waiting for a download (default: 1000).',
+      default: 1000,
+    },
   ],
 
   /**
@@ -170,6 +177,7 @@ export default {
     const searchAuthor = String(query?.author ?? '').trim();
     // Support BookOrbit v3.5.0 PluginReleaseQuery contract (isbn13, isbn13s, isbn)
     const searchIsbn = extractIsbn(null, query);
+    const requestedYear = toNumber(query?.year ?? query?.publicationYear ?? query?.publishYear ?? query?.publishedYear ?? query?.publish_year);
     const metadataQuery = searchTitle || searchIsbn || searchAuthor;
 
     if (!metadataQuery) {
@@ -178,7 +186,7 @@ export default {
 
     const preferredFormat = (config.settings?.preferFormat || 'epub').toLowerCase();
     const source = (config.settings?.releaseSource || 'all').toLowerCase();
-    const maxResults = query.limit || MAX_RESULTS;
+    const maxResults = (Number.isInteger(query?.limit) && query.limit > 0) ? query.limit : MAX_RESULTS;
     const releases = [];
     const seenReleaseKeys = new Set();
     const queriedKeys = new Set();
@@ -190,10 +198,11 @@ export default {
 
     // Helper to add release without duplicates or fabricated attributes
     const addRelease = (rel, book) => {
-      const detectedFormat = detectFormat(rel.format || rel.extension, rel.title, rel.download_url);
+      const detectedFormat = detectFormat(rel.format || rel.extension || rel.extra?.format || rel.extra?.formats || rel.extra?.formats_display, rel.title, `${rel.download_url || ''} ${rel.info_url || ''} ${rel.url || ''}`);
       if (!detectedFormat) return;
 
-      const relSource = rel.source || 'shelfmark';
+      const relSource = rel.source ? String(rel.source).trim() : '';
+      if (!relSource) return;
       const relSourceId = String(rel.source_id || rel.id || '').trim();
       if (!relSourceId) return;
 
@@ -203,37 +212,52 @@ export default {
       }
       seenReleaseKeys.add(dedupKey);
 
-      const sizeBytes = toNumber(rel.size_bytes || rel.sizeBytes || rel.size);
+      const sizeBytes = parseSizeBytes(rel.size_bytes ?? rel.sizeBytes ?? rel.size);
       const directUrl = rel.download_url || rel.downloadUrl || rel.url || null;
       const infoUrl = rel.info_url || rel.infoUrl || null;
       const sourcePageUrl = infoUrl || directUrl || null;
 
       const payload = {
-        source: relSource,
-        source_id: relSourceId,
-        title: rel.title || book?.title || searchTitle,
+        source: String(relSource),
+        source_id: String(relSourceId),
+        title: String(rel.title || book?.title || searchTitle || ''),
         format: detectedFormat,
+        content_type: 'ebook',
+        protocol: rel.protocol ? String(rel.protocol).trim() : 'http',
+        indexer: rel.indexer ? String(rel.indexer).trim() : 'BookOrbit-Shelfmark-Plugin',
+        seeders: toNumber(rel.seeders),
+        size: rel.size != null ? String(rel.size) : null,
+        size_bytes: sizeBytes,
+        extra: rel.extra || null,
       };
-
-      // Preserve the release's page/download URLs using Shelfmark's accepted field names.
-      // OceanofPDF (and other direct-download providers) require this page URL to queue.
       if (directUrl) payload.download_url = directUrl;
       if (infoUrl) payload.info_url = infoUrl;
       if (sourcePageUrl) payload.source_url = sourcePageUrl;
 
+      // Preserve the release's page/download URLs using Shelfmark's accepted field names.
+      // OceanofPDF (and other direct-download providers) require this page URL to queue.
+
       // Authentic author attribution:
       // Prefer authentic author reported by the release if present.
       // Otherwise fall back to validated book metadata author or searchAuthor.
-      const releaseAuthor = toNaturalAuthor(rel.author);
+      const releaseAuthor = toNaturalAuthor(rel.author || rel.extra?.author || rel.extra?.Author);
       const metadataAuthor = Array.isArray(book?.authors)
         ? book.authors.map(toNaturalAuthor).filter(Boolean).join(', ')
         : toNaturalAuthor(book?.author);
-      const displayAuthor = releaseAuthor || metadataAuthor || toNaturalAuthor(searchAuthor) || null;
+      const displayAuthor = releaseAuthor || metadataAuthor || null;
 
       // Extract authentic ISBN
       // Never claim a release has the request's ISBN without independent evidence.
       // Preserve the release's own ISBN (or metadata book ISBN), never the query ISBN.
-      const authenticIsbn = extractIsbn(book, null) || (rel.isbn ? String(rel.isbn).trim() : null);
+      const authenticIsbn = extractIsbn(book, null) || (rel.isbn ? String(rel.isbn).trim() : null) || (rel.extra?.isbn ? String(rel.extra.isbn).trim() : null) || (rel.extra?.isbn13 ? String(rel.extra.isbn13).trim() : null);
+      if (searchIsbn && authenticIsbn && authenticIsbn !== searchIsbn) return;
+      const releaseYear = toNumber(rel.year || rel.publish_year || rel.publication_year || rel.published_year || rel.publicationYear || rel.publishedYear || rel.extra?.year || rel.extra?.publish_year || rel.extra?.publication_year || book?.publish_year || book?.publishYear || book?.year || book?.publication_year || rel?.book?.publish_year || rel?.book?.publishYear || rel?.book?.year || null);
+      if (requestedYear && releaseYear && requestedYear !== releaseYear) return;
+      payload.author = displayAuthor || null;
+      payload.year = toNumber(rel.year || rel.publish_year || rel.publication_year || rel.published_year || rel.publicationYear || rel.publishedYear || rel.extra?.year || rel.extra?.publish_year || rel.extra?.publication_year || book?.publish_year || book?.publishYear || book?.year || book?.publication_year || rel?.book?.publish_year || rel?.book?.publishYear || rel?.book?.year || null);
+      payload.language = rel.language || rel.extra?.language || null;
+      payload.isbn = authenticIsbn || null;
+      payload.size = sizeBytes;
 
       // Authentic book title:
       // Preserves authentic metadata book title or cleaned core release title.
@@ -247,9 +271,9 @@ export default {
         author: displayAuthor,
         isbn: authenticIsbn,
         format: detectedFormat,
-        year: (rel.year || rel.publication_year || rel.published_year || rel.publicationYear || rel.publishedYear || book?.year || book?.publication_year || null),
+        year: toNumber(rel.year || rel.publish_year || rel.publication_year || rel.published_year || rel.publicationYear || rel.publishedYear || rel.extra?.year || rel.extra?.publish_year || rel.extra?.publication_year || book?.publish_year || book?.publishYear || book?.year || book?.publication_year || rel?.book?.publish_year || rel?.book?.publishYear || rel?.book?.year || null),
         sizeBytes,
-        language: rel.language || null,
+        language: rel.language || rel.extra?.language || null,
         seeders: toNumber(rel.seeders),
         leechers: toNumber(rel.leechers),
         downloadUrl: directUrl,
@@ -299,7 +323,7 @@ export default {
       const metaRes = await safeHostFetch(host, metadataUrl.href, { headers }, signal);
       if (metaRes.ok) {
         const metaData = await metaRes.json().catch(() => ({ books: [] }));
-        books = Array.isArray(metaData.books) ? metaData.books : [];
+        books = Array.isArray(metaData.books) ? metaData.books : (Array.isArray(metaData.items) ? metaData.items : (Array.isArray(metaData.results) ? metaData.results : []));
       } else if (metaRes.status === 401 || metaRes.status === 403) {
         throw host.fail('unauthorized', 'Shelfmark rejected authentication. Verify API key.');
       } else {
@@ -310,8 +334,8 @@ export default {
         if (releases.length > 0) return rankAndSlice();
         throw classifyAbort(signal, host, 'Search was cancelled.');
       }
-      if (err.code) throw err;
-      providerError = err.message;
+      if (err && err.code) throw err;
+      providerError = (err && err.message) ? err.message : String(err ?? 'unknown error');
     }
 
     // Step 1 Fallback A: Known confident alternate title representations (e.g. "1984" -> "Nineteen Eighty-Four")
@@ -362,9 +386,13 @@ export default {
 
     // Validate metadata books against title and author
     const validBooks = books.filter((book) => {
-      const titleMatches = isTitleMatch(book.title, searchTitle);
-      const authorMatches = isAuthorMatch(book.authors || book.author, searchAuthor);
-      return titleMatches && authorMatches;
+      const bookTitle = book.search_title || book.title || book.name;
+      const bookAuthors = book.search_author || book.authors || book.author;
+      const bookYear = toNumber(book.year ?? book.publish_year ?? book.publication_year ?? book.published_year ?? book.publishYear ?? book.publicationYear);
+      const titleMatches = isTitleMatch(bookTitle, searchTitle);
+      const authorMatches = isAuthorMatch(bookAuthors, searchAuthor);
+      const yearMatches = !requestedYear || !bookYear || requestedYear === bookYear;
+      return titleMatches && authorMatches && yearMatches;
     });
 
     if (validBooks.length > 0) {
@@ -376,10 +404,11 @@ export default {
         if (hasSufficientResults()) break;
         if (signal?.aborted || Date.now() - searchStartTime >= SEARCH_BUDGET_MS) break;
 
-        const bookTitle = book.title || searchTitle;
+        const bookTitle = book.search_title || book.title || searchTitle;
         const coreTitle = extractCoreTitle(bookTitle);
+        const bookAuthors = book.search_author || book.authors || book.author;
         const naturalAuthor = toNaturalAuthor(
-          (Array.isArray(book.authors) && book.authors[0]) || book.author || searchAuthor || ''
+          (Array.isArray(bookAuthors) && bookAuthors[0]) || bookAuthors || searchAuthor || ''
         );
         const isbn = extractIsbn(book, query);
 
@@ -414,7 +443,7 @@ export default {
 
           const releasesUrl = new URL(`${baseUrl}/api/releases`);
           releasesUrl.searchParams.set('provider', book.provider || 'openlibrary');
-          releasesUrl.searchParams.set('book_id', book.provider_id || book.id || '');
+          releasesUrl.searchParams.set('book_id', book.provider_id || '');
           releasesUrl.searchParams.set('title', queryTitle);
           if (naturalAuthor) {
             releasesUrl.searchParams.set('author', naturalAuthor);
@@ -423,9 +452,7 @@ export default {
             releasesUrl.searchParams.set('isbn', isbn);
           }
           releasesUrl.searchParams.set('content_type', 'ebook');
-          if (source && source !== 'all') {
-            releasesUrl.searchParams.set('source', source);
-          }
+          releasesUrl.searchParams.set('source', source || 'all');
 
           let relRes;
           try {
@@ -446,7 +473,7 @@ export default {
 
           for (const rel of foundReleases) {
             const relTitle = rel.title || '';
-            const relAuthor = rel.author || '';
+            const relAuthor = toNaturalAuthor(rel.author || rel.extra?.author || rel.extra?.Author);
             if (relTitle && !isTitleMatch(relTitle, searchTitle) && !isTitleMatch(relTitle, book.title)) {
               continue;
             }
@@ -455,15 +482,20 @@ export default {
             // Never silently accept a release by a conflicting author (e.g. Michael Dean adaptation of Orwell).
             if (relAuthor) {
               const matchesReq = searchAuthor ? isAuthorMatch(relAuthor, searchAuthor) : true;
-              const matchesBook = book?.authors || book?.author ? isAuthorMatch(relAuthor, book.authors || book.author) : true;
+              const matchesBook = Array.isArray(book?.authors) && book.authors.length ? isAuthorMatch(relAuthor, book.authors) : true;
               if (!matchesReq || !matchesBook) {
                 continue;
               }
             }
             if (searchAuthor && !relAuthor) {
               const byMatch = relTitle.split(/\s+by\s+/i);
-              if (byMatch.length > 1 && !isAuthorMatch(byMatch[1], searchAuthor)) {
-                continue;
+              if (byMatch.length > 1) {
+                const __suffix = byMatch[1].trim();
+                const __toks = __suffix.split(/\s+/).filter(Boolean);
+                const __looks = __suffix.includes(',') || __toks.length >= 2;
+                if (__looks && !isAuthorMatch(__suffix, searchAuthor)) {
+                  continue;
+                }
               }
             }
             addRelease(rel, book);
@@ -494,6 +526,9 @@ export default {
         if (queriedKeys.has(queryKey)) continue;
         queriedKeys.add(queryKey);
 
+        if (source === 'all' && !queryTitle && !naturalSearchAuthor && !queryIsbn) {
+          continue;
+        }
         const directRelUrl = new URL(`${baseUrl}/api/releases`);
         if (queryTitle) {
           directRelUrl.searchParams.set('title', queryTitle);
@@ -505,9 +540,7 @@ export default {
           directRelUrl.searchParams.set('isbn', queryIsbn);
         }
         directRelUrl.searchParams.set('content_type', 'ebook');
-        if (source && source !== 'all') {
-          directRelUrl.searchParams.set('source', source);
-        }
+        directRelUrl.searchParams.set('source', source || 'all');
 
         try {
           const directRelRes = await safeHostFetch(host, directRelUrl.href, { headers }, signal);
@@ -517,19 +550,28 @@ export default {
               ? directData
               : Array.isArray(directData.releases)
                 ? directData.releases
-                : [];
+                : Array.isArray(directData.items)
+                  ? directData.items
+                  : Array.isArray(directData.results)
+                    ? directData.results
+                    : [];
 
             for (const rel of directReleases) {
               const relTitle = rel.title || '';
-              const relAuthor = rel.author || '';
+              const relAuthor = toNaturalAuthor(rel.author || rel.extra?.author || rel.extra?.Author);
               // Strictly validate title and author on direct releases
               if (searchTitle && !isTitleMatch(relTitle, searchTitle)) continue;
               if (searchAuthor && relAuthor && !isAuthorMatch(relAuthor, searchAuthor)) continue;
               if (searchAuthor && !relAuthor && !isAuthorMatch(relTitle, searchAuthor)) {
                 // If release has no author and title has "by <Someone Else>", reject
                 const byMatch = relTitle.split(/\s+by\s+/i);
-                if (byMatch.length > 1 && !isAuthorMatch(byMatch[1], searchAuthor)) {
-                  continue;
+                if (byMatch.length > 1) {
+                  const __suffix = byMatch[1].trim();
+                  const __toks = __suffix.split(/\s+/).filter(Boolean);
+                  const __looks = __suffix.includes(',') || __toks.length >= 2;
+                  if (__looks && !isAuthorMatch(__suffix, searchAuthor)) {
+                    continue;
+                  }
                 }
               }
               addRelease(rel, null);
@@ -634,7 +676,7 @@ export default {
       entry = { controller, subscribers, settled: false };
       inFlightResolutions.set(releaseKey, entry);
 
-      doResolveFile(
+      entry.promise = doResolveFile(
         release,
         payload,
         resolvedFormat,
@@ -645,7 +687,8 @@ export default {
         config,
         host,
         controller.signal
-      )
+      );
+      entry.promise
         .then((result) => {
           entry.settled = true;
           inFlightResolutions.delete(releaseKey);
@@ -772,17 +815,42 @@ async function doResolveFile(release, payload, resolvedFormat, fileName, baseUrl
       const statusData = await statusRes.json().catch(() => ({}));
       const activeTasks = {
         ...(statusData.queued || {}),
+        ...(statusData.queued_tasks || {}),
+        ...(statusData.queuedTasks || {}),
         ...(statusData.active || {}),
+        ...(statusData.active_tasks || {}),
+        ...(statusData.activeTasks || {}),
         ...(statusData.downloading || {}),
+        ...(statusData.downloading_tasks || {}),
+        ...(statusData.downloadingTasks || {}),
         ...(statusData.pending || {}),
+        ...(statusData.pending_tasks || {}),
+        ...(statusData.pendingTasks || {}),
+        ...(statusData.resolving || {}),
+        ...(statusData.resolving_tasks || {}),
+        ...(statusData.resolvingTasks || {}),
+        ...(statusData.locating || {}),
+        ...(statusData.locating_tasks || {}),
+        ...(statusData.locatingTasks || {}),
       };
+      // Cancelled tasks are intentionally never treated as active/adoptable.
+      const cancelledTasks = { ...(statusData.cancelled || {}) };
+      const preExistingCancelledIds = new Set(Object.keys(cancelledTasks));
       const completedTasks = {
         ...(statusData.completed || {}),
+        ...(statusData.completed_tasks || {}),
+        ...(statusData.completedTasks || {}),
         ...(statusData.complete || {}),
+        ...(statusData.complete_tasks || {}),
+        ...(statusData.completeTasks || {}),
       };
       const failedTasks = {
         ...(statusData.error || {}),
+        ...(statusData.error_tasks || {}),
+        ...(statusData.errorTasks || {}),
         ...(statusData.failed || {}),
+        ...(statusData.failed_tasks || {}),
+        ...(statusData.failedTasks || {}),
       };
 
       preExistingActiveIds = new Set(Object.keys(activeTasks));
@@ -895,17 +963,40 @@ async function doResolveFile(release, payload, resolvedFormat, fileName, baseUrl
           const refData = await refreshedRes.json().catch(() => ({}));
           const activeTasks = {
             ...(refData.queued || {}),
+            ...(refData.queued_tasks || {}),
+            ...(refData.queuedTasks || {}),
             ...(refData.active || {}),
+            ...(refData.active_tasks || {}),
+            ...(refData.activeTasks || {}),
             ...(refData.downloading || {}),
+            ...(refData.downloading_tasks || {}),
+            ...(refData.downloadingTasks || {}),
             ...(refData.pending || {}),
+            ...(refData.pending_tasks || {}),
+            ...(refData.pendingTasks || {}),
+            ...(refData.resolving || {}),
+            ...(refData.resolving_tasks || {}),
+            ...(refData.resolvingTasks || {}),
+            ...(refData.locating || {}),
+            ...(refData.locating_tasks || {}),
+            ...(refData.locatingTasks || {}),
           };
+          const cancelledTasks = { ...(refData.cancelled || {}) };
           const completedTasks = {
             ...(refData.completed || {}),
+            ...(refData.completed_tasks || {}),
+            ...(refData.completedTasks || {}),
             ...(refData.complete || {}),
+            ...(refData.complete_tasks || {}),
+            ...(refData.completeTasks || {}),
           };
           const failedTasks = {
             ...(refData.error || {}),
+            ...(refData.error_tasks || {}),
+            ...(refData.errorTasks || {}),
             ...(refData.failed || {}),
+            ...(refData.failed_tasks || {}),
+            ...(refData.failedTasks || {}),
           };
 
           let matchedActive = Object.entries(activeTasks).filter(([id, task]) =>
@@ -953,7 +1044,7 @@ async function doResolveFile(release, payload, resolvedFormat, fileName, baseUrl
                 const [failedId, failedTask] = matchedFailed[0];
                 throw host.fail(
                   'error',
-                  `Shelfmark refused to queue download because a previous attempt failed (${failedId}: ${failedTask.error || failedTask.status || 'failed'}). The failed task must be cleared in Shelfmark or container restarted, or choose another release in BookOrbit.`
+                  `Shelfmark refused to queue download because a previous attempt failed (${failedId}: ${(failedTask.status_message || failedTask.error || failedTask.message || failedTask.status || 'failed')}). The failed task must be cleared in Shelfmark or container restarted, or choose another release in BookOrbit.`
                 );
               }
             }
@@ -971,7 +1062,7 @@ async function doResolveFile(release, payload, resolvedFormat, fileName, baseUrl
       }
     } else {
       const queueData = await queueRes.json().catch(() => ({}));
-      queuedTaskId = queueData.task_id || queueData.taskId || queueData.id || null;
+      queuedTaskId = queueData.task_id || queueData.taskId || queueData.id || queueData.task?.id || queueData.task?.task_id || queueData.download_task_id || null;
     }
   }
 
@@ -1010,9 +1101,9 @@ async function doResolveFile(release, payload, resolvedFormat, fileName, baseUrl
     }
 
     const statusData = await statusRes.json().catch(() => ({}));
-    const completed = { ...(statusData.complete || {}), ...(statusData.completed || {}) };
-    const failed = { ...(statusData.error || {}), ...(statusData.failed || {}) };
-    const active = { ...(statusData.active || {}), ...(statusData.queued || {}), ...(statusData.downloading || {}) };
+    const completed = { ...(statusData.complete || {}), ...(statusData.completed || {}), ...(statusData.completed_tasks || {}), ...(statusData.completedTasks || {}), ...(statusData.complete_tasks || {}), ...(statusData.completeTasks || {}) };
+    const failed = { ...(statusData.error || {}), ...(statusData.failed || {}), ...(statusData.error_tasks || {}), ...(statusData.errorTasks || {}), ...(statusData.failed_tasks || {}), ...(statusData.failedTasks || {}) };
+    const active = { ...(statusData.active || {}), ...(statusData.active_tasks || {}), ...(statusData.activeTasks || {}), ...(statusData.queued || {}), ...(statusData.queued_tasks || {}), ...(statusData.queuedTasks || {}), ...(statusData.downloading || {}), ...(statusData.downloading_tasks || {}), ...(statusData.downloadingTasks || {}), ...(statusData.pending || {}), ...(statusData.pending_tasks || {}), ...(statusData.pendingTasks || {}), ...(statusData.resolving || {}), ...(statusData.resolving_tasks || {}), ...(statusData.resolvingTasks || {}), ...(statusData.locating || {}), ...(statusData.locating_tasks || {}), ...(statusData.locatingTasks || {}) };
 
     // --- CASE A: EXACT TASK ID IS KNOWN ---
     if (queuedTaskId) {
@@ -1033,7 +1124,7 @@ async function doResolveFile(release, payload, resolvedFormat, fileName, baseUrl
       const exactFailedEntry = Object.entries(failed).find(([id, task]) => isExactMatch(id, task));
       if (exactFailedEntry) {
         const failedTask = exactFailedEntry[1];
-        throw host.fail('error', `Shelfmark reported download failed: ${failedTask.error || failedTask.status || 'unknown error'}`);
+        throw host.fail('error', `Shelfmark reported download failed: ${(failedTask.status_message || failedTask.error || failedTask.message || failedTask.status || 'unknown error')}`);
       }
 
       // 3. If exact task is in active, it is still downloading -> continue polling
@@ -1066,7 +1157,7 @@ async function doResolveFile(release, payload, resolvedFormat, fileName, baseUrl
         break;
       }
       if (strongFailed.length === 1) {
-        throw host.fail('error', `Shelfmark reported download failed: ${strongFailed[0][1].error || 'unknown error'}`);
+        throw host.fail('error', `Shelfmark reported download failed: ${(strongFailed[0][1].status_message || strongFailed[0][1].error || strongFailed[0][1].message || strongFailed[0][1].status || 'unknown error')}`);
       }
       if (strongActive.length === 1) {
         queuedTaskId = strongActive[0][0];
@@ -1096,7 +1187,7 @@ async function doResolveFile(release, payload, resolvedFormat, fileName, baseUrl
         break;
       }
       if (titleFailed.length === 1) {
-        throw host.fail('error', `Shelfmark reported download failed: ${titleFailed[0][1].error || 'unknown error'}`);
+        throw host.fail('error', `Shelfmark reported download failed: ${(titleFailed[0][1].status_message || titleFailed[0][1].error || titleFailed[0][1].message || titleFailed[0][1].status || 'unknown error')}`);
       }
       if (titleActive.length === 1) {
         queuedTaskId = titleActive[0][0];
@@ -1130,7 +1221,16 @@ async function doResolveFile(release, payload, resolvedFormat, fileName, baseUrl
 
 function cleanUrl(url) {
   if (!url) return 'http://localhost:8084';
-  return String(url).trim().replace(/\/+$/, '');
+  const trimmed = String(url).trim();
+  try {
+    const u = new URL(trimmed);
+    u.pathname = u.pathname.replace(/\/+$/, '');
+    u.search = '';
+    u.hash = '';
+    return u.toString().replace(/\/+$/, '');
+  } catch (e) {
+    return trimmed.replace(/\/+$/, '');
+  }
 }
 
 function makeHeaders(config) {
@@ -1147,11 +1247,7 @@ function makeHeaders(config) {
 }
 
 function buildLocalDownloadUrl(baseUrl, taskId, apiKey) {
-  let url = `${baseUrl}/api/localdownload?id=${encodeURIComponent(taskId)}`;
-  if (apiKey) {
-    url += `&api_key=${encodeURIComponent(apiKey)}`;
-  }
-  return url;
+  return `${baseUrl}/api/localdownload?id=${encodeURIComponent(taskId)}`;
 }
 
 function sanitizeError(msg, apiKey) {
@@ -1160,6 +1256,8 @@ function sanitizeError(msg, apiKey) {
   if (apiKey) {
     str = str.replaceAll(apiKey, '[REDACTED]');
   }
+  str = str.replace(/(Bearer\s+)[A-Za-z0-9._~+\/-]+=*/gi, '$1[REDACTED]');
+  str = str.replace(/(apiKey|api_key|token|secret|password)=([^&\s]+)/gi, '$1=[REDACTED]');
   str = str.replace(/([?&]api_key=)[^&]+/gi, '$1[REDACTED]');
   return str;
 }
@@ -1183,9 +1281,16 @@ function isOceanofPdfSource(source, extraSource, url) {
 
 function isValidOceanofPdfPageUrl(url, source) {
   if (!isHttpUrl(url)) return false;
-  const lower = String(url).toLowerCase();
-  // The page URL must belong to the OceanofPDF source, never a fabricated hash URL.
-  return lower.includes('oceanofpdf');
+  try {
+    const parsed = new URL(String(url).trim());
+    const host = parsed.hostname.toLowerCase();
+    // Require a real OceanofPDF host/path, not a synthesized URL containing only a hash.
+    if (!host.includes('oceanofpdf')) return false;
+    if (!parsed.pathname || parsed.pathname === '/') return false;
+    return true;
+  } catch (e) {
+    return false;
+  }
 }
 
 function normalizeString(str) {
@@ -1330,10 +1435,16 @@ function extractCoreTitle(title) {
   s = s.replace(/\s*\[[^\]]*\]\s*/g, ' ').replace(/\s*\([^)]*\)\s*/g, ' ').trim();
   // Remove trailing download keywords (e.g. from OceanofPDF titles)
   s = s.replace(/\s+download\b/gi, '').trim();
-  // Split on " by " if it separates title from author (e.g. "1984 by George Orwell")
+  // Split on " by " only when it clearly separates title from an author name
+  // (e.g. "1984 by George Orwell"), never for titles that merely contain "by".
   const byMatch = s.split(/\s+by\s+/i);
   if (byMatch.length > 1 && byMatch[0].trim().length >= 2) {
-    s = byMatch[0].trim();
+    const suffix = byMatch[1].trim();
+    const suffixTokens = suffix.split(/\s+/).filter(Boolean);
+    const looksLikeAuthor = suffix.includes(',') || suffixTokens.length >= 2;
+    if (looksLikeAuthor) {
+      s = byMatch[0].trim();
+    }
   }
   // Split on subtitle and series delimiters (colons, semicolons, slashes, pipes, or spaced dashes)
   const parts = s.split(/(?:\s+[-–—]\s+|[:;/|]|\s*[–—]\s*)/);
@@ -1357,7 +1468,7 @@ function isTitleMatch(candidateTitle, requestedTitle) {
   // requested title (e.g. Lithuanian "1984-ieji"), which are distinct editions.
   try {
     const escaped = String(requestedTitle).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-    if (new RegExp(escaped + '-[\\p{L}]', 'iu').test(candidateTitle)) {
+    if (new RegExp(escaped + '-[\\p{L}]+', 'iu').test(candidateTitle)) {
       return false;
     }
   } catch (e) {
@@ -1481,6 +1592,11 @@ function matchStrongTask(taskId, task, payload, resolvedFormat) {
   const payloadSource = (payload.source || '').toLowerCase();
   if (taskSource && payloadSource && taskSource !== payloadSource) return false;
 
+  // Edition-aware checks: do not adopt a task for a different year/author/ISBN.
+  if (task.year && payload.year && String(task.year) !== String(payload.year)) return false;
+  if (task.isbn && payload.isbn && String(task.isbn) !== String(payload.isbn)) return false;
+  if (task.author && payload.author && !isAuthorMatch(task.author, payload.author)) return false;
+
   return true;
 }
 
@@ -1510,14 +1626,15 @@ function scoreBookMatch(book, searchTitle, searchAuthor) {
 }
 
 function detectFormat(formatVal, titleVal, urlVal) {
-  const raw = String(formatVal || '').toLowerCase().replace(/^\./, '').trim();
+  const rawVal = Array.isArray(formatVal) ? formatVal.join(' ') : formatVal;
+  const raw = String(rawVal || '').toLowerCase().replace(/^\./, '').trim();
   if (raw === 'epub' || raw === 'pdf') return raw;
   if (raw.includes('epub')) return 'epub';
   if (raw.includes('pdf')) return 'pdf';
 
   const textToCheck = `${titleVal || ''} ${urlVal || ''}`.toLowerCase();
-  if (textToCheck.includes('.epub') || textToCheck.includes('[epub]')) return 'epub';
-  if (textToCheck.includes('.pdf') || textToCheck.includes('[pdf]')) return 'pdf';
+  if (textToCheck.includes('.epub') || textToCheck.includes('[epub]') || /\bepub\b/.test(textToCheck)) return 'epub';
+  if (textToCheck.includes('.pdf') || textToCheck.includes('[pdf]') || /\bpdf\b/.test(textToCheck)) return 'pdf';
   return null;
 }
 
@@ -1542,8 +1659,30 @@ function sanitizeFilename(title) {
 
 function toNumber(val) {
   if (val === undefined || val === null || val === '') return null;
-  const num = Number(val);
-  return Number.isFinite(num) ? num : null;
+  if (typeof val === 'boolean') return null;
+  if (Array.isArray(val)) return null;
+  if (typeof val === 'number') return Number.isFinite(val) ? val : null;
+  if (typeof val === 'string') {
+    const trimmed = val.trim();
+    if (!/^-?\d+(\.\d+)?$/.test(trimmed)) return null;
+    const num = Number(trimmed);
+    return Number.isFinite(num) ? num : null;
+  }
+  return null;
+}
+
+function parseSizeBytes(val) {
+  if (val === undefined || val === null || val === '') return null;
+  if (typeof val === 'number') return Number.isFinite(val) ? val : null;
+  const direct = toNumber(val);
+  if (direct !== null) return direct;
+  const match = String(val).trim().match(/^([\d.]+)\s*(b|kb|kib|mb|mib|gb|gib|tb|tib)?$/i);
+  if (!match) return null;
+  const amount = Number(match[1]);
+  if (!Number.isFinite(amount)) return null;
+  const unit = (match[2] || 'b').toLowerCase();
+  const multipliers = { b: 1, kb: 1000, kib: 1024, mb: 1000000, mib: 1048576, gb: 1000000000, gib: 1073741824, tb: 1000000000000, tib: 1099511627776 };
+  return Math.round(amount * (multipliers[unit] || 1));
 }
 
 function sleep(ms, signal) {
@@ -1647,6 +1786,11 @@ function matchTaskByDetails(task, payload, resolvedFormat) {
   const taskSource = (task.source || '').toLowerCase();
   const payloadSource = (payload.source || '').toLowerCase();
   if (taskSource && payloadSource && taskSource !== payloadSource) return false;
+
+  // Edition-aware checks: do not adopt a task for a different year/author/ISBN.
+  if (task.year && payload.year && String(task.year) !== String(payload.year)) return false;
+  if (task.isbn && payload.isbn && String(task.isbn) !== String(payload.isbn)) return false;
+  if (task.author && payload.author && !isAuthorMatch(task.author, payload.author)) return false;
 
   return true;
 }
