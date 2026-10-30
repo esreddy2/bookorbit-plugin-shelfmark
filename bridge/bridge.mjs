@@ -58,6 +58,7 @@ import zlib from 'node:zlib';
 import { fileURLToPath } from 'node:url';
 
 import plugin from '../index.mjs';
+import * as ID from '../shared/identity.mjs';
 
 /** Magic byte signatures for supported book formats. */
 export const MAGIC_BYTES = {
@@ -267,318 +268,15 @@ export function parseShelfmarkStatus(statusJson) {
 /**
  * Validates and parses positive integers (e.g. library and folder IDs).
  */
-export const KNOWN_TITLE_EQUIVALENTS = new Map([
-  ['1984', ['nineteen eighty four', 'nineteen eighty-four']],
-  ['nineteen eighty four', ['1984']],
-  ['nineteen eighty-four', ['1984']],
-  ['2001', ['two thousand and one']],
-  ['two thousand and one', ['2001']],
-]);
+export const KNOWN_TITLE_EQUIVALENTS = ID.KNOWN_TITLE_EQUIVALENTS;
 
-export function normalizeString(str) {
-  if (!str) return '';
-  return String(str)
-    .toLowerCase()
-    .normalize('NFKD')
-    .replace(/[\u0300-\u036f]/g, '')
-    .replace(/[^\p{L}\p{N}\s]/gu, ' ')
-    .replace(/\s+/g, ' ')
-    .trim();
-}
-
-
-export function getTokens(str) {
-  return normalizeString(str)
-    .split(' ')
-    .filter((t) => t.length > 0);
-}
-
-/**
- * Normalizes author name strings to natural first-last name order.
- * E.g., "Orwell, George, 1903-1950" -> "George Orwell"
- *       "Bradbury, Ray" -> "Ray Bradbury"
- *       "Celeste Ng" -> "Celeste Ng"
- */
-
-
-export function toNaturalAuthor(author) {
-  if (!author) return '';
-  let s = String(author).trim();
-  // Remove life dates like "1903-1950", "1920-", "(1920-2012)"
-  s = s.replace(/\s*\(?\b\d{4}\s*[-–—]\s*\d{0,4}\b\)?/g, ' ').trim();
-  // Remove parenthetical annotations like "(writer)", "(illustrator)"
-  s = s.replace(/\s*\([^)]*\)/g, ' ').trim();
-  // Remove trailing punctuation
-  s = s.replace(/[,.;]+$/, '').trim();
-  if (s.includes(',')) {
-    const parts = s.split(',').map((p) => p.trim()).filter(Boolean);
-    if (parts.length === 2) {
-      const [last, first] = parts;
-      if (!/^(jr|sr|ii|iii|iv|v|phd|md|esq)\.?$/i.test(first)) {
-        return `${first} ${last}`.trim();
-      }
-    }
-  }
-  return s.replace(/\s+/g, ' ').trim();
-}
-
-/**
- * Extracts a clean 10 or 13 digit ISBN from metadata or search query.
- * Supports BookOrbit v3.5.0 PluginReleaseQuery (isbn13, isbn13s, legacy isbn).
- */
-
-
-export function extractCoreTitle(title) {
-  if (!title) return '';
-  let s = String(title).trim();
-  // Remove bracketed tags like [EPUB], [PDF] and parentheticals like (Retail), (Signet)
-  s = s.replace(/\s*\[[^\]]*\]\s*/g, ' ').replace(/\s*\([^)]*\)\s*/g, ' ').trim();
-  // Remove trailing download keywords (e.g. from OceanofPDF titles)
-  s = s.replace(/\s+download\b/gi, '').trim();
-  // Split on " by " only when it clearly separates title from an author name
-  // (e.g. "1984 by George Orwell"), never for titles that merely contain "by".
-  const byMatch = s.split(/\s+by\s+/i);
-  if (byMatch.length > 1 && byMatch[0].trim().length >= 2) {
-    const suffix = byMatch[1].trim();
-    const suffixTokens = suffix.split(/\s+/).filter(Boolean);
-    const looksLikeAuthor = suffix.includes(',') || suffixTokens.length >= 2;
-    if (looksLikeAuthor) {
-      s = byMatch[0].trim();
-    }
-  }
-  // Split on subtitle and series delimiters (colons, semicolons, slashes, pipes, or spaced dashes)
-  const parts = s.split(/(?:\s+[-–—]\s+|[:;/|]|\s*[–—]\s*)/);
-  const core = parts[0]?.trim();
-  return core && core.length >= 2 ? core : s;
-}
-
-
-export function isNoiseDerivative(candidateTitle, requestedTitle) {
-  const normCand = normalizeString(candidateTitle);
-  const normReq = normalizeString(requestedTitle);
-  const noiseMarkers = [
-    // Study guides & summaries
-    'summary of',
-    'study guide',
-    'cliffsnotes',
-    'sparknotes',
-    'analysis of',
-    'workbook for',
-    'book summary',
-    'companion to',
-    'teacher guide',
-    'teachers guide',
-    'lesson plans',
-    'activity guide',
-    // Adaptations & abridgments
-    'adapted by',
-    'retold by',
-    'simplified edition',
-    'simplified retelling',
-    'retelling',
-    'abridged',
-    // Graded readers
-    'graded reader',
-    'oxford bookworms',
-    'penguin active reading',
-    'penguin readers',
-    'macmillan readers',
-    // Graphic novels & comics
-    'graphic novel',
-    'comic book',
-    'illustrated novel',
-    // Collections & boxed sets
-    'complete works',
-    'box set',
-    'boxed set',
-    'omnibus',
-    'anthology',
-  ];
-  for (const marker of noiseMarkers) {
-    if (normCand.includes(marker) && !normReq.includes(marker)) {
-      return true;
-    }
-  }
-
-  // Graded reader stage / level markers: e.g. "stage 1", "level 3"
-  if (/\b(?:stage|level)\s*[1-6]\b/i.test(candidateTitle) && !/\b(?:stage|level)\s*[1-6]\b/i.test(requestedTitle)) {
-    return true;
-  }
-
-  // Multi-work collections (e.g. "Animal Farm & 1984" when user searched only one of them)
-  const hasAnimalFarm = normCand.includes('animal farm');
-  const has1984 = normCand.includes('1984') || normCand.includes('nineteen eighty four');
-  if (hasAnimalFarm && has1984) {
-    const reqHasBoth =
-      normReq.includes('animal farm') && (normReq.includes('1984') || normReq.includes('nineteen eighty four'));
-    if (!reqHasBoth) {
-      return true;
-    }
-  }
-
-  return false;
-}
-
-
-export function isTitleMatch(candidateTitle, requestedTitle) {
-  if (!requestedTitle) return true;
-  if (!candidateTitle) return false;
-
-  if (isNoiseDerivative(candidateTitle, requestedTitle)) {
-    return false;
-  }
-
-  const normCand = normalizeString(candidateTitle);
-  const normReq = normalizeString(requestedTitle);
-  if (!normCand || !normReq) return false;
-
-  // Reject translated/compound titles that append extra letters directly to the
-  // requested title (e.g. Lithuanian "1984-ieji"), which are distinct editions.
-  try {
-    const escaped = String(requestedTitle).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-    if (new RegExp(escaped + '-[\\p{L}]+', 'iu').test(candidateTitle)) {
-      return false;
-    }
-  } catch (e) {
-    // Fall through to normal matching on regex failure
-  }
-
-  if (normCand === normReq) return true;
-
-  // Safe subtitle boundaries only: a prefix match is valid only when the remainder
-  // begins with a subtitle delimiter, not another word (e.g. "Fear Street").
-  const safePrefix = (candidate, requested) => {
-    const c = String(candidate).trim().toLowerCase();
-    const r = String(requested).trim().toLowerCase();
-    if (!c.startsWith(r) || c === r) return c === r;
-    const rest = c.slice(r.length);
-    return /^[\s]*[:;\-–—(\[]/.test(rest);
-  };
-  if (safePrefix(candidateTitle, requestedTitle) || safePrefix(requestedTitle, candidateTitle)) return true;
-
-  // Explicit equivalents only.
-  // (handled below)
-
-  if (normCand.includes(normReq) || normReq.includes(normCand)) {
-    // Allow containment only when the contained phrase is a complete title segment.
-    const cTokens = getTokens(candidateTitle);
-    const rTokens = getTokens(requestedTitle);
-    if (rTokens.length > 1 && rTokens.every((t) => cTokens.includes(t))) return true;
-  }
-
-  // Check confident equivalents (e.g. 1984 vs Nineteen Eighty-Four)
-  const equivalents = KNOWN_TITLE_EQUIVALENTS.get(normReq);
-  if (equivalents) {
-    for (const eq of equivalents) {
-      const normEq = normalizeString(eq);
-      if (normCand === normEq || normCand.startsWith(normEq) || normCand.includes(normEq)) {
-        return true;
-      }
-    }
-  }
-
-  const candEquivalents = KNOWN_TITLE_EQUIVALENTS.get(normCand);
-  if (candEquivalents) {
-    for (const eq of candEquivalents) {
-      const normEq = normalizeString(eq);
-      if (normReq === normEq || normReq.startsWith(normEq) || normReq.includes(normEq)) {
-        return true;
-      }
-    }
-  }
-
-  // Check core title match (e.g. "Animal Farm: A Fairy Story" vs "Animal Farm")
-  const coreCand = normalizeString(extractCoreTitle(candidateTitle));
-  const coreReq = normalizeString(extractCoreTitle(requestedTitle));
-  if (coreCand && coreReq && (coreCand === coreReq || coreCand === normReq || normCand === coreReq)) {
-    return true;
-  }
-
-  const candTokens = getTokens(candidateTitle);
-  const reqTokens = getTokens(requestedTitle);
-  if (reqTokens.length === 0) return true;
-
-  // Single-token titles require an exact, safe boundary or explicit equivalence;
-  // never accept an unrelated title that merely starts with or contains the word.
-  if (reqTokens.length === 1) {
-    return false;
-  }
-
-  const matchingTokens = reqTokens.filter((t) => candTokens.includes(t));
-  return matchingTokens.length === reqTokens.length;
-}
-
-
-export function isAuthorMatch(candidateAuthors, requestedAuthor) {
-  if (!requestedAuthor) return true;
-  if (!candidateAuthors) return false;
-
-  const rawList = Array.isArray(candidateAuthors)
-    ? candidateAuthors
-    : String(candidateAuthors).split(/[;&]/);
-
-  const authorList = rawList.map((a) => toNaturalAuthor(a)).filter(Boolean);
-  if (authorList.length === 0) return false;
-
-  const reqNorm = normalizeString(toNaturalAuthor(requestedAuthor));
-  const reqTokens = getTokens(reqNorm);
-  if (reqTokens.length === 0) return true;
-
-  for (const cand of authorList) {
-    const candNorm = normalizeString(cand);
-    const candTokens = getTokens(cand);
-    if (candTokens.length === 0) continue;
-
-    // Direct match or substring
-    if (candNorm === reqNorm) {
-      return true;
-    }
-
-    // Token set containment
-    const matchingTokens = reqTokens.filter((t) => candTokens.includes(t));
-    if (matchingTokens.length === reqTokens.length) {
-      return true;
-    }
-
-    // Surname + first-name match. Full first names must agree exactly;
-  // single-character initials may match by initial only.
-  const reqSurname = reqTokens[reqTokens.length - 1];
-  if (candTokens.includes(reqSurname)) {
-    if (reqTokens.length === 1) return true;
-    const reqFirst = reqTokens[0];
-    const candFirsts = candTokens.filter((t) => t !== reqSurname);
-    const compatibleFirst = candFirsts.some((t) => {
-      if (t === reqFirst) return true;
-      if (t.length === 1 || reqFirst.length === 1) {
-        return t.startsWith(reqFirst[0]) || reqFirst.startsWith(t[0]);
-      }
-      return false;
-    });
-    if (compatibleFirst) {
-      return true;
-    }
-  }
-
-    // Transposed author match
-    const candSurname = candTokens[0];
-    if (reqTokens.includes(candSurname)) {
-      if (candTokens.length === 1) return true;
-      const candFirst = candTokens[candTokens.length - 1];
-      const reqFirst = reqTokens[0];
-      const compatibleFirst = (candFirst === reqFirst) || (candFirst.length === 1 || reqFirst.length === 1 && (candFirst.startsWith(reqFirst[0]) || reqFirst.startsWith(candFirst[0])));
-      if (compatibleFirst && reqTokens.some((t) => t === candFirst)) {
-        return true;
-      }
-      if (candFirst === reqFirst) return true;
-      if ((candFirst.length === 1 || reqFirst.length === 1) && (candFirst.startsWith(reqFirst[0]) || reqFirst.startsWith(candFirst[0]))) {
-        return true;
-      }
-    }
-  }
-
-  return false;
-}
-
+export function normalizeString(str) { return ID.normalizeString(str); }
+export function getTokens(str) { return ID.getTokens(str); }
+export function toNaturalAuthor(author) { return ID.toNaturalAuthor(author); }
+export function extractCoreTitle(title) { return ID.extractCoreTitle(title); }
+export function isNoiseDerivative(candidateTitle, requestedTitle) { return ID.isNoiseDerivative(candidateTitle, requestedTitle); }
+export function isTitleMatch(candidateTitle, requestedTitle) { return ID.isTitleMatch(candidateTitle, requestedTitle); }
+export function isAuthorMatch(candidateAuthors, requestedAuthor) { return ID.isAuthorMatch(candidateAuthors, requestedAuthor); }
 
 export function parsePositiveInt(val) {
   if (typeof val === 'number') {
@@ -592,7 +290,7 @@ export function parsePositiveInt(val) {
 }
 
 export function normalizeIsbnBridge(value) {
-  return String(value || '').replace(/[^0-9X]/gi, '').trim().toUpperCase();
+  return ID.normalizeIsbn(value);
 }
 
 export function collectMetadataIsbnsBridge(obj, out = new Set()) {
@@ -637,109 +335,15 @@ export function gatherTrustedIsbnsBridge(...sources) {
 }
 
 export function collectEditionSpecificIsbnPairsBridge(obj) {
-  const pairs = [];
-  if (!obj || typeof obj !== 'object') return pairs;
-  if (Array.isArray(obj)) {
-    for (const item of obj) pairs.push(...collectEditionSpecificIsbnPairsBridge(item));
-    return pairs;
-  }
-
-  const counterpartKeys = Object.keys(obj).filter((k) => /counterpart|equivalent/i.test(k));
-  if (counterpartKeys.length > 0) {
-    const counterpartIsbns = [];
-    for (const key of counterpartKeys) {
-      const stack = [obj[key]];
-      while (stack.length) {
-        const cur = stack.pop();
-        if (cur == null) continue;
-        if (Array.isArray(cur)) { stack.push(...cur); continue; }
-        if (typeof cur === 'object') { stack.push(...Object.values(cur)); continue; }
-        const cleaned = normalizeIsbnBridge(cur);
-        if (cleaned.length === 10 || cleaned.length === 13) counterpartIsbns.push(cleaned);
-      }
-    }
-    const ownIsbns = [];
-    for (const [key, value] of Object.entries(obj)) {
-      if (/isbn/i.test(key) && !/counterpart|equivalent/i.test(key)) {
-        const stack = [value];
-        while (stack.length) {
-          const cur = stack.pop();
-          if (cur == null) continue;
-          if (Array.isArray(cur)) { stack.push(...cur); continue; }
-          if (typeof cur === 'object') { stack.push(...Object.values(cur)); continue; }
-          const cleaned = normalizeIsbnBridge(cur);
-          if (cleaned.length === 10 || cleaned.length === 13) ownIsbns.push(cleaned);
-        }
-      }
-    }
-
-    if (counterpartIsbns.length > 0 && ownIsbns.length > 0) {
-      for (const c of counterpartIsbns) {
-        for (const o of ownIsbns) {
-          pairs.push([c, o]);
-        }
-      }
-    } else if (counterpartIsbns.length >= 2) {
-      for (let i = 0; i < counterpartIsbns.length; i++) {
-        for (let j = i + 1; j < counterpartIsbns.length; j++) {
-          pairs.push([counterpartIsbns[i], counterpartIsbns[j]]);
-        }
-      }
-    }
-  }
-
-  for (const [key, value] of Object.entries(obj)) {
-    if (counterpartKeys.includes(key)) continue;
-    if (value && typeof value === 'object') {
-      pairs.push(...collectEditionSpecificIsbnPairsBridge(value));
-    }
-  }
-  return pairs;
+  return ID.collectIsbnPairs(obj);
 }
 
-// Backwards-compatible flattened view (not used for verification decisions).
 export function collectEditionSpecificIsbnsBridge(obj, out = new Set()) {
-  for (const [a, b] of collectEditionSpecificIsbnPairsBridge(obj)) {
-    const na = normalizeIsbnBridge(a);
-    const nb = normalizeIsbnBridge(b);
-    if (na.length === 10 || na.length === 13) out.add(na);
-    if (nb.length === 10 || nb.length === 13) out.add(nb);
-  }
-  return out;
+  return ID.collectMetadataIsbns(obj, out);
 }
 
 export function areVerifiedIsbnCounterpartsBridge(isbnA, isbnB, ...contexts) {
-  const a = normalizeIsbnBridge(isbnA);
-  const b = normalizeIsbnBridge(isbnB);
-  if (!a || !b) return false;
-  if (a === b) return true;
-  for (const ctx of contexts) {
-    if (!ctx) continue;
-    const pairs = [];
-    if (typeof ctx === 'object') {
-      if (ctx.bookMetadata && typeof ctx.bookMetadata === 'object') {
-        pairs.push(...collectEditionSpecificIsbnPairsBridge(ctx.bookMetadata));
-      }
-      if (ctx.metadata && typeof ctx.metadata === 'object') {
-        pairs.push(...collectEditionSpecificIsbnPairsBridge(ctx.metadata));
-      }
-      pairs.push(...collectEditionSpecificIsbnPairsBridge(ctx));
-      if (ctx.extra && typeof ctx.extra === 'object') {
-        if (ctx.extra.bookMetadata && typeof ctx.extra.bookMetadata === 'object') {
-          pairs.push(...collectEditionSpecificIsbnPairsBridge(ctx.extra.bookMetadata));
-        }
-        pairs.push(...collectEditionSpecificIsbnPairsBridge(ctx.extra));
-      }
-    }
-    for (const [x, y] of pairs) {
-      const nx = normalizeIsbnBridge(x);
-      const ny = normalizeIsbnBridge(y);
-      if ((nx === a && ny === b) || (nx === b && ny === a)) {
-        return true;
-      }
-    }
-  }
-  return false;
+  return ID.areVerifiedCounterparts(isbnA, isbnB, ...contexts);
 }
 
 /**
@@ -758,22 +362,10 @@ export function areEditionsCompatible(a, b) {
     return false;
   }
 
-  const authorA = (a.author || (Array.isArray(a.authors) ? a.authors[0] : '') || '').trim().toLowerCase();
-  const authorB = (b.author || (Array.isArray(b.authors) ? b.authors[0] : '') || '').trim().toLowerCase();
-  if (authorA && authorB && authorA !== authorB) {
-    const cleanA = authorA.replace(/[^a-z0-9]/g, '');
-    const cleanB = authorB.replace(/[^a-z0-9]/g, '');
-    if (cleanA !== cleanB && !cleanA.includes(cleanB) && !cleanB.includes(cleanA)) {
-      const tokensA = authorA.split(/[^a-z0-9]+/).filter((t) => t.length > 1);
-      const tokensB = authorB.split(/[^a-z0-9]+/).filter((t) => t.length > 1);
-      const setA = new Set(tokensA);
-      const setB = new Set(tokensB);
-      const allAInB = tokensA.length > 0 && tokensA.every((t) => setB.has(t));
-      const allBInA = tokensB.length > 0 && tokensB.every((t) => setA.has(t));
-      if (!allAInB && !allBInA) {
-        return false;
-      }
-    }
+  const authorA = (a.author || (Array.isArray(a.authors) ? a.authors[0] : '') || '').trim();
+  const authorB = (b.author || (Array.isArray(b.authors) ? b.authors[0] : '') || '').trim();
+  if (authorA && authorB && !ID.isAuthorMatch(authorA, authorB)) {
+    return false;
   }
 
   const fmtA = (a.format || '').trim().toLowerCase();
@@ -4247,3 +3839,17 @@ if (process.argv[1] && path.resolve(process.argv[1]) === path.resolve(fileURLToP
     console.log('[Bridge] Native Shelfmark indexer searches and manual grab remain active; the companion handles approved request queueing and fulfillment asynchronously.');
   });
 }
+
+
+// Re-export shared identity helpers under bridge-friendly names for tests.
+export {
+  validateIsbn,
+  sameIsbn,
+  isbn10To13,
+  isbn13To10,
+  titleMatchDecision,
+  authorMatchDecision,
+  editionCompatibility,
+  matchDecision,
+  normalizeIsbn,
+} from '../shared/identity.mjs';
