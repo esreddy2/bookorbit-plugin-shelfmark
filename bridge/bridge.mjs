@@ -3689,6 +3689,97 @@ export class BridgeService {
    * Enforces timing-safe secret validation, request body size limits,
    * and local/private network binding.
    */
+  /**
+   * Read-only diagnostic report for a request or the whole bridge state.
+   * Never includes credentials, authorization headers, private URLs or full payloads.
+   */
+  diagnose(requestId = null) {
+    const sanitize = (v) => {
+      if (v == null) return v;
+      if (typeof v === 'string') {
+        // redact anything that looks like a token/key/secret/url with credentials
+        return v.replace(/(token|secret|key|password|auth)=([^&\s]+)/gi, '$1=[REDACTED]');
+      }
+      return v;
+    };
+    const tasks = this.state.tasks || {};
+    const requests = this.state.requests || {};
+    const progress = this.state.requestProgress || {};
+    const attempts = this.state.requestAttempts || {};
+    const errors = this.state.requestErrors || {};
+    const failedReleases = this.state.failedReleases || {};
+    const uncertain = this.state.uncertainQueues || {};
+    const sourceAttempts = this.state.requestSourceAttempts || {};
+
+    const filterByRequest = (obj) => {
+      if (!requestId) return obj;
+      const out = {};
+      for (const [k, v] of Object.entries(obj || {})) {
+        const matches = k === requestId || (v && (v.requestId === requestId || (Array.isArray(v.requestIds) && v.requestIds.includes(requestId))));
+        if (matches) {
+          out[k] = v;
+        }
+      }
+      return out;
+    };
+
+    const report = {
+      generatedAt: new Date().toISOString(),
+      requestId: requestId || null,
+      request: requestId ? (requests[requestId] ? { taskId: requests[requestId] } : null) : undefined,
+      stage: requestId ? (progress[requestId] || null) : undefined,
+      lastTransitionReason: requestId ? (this.state.requestFailureReasons?.[requestId] || null) : undefined,
+      searchAttempts: requestId ? (sourceAttempts[requestId] ?? 0) : sourceAttempts,
+      attempts: requestId ? (attempts[requestId] || []) : attempts,
+      errors: requestId ? (errors[requestId] || null) : errors,
+      metadataCandidateCounts: requestId ? undefined : undefined,
+      candidateRejectionReasonCounts: undefined,
+      associatedShelfmarkTask: requestId ? (requests[requestId] ? tasks[requests[requestId]] || null : null) : undefined,
+      verificationEvidence: requestId ? (tasks[requests[requestId]]?.verificationEvidence || null) : undefined,
+      verificationConflicts: requestId ? (tasks[requests[requestId]]?.verificationConflicts || null) : undefined,
+      retryState: requestId ? { attempts: sourceAttempts[requestId] ?? 0, max: this.maxSourceAttempts } : undefined,
+      taskStatuses: Object.fromEntries(Object.entries(tasks).map(([k, v]) => [k, v?.status || v?.state || 'unknown'])),
+      uncertainQueueCount: Object.keys(uncertain).length,
+      failedReleaseCount: Object.keys(failedReleases).length,
+    };
+
+    if (requestId) {
+      const t = requests[requestId] ? tasks[requests[requestId]] : null;
+      if (t) {
+        report.task = {
+          id: t.id || t.taskId || t.task_id || null,
+          status: t.status || t.state || null,
+          format: t.format || null,
+          source: t.source || null,
+          sourceId: t.source_id || t.sourceId || null,
+          year: t.year || t.publicationYear || null,
+          isbn: t.isbn || t.isbn13 || null,
+          title: t.title || t.book_title || null,
+          author: t.author || null,
+          verificationEvidence: t.verificationEvidence || t.verification?.evidence || null,
+          verificationConflicts: t.verificationConflicts || t.verification?.conflicts || null,
+        };
+      }
+      report.uncertainQueues = filterByRequest(uncertain);
+      report.failedReleases = Object.fromEntries(Object.entries(failedReleases).filter(([, v]) => !requestId || (v && (v.requestId === requestId || (Array.isArray(v.requestIds) && v.requestIds.includes(requestId))))));
+    } else {
+      report.uncertainQueues = uncertain;
+      report.failedReleases = failedReleases;
+    }
+
+    // Sanitize string fields recursively (shallow)
+    const walk = (o) => {
+      if (Array.isArray(o)) return o.map(walk);
+      if (o && typeof o === 'object') {
+        const r = {};
+        for (const [k, v] of Object.entries(o)) r[k] = walk(v);
+        return r;
+      }
+      return sanitize(o);
+    };
+    return walk(report);
+  }
+
   createServer(port = 8085, host = this.host) {
     if (!this._httpLock) this._httpLock = Promise.resolve();
     const runLocked = (fn) => {
@@ -3800,6 +3891,16 @@ export class BridgeService {
         return;
       }
 
+      // Read-only diagnostics endpoint: GET /api/diagnostics or /api/diagnostics/:requestId
+      if (req.method === 'GET' && (url.pathname === '/api/diagnostics' || url.pathname.startsWith('/api/diagnostics/'))) {
+        await runLocked(async () => {
+          const rid = url.pathname === '/api/diagnostics' ? (url.searchParams.get('requestId') || null) : decodeURIComponent(url.pathname.slice('/api/diagnostics/'.length));
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify(this.diagnose(rid)));
+        });
+        return;
+      }
+
       // Health and status endpoint: GET /api/status
       if (req.method === 'GET' && url.pathname === '/api/status') {
         await runLocked(async () => {
@@ -3826,6 +3927,13 @@ export class BridgeService {
 
 // Standalone execution entrypoint
 if (process.argv[1] && path.resolve(process.argv[1]) === path.resolve(fileURLToPath(import.meta.url))) {
+  if (process.argv.includes('--diagnose')) {
+    const bridge = new BridgeService({ host: process.env.BRIDGE_HOST || '127.0.0.1' });
+    const rid = process.argv[process.argv.indexOf('--diagnose') + 1];
+    const report = bridge.diagnose(rid && !rid.startsWith('--') ? rid : null);
+    console.log(JSON.stringify(report, null, 2));
+    process.exit(0);
+  }
   const parsedPort = parsePositiveInt(process.env.BRIDGE_PORT);
   const port = parsedPort || 8085;
   const host = process.env.BRIDGE_HOST || '127.0.0.1';
@@ -3852,4 +3960,5 @@ export {
   editionCompatibility,
   matchDecision,
   normalizeIsbn,
+  areVerifiedCounterparts,
 } from '../shared/identity.mjs';

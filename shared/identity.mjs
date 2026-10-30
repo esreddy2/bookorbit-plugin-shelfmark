@@ -82,12 +82,6 @@ export function isNoiseDerivative(candidateTitle, requestedTitle) {
     if (normCand.includes(marker) && !normReq.includes(marker)) return true;
   }
   if (/\b(?:stage|level)\s*[1-6]\b/i.test(candidateTitle) && !/\b(?:stage|level)\s*[1-6]\b/i.test(requestedTitle)) return true;
-  const hasAnimalFarm = normCand.includes('animal farm');
-  const has1984 = normCand.includes('1984') || normCand.includes('nineteen eighty four');
-  if (hasAnimalFarm && has1984) {
-    const reqHasBoth = normReq.includes('animal farm') && (normReq.includes('1984') || normReq.includes('nineteen eighty four'));
-    if (!reqHasBoth) return true;
-  }
   return false;
 }
 

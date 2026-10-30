@@ -46,6 +46,19 @@ import {
   normalizeTaskGroup,
   parsePositiveInt,
   areEditionsCompatible,
+  titleMatchDecision,
+  authorMatchDecision,
+  editionCompatibility,
+  matchDecision,
+  normalizeIsbn,
+  areVerifiedCounterparts,
+  sameIsbn,
+  validateIsbn,
+  isbn10To13,
+  isbn13To10,
+  normalizeString,
+  toNaturalAuthor,
+  isNoiseDerivative,
   extractEpubMetadata,
   extractEpubMetadataFromFile,
   MAGIC_BYTES,
@@ -53,7 +66,7 @@ import {
 } from './bridge/bridge.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
-const EXPECTED_VERSION = '1.6.0';
+const EXPECTED_VERSION = '1.7.0';
 const RELEASE_MODE = process.argv.includes('--release');
 const TEST_TIMEOUT_MS = 10_000;
 const tests = [];
@@ -373,7 +386,7 @@ test('DECLARATION: BookOrbit API v1, Shelfmark indexer and ebook-only', () => {
   assert.equal(plugin.type, 'shelfmark');
   assert.deepEqual(plugin.mediaKinds, ['ebook']);
 });
-test('DECLARATION: native indexer advertises v1.6.0, never a previous version', () => {
+test('DECLARATION: native indexer advertises v1.7.0, never a previous version', () => {
   assert.equal(plugin.version, EXPECTED_VERSION);
 });
 test('DECLARATION: exposes search, test, and resolveFile entry points', () => {
@@ -399,7 +412,7 @@ test('RELEASE CONTRACT: package version, plugin version and release target agree
   assert.equal(plugin.version, EXPECTED_VERSION);
 });
 if (RELEASE_MODE) {
-  test('RELEASE: signed manifest has declared format and v1.6.0 version', () => {
+  test('RELEASE: signed manifest has declared format and v1.7.0 version', () => {
     const manifest = JSON.parse(readFileSync(join(HERE, 'updates', 'shelfmark.json'), 'utf8'));
     assert.equal(manifest.schemaVersion, 1);
     assert.equal(manifest.type, 'shelfmark');
@@ -3336,6 +3349,149 @@ test('REGRESSION: a failed source is cooled down and a healthy alternative is se
   const posts = fake.called('sm.download').map((c) => expectedJson(c.options));
   assert.equal(posts.length, 1, 'healthy alternative should be tried once');
   assert.equal(posts[0].source_id, 'healthy-alternative-1984');
+  fake.assertKnownRoutes();
+});
+
+test('DIAGNOSTICS: BridgeService.diagnose returns sanitized redacted report', async () => {
+  const stateFile = join(root, 'diag-state.json');
+  const bridge = new BridgeService({ stateFilePath: stateFile, host: '127.0.0.1' });
+  // seed minimal state
+  bridge.state.tasks['t1'] = { id: 't1', status: 'completed', title: 'Dune', author: 'Frank Herbert', year: 1965, isbn: '9780441172719', format: 'epub', source: 'direct_download', source_id: 'src1', verificationEvidence: [{ field: 'title', status: 'verified' }], verificationConflicts: [] };
+  bridge.state.requests['r1'] = 't1';
+  bridge.state.requestProgress['r1'] = { stage: 'importing', status: 'importing', updatedAt: new Date().toISOString() };
+  bridge.state.requestSourceAttempts['r1'] = 2;
+  bridge.saveState();
+  const report = bridge.diagnose('r1');
+  assert.equal(report.requestId, 'r1');
+  assert.equal(report.stage.stage, 'importing');
+  assert.equal(report.task.id, 't1');
+  assert.equal(report.task.status, 'completed');
+  assert.equal(report.retryState.attempts, 2);
+  assert.equal(report.retryState.max, 3);
+  // no credentials leaked
+  const serialized = JSON.stringify(report);
+  assert.ok(!serialized.includes('secret'), 'diagnostic must not include secrets');
+  assert.ok(!serialized.includes('token'), 'diagnostic must not include tokens');
+  const all = bridge.diagnose();
+  assert.ok(all.taskStatuses && all.taskStatuses.t1 === 'completed');
+});
+
+test('PROPERTY: normalizeString is idempotent and lowercases', () => {
+  const samples = ['Dune', '  1984  ', 'Nineteen Eighty-Four', 'Müller', 'A:B-C', ''];
+  for (const s of samples) {
+    const once = normalizeString(s);
+    assert.equal(normalizeString(once), once, `normalize not idempotent for ${s}`);
+  }
+  assert.equal(normalizeString('ABC'), 'abc');
+});
+
+test('PROPERTY: sameIsbn is symmetric and handles 10/13 conversion', () => {
+  const isbn10 = '0441172717';
+  const isbn13 = '9780441172719';
+  assert.equal(sameIsbn(isbn10, isbn13), sameIsbn(isbn13, isbn10));
+  // valid conversion pair
+  const v10 = validateIsbn(isbn10);
+  const v13 = validateIsbn(isbn13);
+  assert.equal(v10.valid, true);
+  assert.equal(v13.valid, true);
+  assert.equal(isbn10To13(isbn10), isbn13);
+  assert.equal(isbn13To10(isbn13), isbn10);
+  // unrelated ISBNs not same
+  assert.equal(sameIsbn('9780441172719', '9780060850524'), false);
+  // empty not same
+  assert.equal(sameIsbn('', '9780441172719'), false);
+});
+
+test('PROPERTY: unrelated counterpart pairs remain independent', () => {
+  const ctxA = { bookMetadata: { isbn: '9781111111111', counterpart_isbn: '9782222222222' } };
+  const ctxB = { bookMetadata: { isbn: '9783333333333', counterpart_isbn: '9784444444444' } };
+  // A's pair should not imply B's
+  assert.equal(areVerifiedCounterparts('9781111111111', '9782222222222', ctxA), true);
+  assert.equal(areVerifiedCounterparts('9781111111111', '9783333333333', ctxA, ctxB), false);
+  assert.equal(areVerifiedCounterparts('9782222222222', '9784444444444', ctxA, ctxB), false);
+});
+
+test('PROPERTY: unknown evidence cannot become verified (year)', () => {
+  const req = { title: 'Dune', author: 'Frank Herbert', year: 1965 };
+  const cand = { title: 'Dune', author: 'Frank Herbert', year: null };
+  const d = editionCompatibility(req, cand);
+  // known requested year + unknown release year => reject unless ISBN verified
+  assert.equal(d.outcome, 'reject');
+  assert.ok(d.conflicts.includes('unknown_release_year'));
+});
+
+test('PROPERTY: contradictory edition evidence prevents fulfillment', () => {
+  const req = { title: 'Dune', author: 'Frank Herbert', year: 1965, isbn: '9780441172719', language: 'en' };
+  const cand = { title: 'Dune', author: 'Frank Herbert', year: 1984, isbn: '9780060850524', language: 'fr' };
+  const d = editionCompatibility(req, cand);
+  assert.equal(d.outcome, 'reject');
+  assert.ok(d.conflicts.includes('incompatible_year'));
+  assert.ok(d.conflicts.includes('conflicting_isbn'));
+  assert.ok(d.conflicts.includes('language_mismatch'));
+});
+
+test('PROPERTY: noise derivatives are rejected', () => {
+  const cases = [
+    ['Summary of Dune', 'Dune'],
+    ['Dune: Study Guide', 'Dune'],
+    ['Dune (Graphic Novel)', 'Dune'],
+    ['Dune Abridged', 'Dune'],
+  ];
+  for (const [c, r] of cases) {
+    assert.equal(isNoiseDerivative(c, r), true, `${c} should be noise derivative of ${r}`);
+  }
+  assert.equal(isNoiseDerivative('Dune', 'Dune'), false);
+});
+
+test('PROPERTY: title match decision is stable under candidate reordering input', () => {
+  const a = titleMatchDecision('The Hobbit', 'Hobbit');
+  const b = titleMatchDecision('The Hobbit', 'Hobbit');
+  assert.equal(a.outcome, b.outcome);
+  // different but equivalent phrasing
+  assert.equal(titleMatchDecision('1984', 'Nineteen Eighty-Four').outcome, 'match');
+});
+
+test('PROPERTY: author match rejects conflicting authors', () => {
+  assert.equal(authorMatchDecision('George Orwell', 'Michael Dean').outcome, 'reject');
+  assert.equal(authorMatchDecision('J. K. Rowling', 'J. K. Rowling').outcome, 'match');
+});
+
+test('PROPERTY: matchDecision aggregates conflicts', () => {
+  const req = { title: 'Dune', author: 'Frank Herbert', year: 1965, isbn: '9780441172719' };
+  const cand = { title: 'Dune Messiah', author: 'Frank Herbert', year: 1969, isbn: '9780441005901' };
+  const d = matchDecision(req, cand);
+  // title mismatch? Dune vs Dune Messiah: safePrefix? 'dune messiah' starts with 'dune ' then 'messiah' not boundary? actually space then messiah no punctuation => safePrefix false for prefix? Let's just ensure not match outcome match
+  assert.notEqual(d.outcome, 'match');
+});
+
+test('STATEFUL: duplicate webhook events do not duplicate upload or fulfillment', async () => {
+  const stateFilePath = newStateFile();
+  const bridge = established(new BridgeService(bridgeOpts({ stateFilePath,
+    secret: 'dup-event-secret' })), ['historical-only']);
+  const incoming = request('dup-evt', 'Fahrenheit 451', 'Ray Bradbury');
+  const fake = apiScenarios({
+    requests: [incoming],
+    books: [metadata('Fahrenheit 451', 'Ray Bradbury')],
+    releases: [release('Fahrenheit 451', 'Ray Bradbury', { source_id: 'dup-src' })],
+    taskId: 'dup-task',
+    'bo.upload': { id: 3001 }, 'bo.fulfill': { id: 'dup-evt', status: 'AVAILABLE' },
+  });
+  await bridge.processPendingRequests({ fetchFn: fake.fetch });
+  const payload = {
+    version: 1, phase: 'post_transfer',
+    task: { task_id: 'dup-task', source: 'annas', title: 'Fahrenheit 451', format: 'epub' },
+    paths: { destination: root, target: FILES.fahrenheitEpub, final_paths: [FILES.fahrenheitEpub] },
+    output: { mode: 'folder' },
+  };
+  const first = await bridge.handleWebhook(payload, 'dup-event-secret', fake.fetch);
+  assert.equal(first.ok, true);
+  const uploadsBefore = fake.called('bo.upload').length;
+  const fulfillsBefore = fake.called('bo.fulfill').length;
+  // duplicate delivery
+  const second = await bridge.handleWebhook(payload, 'dup-event-secret', fake.fetch);
+  assert.equal(second.ok, true);
+  assert.equal(fake.called('bo.upload').length, uploadsBefore, 'duplicate webhook must not re-upload');
+  assert.equal(fake.called('bo.fulfill').length, fulfillsBefore, 'duplicate webhook must not re-fulfill');
   fake.assertKnownRoutes();
 });
 

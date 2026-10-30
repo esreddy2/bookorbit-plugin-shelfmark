@@ -26,7 +26,7 @@ const inFlightResolutions = new Map();
 /** Confident bidirectional title equivalents. */
 export default {
   apiVersion: 1,
-  version: '1.6.0',
+  version: '1.7.0',
   update: {
     manifestUrl: 'https://raw.githubusercontent.com/esreddy2/bookorbit-plugin-shelfmark/main/updates/shelfmark.json',
     ed25519PublicKey: '-0aHVhXqg7cGaDchc2p1Y8tDnn8A7cJ0WREKspNv5Bc',
@@ -1366,12 +1366,6 @@ function isNoiseDerivative(candidateTitle, requestedTitle) {
     if (normCand.includes(marker) && !normReq.includes(marker)) return true;
   }
   if (/\b(?:stage|level)\s*[1-6]\b/i.test(candidateTitle) && !/\b(?:stage|level)\s*[1-6]\b/i.test(requestedTitle)) return true;
-  const hasAnimalFarm = normCand.includes('animal farm');
-  const has1984 = normCand.includes('1984') || normCand.includes('nineteen eighty four');
-  if (hasAnimalFarm && has1984) {
-    const reqHasBoth = normReq.includes('animal farm') && (normReq.includes('1984') || normReq.includes('nineteen eighty four'));
-    if (!reqHasBoth) return true;
-  }
   return false;
 }
 
@@ -1929,8 +1923,8 @@ function scoreBookMatch(book, searchTitle, searchAuthor) {
   const normQueryTitle = normalizeString(searchTitle);
   const normBookTitle = normalizeString(book.title);
   if (normBookTitle === normQueryTitle) score += 50;
-  else if (normBookTitle.startsWith(normQueryTitle)) score += 30;
-  else if (normBookTitle.includes(normQueryTitle)) score += 20;
+  else if (safePrefix(normBookTitle, normQueryTitle) || safePrefix(normQueryTitle, normBookTitle)) score += 30;
+  else if (getTokens(normQueryTitle).length > 1 && getTokens(normQueryTitle).every((t) => getTokens(normBookTitle).includes(t))) score += 20;
 
   if (searchAuthor) {
     const normQueryAuthor = normalizeString(toNaturalAuthor(searchAuthor));
@@ -1940,9 +1934,13 @@ function scoreBookMatch(book, searchTitle, searchAuthor) {
       if (normA === normQueryAuthor) {
         score += 50;
         break;
-      } else if (normA.includes(normQueryAuthor) || normQueryAuthor.includes(normA)) {
-        score += 25;
-        break;
+      } else {
+        const aTokens = getTokens(normA);
+        const qTokens = getTokens(normQueryAuthor);
+        if (qTokens.length > 0 && qTokens.every((t) => aTokens.includes(t)) && aTokens.length <= qTokens.length + 2) {
+          score += 25;
+          break;
+        }
       }
     }
   }
