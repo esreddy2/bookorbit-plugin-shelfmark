@@ -267,6 +267,280 @@ export function parseShelfmarkStatus(statusJson) {
 /**
  * Validates and parses positive integers (e.g. library and folder IDs).
  */
+export const KNOWN_TITLE_EQUIVALENTS = new Map([
+  ['1984', ['nineteen eighty four', 'nineteen eighty-four']],
+  ['nineteen eighty four', ['1984']],
+  ['nineteen eighty-four', ['1984']],
+  ['2001', ['two thousand and one']],
+  ['two thousand and one', ['2001']],
+]);
+
+export function normalizeString(str) {
+  if (!str) return '';
+  return String(str)
+    .toLowerCase()
+    .normalize('NFKD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/[^\p{L}\p{N}\s]/gu, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+
+export function getTokens(str) {
+  return normalizeString(str)
+    .split(' ')
+    .filter((t) => t.length > 0);
+}
+
+/**
+ * Normalizes author name strings to natural first-last name order.
+ * E.g., "Orwell, George, 1903-1950" -> "George Orwell"
+ *       "Bradbury, Ray" -> "Ray Bradbury"
+ *       "Celeste Ng" -> "Celeste Ng"
+ */
+
+
+export function toNaturalAuthor(author) {
+  if (!author) return '';
+  let s = String(author).trim();
+  // Remove life dates like "1903-1950", "1920-", "(1920-2012)"
+  s = s.replace(/\s*\(?\b\d{4}\s*[-–—]\s*\d{0,4}\b\)?/g, ' ').trim();
+  // Remove parenthetical annotations like "(writer)", "(illustrator)"
+  s = s.replace(/\s*\([^)]*\)/g, ' ').trim();
+  // Remove trailing punctuation
+  s = s.replace(/[,.;]+$/, '').trim();
+  if (s.includes(',')) {
+    const parts = s.split(',').map((p) => p.trim()).filter(Boolean);
+    if (parts.length === 2) {
+      const [last, first] = parts;
+      if (!/^(jr|sr|ii|iii|iv|v|phd|md|esq)\.?$/i.test(first)) {
+        return `${first} ${last}`.trim();
+      }
+    }
+  }
+  return s.replace(/\s+/g, ' ').trim();
+}
+
+/**
+ * Extracts a clean 10 or 13 digit ISBN from metadata or search query.
+ * Supports BookOrbit v3.5.0 PluginReleaseQuery (isbn13, isbn13s, legacy isbn).
+ */
+
+
+export function extractCoreTitle(title) {
+  if (!title) return '';
+  let s = String(title).trim();
+  // Remove bracketed tags like [EPUB], [PDF] and parentheticals like (Retail), (Signet)
+  s = s.replace(/\s*\[[^\]]*\]\s*/g, ' ').replace(/\s*\([^)]*\)\s*/g, ' ').trim();
+  // Remove trailing download keywords (e.g. from OceanofPDF titles)
+  s = s.replace(/\s+download\b/gi, '').trim();
+  // Split on " by " only when it clearly separates title from an author name
+  // (e.g. "1984 by George Orwell"), never for titles that merely contain "by".
+  const byMatch = s.split(/\s+by\s+/i);
+  if (byMatch.length > 1 && byMatch[0].trim().length >= 2) {
+    const suffix = byMatch[1].trim();
+    const suffixTokens = suffix.split(/\s+/).filter(Boolean);
+    const looksLikeAuthor = suffix.includes(',') || suffixTokens.length >= 2;
+    if (looksLikeAuthor) {
+      s = byMatch[0].trim();
+    }
+  }
+  // Split on subtitle and series delimiters (colons, semicolons, slashes, pipes, or spaced dashes)
+  const parts = s.split(/(?:\s+[-–—]\s+|[:;/|]|\s*[–—]\s*)/);
+  const core = parts[0]?.trim();
+  return core && core.length >= 2 ? core : s;
+}
+
+
+export function isNoiseDerivative(candidateTitle, requestedTitle) {
+  const normCand = normalizeString(candidateTitle);
+  const normReq = normalizeString(requestedTitle);
+  const noiseMarkers = [
+    // Study guides & summaries
+    'summary of',
+    'study guide',
+    'cliffsnotes',
+    'sparknotes',
+    'analysis of',
+    'workbook for',
+    'book summary',
+    'companion to',
+    'teacher guide',
+    'teachers guide',
+    'lesson plans',
+    'activity guide',
+    // Adaptations & abridgments
+    'adapted by',
+    'retold by',
+    'simplified edition',
+    'simplified retelling',
+    'retelling',
+    'abridged',
+    // Graded readers
+    'graded reader',
+    'oxford bookworms',
+    'penguin active reading',
+    'penguin readers',
+    'macmillan readers',
+    // Graphic novels & comics
+    'graphic novel',
+    'comic book',
+    'illustrated novel',
+    // Collections & boxed sets
+    'complete works',
+    'box set',
+    'boxed set',
+    'omnibus',
+    'anthology',
+  ];
+  for (const marker of noiseMarkers) {
+    if (normCand.includes(marker) && !normReq.includes(marker)) {
+      return true;
+    }
+  }
+
+  // Graded reader stage / level markers: e.g. "stage 1", "level 3"
+  if (/\b(?:stage|level)\s*[1-6]\b/i.test(candidateTitle) && !/\b(?:stage|level)\s*[1-6]\b/i.test(requestedTitle)) {
+    return true;
+  }
+
+  // Multi-work collections (e.g. "Animal Farm & 1984" when user searched only one of them)
+  const hasAnimalFarm = normCand.includes('animal farm');
+  const has1984 = normCand.includes('1984') || normCand.includes('nineteen eighty four');
+  if (hasAnimalFarm && has1984) {
+    const reqHasBoth =
+      normReq.includes('animal farm') && (normReq.includes('1984') || normReq.includes('nineteen eighty four'));
+    if (!reqHasBoth) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+
+export function isTitleMatch(candidateTitle, requestedTitle) {
+  if (!requestedTitle) return true;
+  if (!candidateTitle) return false;
+
+  if (isNoiseDerivative(candidateTitle, requestedTitle)) {
+    return false;
+  }
+
+  const normCand = normalizeString(candidateTitle);
+  const normReq = normalizeString(requestedTitle);
+  if (!normCand || !normReq) return false;
+
+  // Reject translated/compound titles that append extra letters directly to the
+  // requested title (e.g. Lithuanian "1984-ieji"), which are distinct editions.
+  try {
+    const escaped = String(requestedTitle).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    if (new RegExp(escaped + '-[\\p{L}]+', 'iu').test(candidateTitle)) {
+      return false;
+    }
+  } catch (e) {
+    // Fall through to normal matching on regex failure
+  }
+
+  if (normCand === normReq) return true;
+  if (normCand.startsWith(normReq) || normReq.startsWith(normCand)) return true;
+  if (normCand.includes(normReq) || normReq.includes(normCand)) return true;
+
+  // Check confident equivalents (e.g. 1984 vs Nineteen Eighty-Four)
+  const equivalents = KNOWN_TITLE_EQUIVALENTS.get(normReq);
+  if (equivalents) {
+    for (const eq of equivalents) {
+      const normEq = normalizeString(eq);
+      if (normCand === normEq || normCand.startsWith(normEq) || normCand.includes(normEq)) {
+        return true;
+      }
+    }
+  }
+
+  const candEquivalents = KNOWN_TITLE_EQUIVALENTS.get(normCand);
+  if (candEquivalents) {
+    for (const eq of candEquivalents) {
+      const normEq = normalizeString(eq);
+      if (normReq === normEq || normReq.startsWith(normEq) || normReq.includes(normEq)) {
+        return true;
+      }
+    }
+  }
+
+  // Check core title match (e.g. "Animal Farm: A Fairy Story" vs "Animal Farm")
+  const coreCand = normalizeString(extractCoreTitle(candidateTitle));
+  const coreReq = normalizeString(extractCoreTitle(requestedTitle));
+  if (coreCand && coreReq && (coreCand === coreReq || coreCand === normReq || normCand === coreReq)) {
+    return true;
+  }
+
+  const candTokens = getTokens(candidateTitle);
+  const reqTokens = getTokens(requestedTitle);
+  if (reqTokens.length === 0) return true;
+
+  const matchingTokens = reqTokens.filter((t) => candTokens.includes(t));
+  return matchingTokens.length / reqTokens.length >= 0.7;
+}
+
+
+export function isAuthorMatch(candidateAuthors, requestedAuthor) {
+  if (!requestedAuthor) return true;
+  if (!candidateAuthors) return false;
+
+  const rawList = Array.isArray(candidateAuthors)
+    ? candidateAuthors
+    : String(candidateAuthors).split(/[;&]/);
+
+  const authorList = rawList.map((a) => toNaturalAuthor(a)).filter(Boolean);
+  if (authorList.length === 0) return false;
+
+  const reqNorm = normalizeString(toNaturalAuthor(requestedAuthor));
+  const reqTokens = getTokens(reqNorm);
+  if (reqTokens.length === 0) return true;
+
+  for (const cand of authorList) {
+    const candNorm = normalizeString(cand);
+    const candTokens = getTokens(cand);
+    if (candTokens.length === 0) continue;
+
+    // Direct match or substring
+    if (candNorm === reqNorm || candNorm.includes(reqNorm) || reqNorm.includes(candNorm)) {
+      return true;
+    }
+
+    // Token set containment
+    const matchingTokens = reqTokens.filter((t) => candTokens.includes(t));
+    if (matchingTokens.length === reqTokens.length) {
+      return true;
+    }
+
+    // Surname + initials / first name match
+    const reqSurname = reqTokens[reqTokens.length - 1];
+    if (candTokens.includes(reqSurname)) {
+      if (reqTokens.length === 1) return true;
+      const reqFirst = reqTokens[0];
+      if (candTokens.some((t) => t === reqFirst || t.startsWith(reqFirst[0]) || reqFirst.startsWith(t[0]))) {
+        return true;
+      }
+    }
+
+    // Transposed author match
+    const candSurname = candTokens[0];
+    if (reqTokens.includes(candSurname)) {
+      if (candTokens.length === 1) return true;
+      const candFirst = candTokens[candTokens.length - 1];
+      const reqFirst = reqTokens[0];
+      if (reqTokens.some((t) => t === candFirst || t.startsWith(candFirst[0]) || candFirst.startsWith(t[0]))) {
+        return true;
+      }
+    }
+  }
+
+  return false;
+}
+
+
 export function parsePositiveInt(val) {
   if (typeof val === 'number') {
     return Number.isInteger(val) && val > 0 ? val : null;
@@ -439,13 +713,9 @@ export function areVerifiedIsbnCounterpartsBridge(isbnA, isbnB, ...contexts) {
 export function areEditionsCompatible(a, b) {
   if (!a || !b) return false;
 
-  const cleanTitle = (obj) => {
-    const raw = (obj.bookTitle || obj.title || '').trim().toLowerCase();
-    return raw.replace(/\[[^\]]+\]/g, '').replace(/\([^)]+\)/g, '').replace(/\s+/g, ' ').trim();
-  };
-  const titleA = cleanTitle(a);
-  const titleB = cleanTitle(b);
-  if (titleA && titleB && titleA !== titleB) {
+  const rawTitleA = (a.bookTitle || a.title || '').trim();
+  const rawTitleB = (b.bookTitle || b.title || '').trim();
+  if (rawTitleA && rawTitleB && !isTitleMatch(rawTitleA, rawTitleB)) {
     return false;
   }
 
@@ -480,14 +750,14 @@ export function areEditionsCompatible(a, b) {
   let metaIsbnB = b.epubMetadata?.isbn;
   if (a.filePath && (a.format === 'epub' || (a.filePath || '').endsWith('.epub'))) {
     const meta = extractEpubMetadataFromFile(a.filePath);
-    if (meta && (!meta.title || cleanTitle({ title: meta.title }) === titleA)) {
+    if (meta && (!meta.title || isTitleMatch(meta.title, rawTitleA))) {
       metaYearA = metaYearA || meta.year;
       metaIsbnA = metaIsbnA || meta.isbn;
     }
   }
   if (b.filePath && (b.format === 'epub' || (b.filePath || '').endsWith('.epub'))) {
     const meta = extractEpubMetadataFromFile(b.filePath);
-    if (meta && (!meta.title || cleanTitle({ title: meta.title }) === titleB)) {
+    if (meta && (!meta.title || isTitleMatch(meta.title, rawTitleB))) {
       metaYearB = metaYearB || meta.year;
       metaIsbnB = metaIsbnB || meta.isbn;
     }
@@ -532,15 +802,15 @@ export function areEditionsCompatible(a, b) {
 function getEditionIncompatibilityReason(req, rel) {
   if (!req || !rel) return 'incompatible_edition';
 
-  const titleReq = (req.bookTitle || req.title || '').trim().toLowerCase();
-  const titleRel = (rel.bookTitle || rel.title || '').trim().toLowerCase();
-  if (titleReq && titleRel && titleReq !== titleRel) {
+  const titleReq = (req.bookTitle || req.title || '').trim();
+  const titleRel = (rel.bookTitle || rel.title || '').trim();
+  if (titleReq && titleRel && !isTitleMatch(titleReq, titleRel)) {
     return 'incompatible_title';
   }
 
-  const authorReq = (req.author || (Array.isArray(req.authors) ? req.authors[0] : '') || '').trim().toLowerCase();
-  const authorRel = (rel.author || (Array.isArray(rel.authors) ? rel.authors[0] : '') || '').trim().toLowerCase();
-  if (authorReq && authorRel && authorReq !== authorRel) {
+  const authorReq = (req.author || (Array.isArray(req.authors) ? req.authors[0] : '') || '').trim();
+  const authorRel = (rel.author || (Array.isArray(rel.authors) ? rel.authors[0] : '') || '').trim();
+  if (authorReq && authorRel && !isAuthorMatch(authorReq, authorRel)) {
     return 'incompatible_author';
   }
 
@@ -1635,7 +1905,7 @@ export class BridgeService {
             const timeoutErr = new Error('Shelfmark search timed out before completion.');
             timeoutErr.name = 'TimeoutError';
             searchController.abort(timeoutErr);
-          }, 70000);
+          }, 80000);
           try {
             searchResults = await plugin.search(query, config, host, searchController.signal);
           } catch (err) {
@@ -3003,7 +3273,6 @@ export class BridgeService {
         task.isbnVerificationFailed = true;
         task.status = 'failed';
         task.errorSource = 'companion_isbn_verification';
-        // Record attempts and unmap requests so alternatives can be evaluated.
         for (const rid of (task.requestIds || [])) {
           if (task.requestFulfillments?.[rid]?.fulfilled) continue;
           const attemptId = `isbn:${task.taskId || task.id}`;
@@ -3017,8 +3286,12 @@ export class BridgeService {
           if ((this.state.requestSourceAttempts[rid] || 0) < this.maxSourceAttempts) {
             delete this.state.requests[rid];
           }
+          this.setRequestProgress(rid, 'review_required', { reason: 'isbn_verification_failed' });
         }
         this.saveState();
+        if ((task.requestIds || []).some((rid) => (this.state.requestSourceAttempts[rid] || 0) < this.maxSourceAttempts)) {
+          this.triggerProcessPendingRequests(100);
+        }
         return { fulfilled: false, error: task.error };
       }
     }
@@ -3192,6 +3465,7 @@ export class BridgeService {
           if ((this.state.requestSourceAttempts[reqId] || 0) < this.maxSourceAttempts) delete this.state.requests[reqId];
           task.isbnVerificationFailed = true;
           this.saveState();
+          this.triggerProcessPendingRequests(100);
           continue;
         }
         if (!verified) {
@@ -3214,6 +3488,7 @@ export class BridgeService {
           if ((this.state.requestSourceAttempts[reqId] || 0) < this.maxSourceAttempts) delete this.state.requests[reqId];
           task.isbnVerificationFailed = true;
           this.saveState();
+          this.triggerProcessPendingRequests(100);
           continue;
         }
       }
@@ -3246,6 +3521,7 @@ export class BridgeService {
           if ((this.state.requestSourceAttempts[reqId] || 0) < this.maxSourceAttempts) delete this.state.requests[reqId];
           task.isbnVerificationFailed = true;
           this.saveState();
+          this.triggerProcessPendingRequests(100);
           continue;
         }
       }
