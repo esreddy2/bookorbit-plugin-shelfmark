@@ -1,5 +1,5 @@
 /**
- * BookOrbit ↔ Shelfmark acceptance and regression verification, v1.5.21.
+ * BookOrbit ↔ Shelfmark acceptance and regression verification, v1.5.22.
  *
  * EXTERNAL ORACLES — NOT AN IMPLEMENTATION-DERIVED TEST PLAN:
  *   - BookOrbit v3.5.0 API/host contracts and request behavior.
@@ -15,7 +15,7 @@
  *
  * Place at repository ROOT as verify.mjs, then run:
  *   node verify.mjs                # acceptance tests while developing
- *   node verify.mjs --release      # additionally require signed v1.5.21 release
+ *   node verify.mjs --release      # additionally require signed v1.5.22 release
  *
  * A 404 for an unknown route is intentional. NEVER add a made-up endpoint
  * to the allowlist just to make a test green. Verify an API contract first.
@@ -53,7 +53,7 @@ import {
 } from './bridge/bridge.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
-const EXPECTED_VERSION = '1.5.21';
+const EXPECTED_VERSION = '1.5.22';
 const RELEASE_MODE = process.argv.includes('--release');
 const TEST_TIMEOUT_MS = 10_000;
 const tests = [];
@@ -373,7 +373,7 @@ test('DECLARATION: BookOrbit API v1, Shelfmark indexer and ebook-only', () => {
   assert.equal(plugin.type, 'shelfmark');
   assert.deepEqual(plugin.mediaKinds, ['ebook']);
 });
-test('DECLARATION: native indexer advertises v1.5.21, never a previous version', () => {
+test('DECLARATION: native indexer advertises v1.5.22, never a previous version', () => {
   assert.equal(plugin.version, EXPECTED_VERSION);
 });
 test('DECLARATION: exposes search, test, and resolveFile entry points', () => {
@@ -399,7 +399,7 @@ test('RELEASE CONTRACT: package version, plugin version and release target agree
   assert.equal(plugin.version, EXPECTED_VERSION);
 });
 if (RELEASE_MODE) {
-  test('RELEASE: signed manifest has declared format and v1.5.21 version', () => {
+  test('RELEASE: signed manifest has declared format and v1.5.22 version', () => {
     const manifest = JSON.parse(readFileSync(join(HERE, 'updates', 'shelfmark.json'), 'utf8'));
     assert.equal(manifest.schemaVersion, 1);
     assert.equal(manifest.type, 'shelfmark');

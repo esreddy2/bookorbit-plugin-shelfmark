@@ -323,6 +323,47 @@ export function gatherTrustedIsbnsBridge(...sources) {
   return [...out];
 }
 
+export function collectEditionSpecificIsbnsBridge(obj, out = new Set()) {
+  if (!obj || typeof obj !== 'object') return out;
+  const counterpartFlags = ['verifiedCounterpart', 'counterpartVerified', 'verified_counterpart', 'counterpart_verified', 'verified', 'counterpart'];
+  const hasVerifiedFlag = counterpartFlags.some((f) => obj[f] === true || obj[f] === 'true' || obj[f] === 1);
+
+  if (hasVerifiedFlag) {
+    for (const [key, value] of Object.entries(obj)) {
+      if (/isbn/i.test(key)) {
+        const vals = Array.isArray(value) ? value : [value];
+        for (const v of vals) {
+          if (v == null) continue;
+          if (typeof v === 'object') collectEditionSpecificIsbnsBridge(v, out);
+          else {
+            const cleaned = normalizeIsbnBridge(v);
+            if (cleaned.length === 10 || cleaned.length === 13) out.add(cleaned);
+          }
+        }
+      }
+    }
+  }
+
+  for (const [key, value] of Object.entries(obj)) {
+    if (/(counterpart|equivalent|related|alternate)/i.test(key)) {
+      const stack = [value];
+      while (stack.length) {
+        const cur = stack.pop();
+        if (cur == null) continue;
+        if (Array.isArray(cur)) { stack.push(...cur); continue; }
+        if (typeof cur === 'object') { stack.push(...Object.values(cur)); continue; }
+        const cleaned = normalizeIsbnBridge(cur);
+        if (cleaned.length === 10 || cleaned.length === 13) out.add(cleaned);
+      }
+    } else if (Array.isArray(value)) {
+      for (const item of value) collectEditionSpecificIsbnsBridge(item, out);
+    } else if (typeof value === 'object' && value !== null) {
+      collectEditionSpecificIsbnsBridge(value, out);
+    }
+  }
+  return out;
+}
+
 export function areVerifiedIsbnCounterpartsBridge(isbnA, isbnB, ...contexts) {
   const a = normalizeIsbnBridge(isbnA);
   const b = normalizeIsbnBridge(isbnB);
@@ -348,21 +389,19 @@ export function areVerifiedIsbnCounterpartsBridge(isbnA, isbnB, ...contexts) {
       }
       // bookMetadata/metadata record as a whole
       if (ctx.bookMetadata && typeof ctx.bookMetadata === 'object') {
-        sets.push(collectMetadataIsbnsBridge(ctx.bookMetadata));
+        sets.push(collectEditionSpecificIsbnsBridge(ctx.bookMetadata));
       }
       if (ctx.metadata && typeof ctx.metadata === 'object') {
-        sets.push(collectMetadataIsbnsBridge(ctx.metadata));
+        sets.push(collectEditionSpecificIsbnsBridge(ctx.metadata));
       }
-      // If ctx itself looks like a metadata record (has isbn-ish fields), test it alone.
-      if (collectMetadataIsbnsBridge(ctx).size > 0) {
-        sets.push(collectMetadataIsbnsBridge(ctx));
+      if (collectEditionSpecificIsbnsBridge(ctx).size > 0) {
+        sets.push(collectEditionSpecificIsbnsBridge(ctx));
       }
-      // extra object
       if (ctx.extra && typeof ctx.extra === 'object') {
         if (ctx.extra.bookMetadata && typeof ctx.extra.bookMetadata === 'object') {
-          sets.push(collectMetadataIsbnsBridge(ctx.extra.bookMetadata));
+          sets.push(collectEditionSpecificIsbnsBridge(ctx.extra.bookMetadata));
         }
-        sets.push(collectMetadataIsbnsBridge(ctx.extra));
+        sets.push(collectEditionSpecificIsbnsBridge(ctx.extra));
       }
     } else if (typeof ctx === 'string') {
       const n = normalizeIsbnBridge(ctx);
@@ -1797,7 +1836,8 @@ export class BridgeService {
               !areVerifiedIsbnCounterpartsBridge(existingEvidenceIsbn, incomingTaskIsbn, existing?.trustedIsbns, existing?.bookMetadata, existing?.extra?.bookMetadata, release?.trustedIsbns, release?.extra?.bookMetadata)) {
             throw new Error(`Incompatible ISBN for existing task ${existingTaskId}: requested ${incomingTaskIsbn} vs task ${existingEvidenceIsbn}`);
           }
-        } else if (!areVerifiedIsbnCounterpartsBridge(incomingTaskIsbn, incomingTaskIsbn, existing?.trustedIsbns, existing?.bookMetadata, existing?.extra?.bookMetadata, release?.trustedIsbns, release?.extra?.bookMetadata)) {
+        } else {
+          // No verified ISBN evidence on the existing task; reject adoption for ISBN-specific request.
           throw new Error(`Incompatible ISBN for existing task ${existingTaskId}: no verified ISBN evidence`);
         }
       }
@@ -2064,7 +2104,8 @@ export class BridgeService {
               !areVerifiedIsbnCounterpartsBridge(existingEvidenceIsbn, incomingTaskIsbn, existing?.trustedIsbns, existing?.bookMetadata, existing?.extra?.bookMetadata, release?.trustedIsbns, release?.extra?.bookMetadata)) {
             throw new Error(`Incompatible ISBN for existing task ${taskId}: requested ${incomingTaskIsbn} vs task ${existingEvidenceIsbn}`);
           }
-        } else if (!areVerifiedIsbnCounterpartsBridge(incomingTaskIsbn, incomingTaskIsbn, existing?.trustedIsbns, existing?.bookMetadata, existing?.extra?.bookMetadata, release?.trustedIsbns, release?.extra?.bookMetadata)) {
+        } else {
+          // No verified ISBN evidence on the existing task; reject adoption for ISBN-specific request.
           throw new Error(`Incompatible ISBN for existing task ${taskId}: no verified ISBN evidence`);
         }
       }

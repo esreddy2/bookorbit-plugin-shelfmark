@@ -34,7 +34,7 @@ const KNOWN_TITLE_EQUIVALENTS = new Map([
 
 export default {
   apiVersion: 1,
-  version: '1.5.21',
+  version: '1.5.22',
   update: {
     manifestUrl: 'https://raw.githubusercontent.com/esreddy2/bookorbit-plugin-shelfmark/main/updates/shelfmark.json',
     ed25519PublicKey: '-0aHVhXqg7cGaDchc2p1Y8tDnn8A7cJ0WREKspNv5Bc',
@@ -260,10 +260,10 @@ export default {
         const counterpartVerified = metaIsbns.has(String(searchIsbn).toUpperCase()) && metaIsbns.has(String(authenticIsbn).toUpperCase());
         if (!counterpartVerified) return;
       }
-      const releaseYear = toNumber(rel.year || rel.publish_year || rel.publication_year || rel.published_year || rel.publicationYear || rel.publishedYear || rel.extra?.year || rel.extra?.publish_year || rel.extra?.publication_year || rel?.book?.publish_year || rel?.book?.publishYear || rel?.book?.year || null);
+      const releaseYear = toNumber(rel.year || rel.publish_year || rel.publication_year || rel.published_year || rel.publicationYear || rel.publishedYear || rel.extra?.year || rel.extra?.publish_year || rel.extra?.publication_year || null);
       if (requestedYear && releaseYear && requestedYear !== releaseYear) return;
       payload.author = displayAuthor || null;
-      payload.year = toNumber(rel.year || rel.publish_year || rel.publication_year || rel.published_year || rel.publicationYear || rel.publishedYear || rel.extra?.year || rel.extra?.publish_year || rel.extra?.publication_year || rel?.book?.publish_year || rel?.book?.publishYear || rel?.book?.year || null);
+      payload.year = toNumber(rel.year || rel.publish_year || rel.publication_year || rel.published_year || rel.publicationYear || rel.publishedYear || rel.extra?.year || rel.extra?.publish_year || rel.extra?.publication_year || null);
       payload.language = rel.language || rel.extra?.language || null;
       // Reject known language mismatches; unknown stays unknown.
       if (requestedLanguage && payload.language) {
@@ -293,7 +293,7 @@ export default {
         author: displayAuthor,
         isbn: authenticIsbn,
         format: detectedFormat,
-        year: toNumber(rel.year || rel.publish_year || rel.publication_year || rel.published_year || rel.publicationYear || rel.publishedYear || rel.extra?.year || rel.extra?.publish_year || rel.extra?.publication_year || rel?.book?.publish_year || rel?.book?.publishYear || rel?.book?.year || null),
+        year: toNumber(rel.year || rel.publish_year || rel.publication_year || rel.published_year || rel.publicationYear || rel.publishedYear || rel.extra?.year || rel.extra?.publish_year || rel.extra?.publication_year || null),
         sizeBytes,
         language: rel.language || rel.extra?.language || null,
         seeders: toNumber(rel.seeders),
@@ -1351,22 +1351,45 @@ function extractIsbn(book, query) {
 }
 
 /**
- * Collects ISBN-like identifiers from a metadata object (including arrays/nested fields)
- * so trusted print/ebook counterpart relationships can be recognized.
+ * Collects ISBN-like identifiers that are explicitly tied to edition-level
+ * counterpart relationships (not broad work-level ISBN lists).
  */
 function collectMetadataIsbns(obj, out = new Set()) {
   if (!obj || typeof obj !== 'object') return out;
-  for (const [key, value] of Object.entries(obj)) {
-    if (/isbn/i.test(key)) {
-      const vals = Array.isArray(value) ? value : [value];
-      for (const v of vals) {
-        if (v == null) continue;
-        if (typeof v === 'object') collectMetadataIsbns(v, out);
-        else {
-          const cleaned = String(v).replace(/[^0-9Xx]/g, '').trim();
-          if (cleaned.length === 10 || cleaned.length === 13) out.add(cleaned.toUpperCase());
+  const counterpartFlags = ['verifiedCounterpart', 'counterpartVerified', 'verified_counterpart', 'counterpart_verified', 'verified', 'counterpart'];
+  const hasVerifiedFlag = counterpartFlags.some((f) => obj[f] === true || obj[f] === 'true' || obj[f] === 1);
+
+  // ISBN fields are trusted only when explicitly verified as counterparts.
+  if (hasVerifiedFlag) {
+    for (const [key, value] of Object.entries(obj)) {
+      if (/isbn/i.test(key)) {
+        const vals = Array.isArray(value) ? value : [value];
+        for (const v of vals) {
+          if (v == null) continue;
+          if (typeof v === 'object') collectMetadataIsbns(v, out);
+          else {
+            const cleaned = String(v).replace(/[^0-9Xx]/g, '').trim();
+            if (cleaned.length === 10 || cleaned.length === 13) out.add(cleaned.toUpperCase());
+          }
         }
       }
+    }
+  }
+
+  for (const [key, value] of Object.entries(obj)) {
+    if (/(counterpart|equivalent|related|alternate)/i.test(key)) {
+      // Collect ISBN-like scalars from explicitly counterpart-related fields.
+      const stack = [value];
+      while (stack.length) {
+        const cur = stack.pop();
+        if (cur == null) continue;
+        if (Array.isArray(cur)) { stack.push(...cur); continue; }
+        if (typeof cur === 'object') { stack.push(...Object.values(cur)); continue; }
+        const cleaned = String(cur).replace(/[^0-9Xx]/g, '').trim();
+        if (cleaned.length === 10 || cleaned.length === 13) out.add(cleaned.toUpperCase());
+      }
+    } else if (Array.isArray(value)) {
+      for (const item of value) collectMetadataIsbns(item, out);
     } else if (typeof value === 'object') {
       collectMetadataIsbns(value, out);
     }
