@@ -34,7 +34,7 @@ const KNOWN_TITLE_EQUIVALENTS = new Map([
 
 export default {
   apiVersion: 1,
-  version: '1.5.23',
+  version: '1.5.24',
   update: {
     manifestUrl: 'https://raw.githubusercontent.com/esreddy2/bookorbit-plugin-shelfmark/main/updates/shelfmark.json',
     ed25519PublicKey: '-0aHVhXqg7cGaDchc2p1Y8tDnn8A7cJ0WREKspNv5Bc',
@@ -256,8 +256,14 @@ export default {
       // release's own ISBN (or EPUB metadata discovered later) is authentic.
       const authenticIsbn = (rel.isbn ? String(rel.isbn).trim() : null) || (rel.extra?.isbn ? String(rel.extra.isbn).trim() : null) || (rel.extra?.isbn13 ? String(rel.extra.isbn13).trim() : null);
       if (searchIsbn && authenticIsbn && authenticIsbn !== searchIsbn) {
-        const metaIsbns = collectMetadataIsbns(book);
-        const counterpartVerified = metaIsbns.has(String(searchIsbn).toUpperCase()) && metaIsbns.has(String(authenticIsbn).toUpperCase());
+        const metaPairs = collectMetadataIsbnPairs(book);
+        const counterpartVerified = metaPairs.some(([x, y]) => {
+          const nx = String(x).toUpperCase();
+          const ny = String(y).toUpperCase();
+          const a = String(searchIsbn).toUpperCase();
+          const b = String(authenticIsbn).toUpperCase();
+          return (nx === a && ny === b) || (nx === b && ny === a);
+        });
         if (!counterpartVerified) return;
       }
       const releaseYear = toNumber(rel.year || rel.publish_year || rel.publication_year || rel.published_year || rel.publicationYear || rel.publishedYear || rel.extra?.year || rel.extra?.publish_year || rel.extra?.publication_year || null);
@@ -1351,14 +1357,19 @@ function extractIsbn(book, query) {
 }
 
 /**
- * Collects ISBN-like identifiers tied to explicit counterpart/equivalent
- * relationships only. Broad work-level ISBN lists never establish equivalence.
+ * Collects explicit counterpart ISBN pairs. Boundaries are preserved per record.
  */
-function collectMetadataIsbns(obj, out = new Set()) {
-  if (!obj || typeof obj !== 'object') return out;
+function collectMetadataIsbnPairs(obj) {
+  const pairs = [];
+  if (!obj || typeof obj !== 'object') return pairs;
+  if (Array.isArray(obj)) {
+    for (const item of obj) pairs.push(...collectMetadataIsbnPairs(item));
+    return pairs;
+  }
 
   const counterpartKeys = Object.keys(obj).filter((k) => /counterpart|equivalent/i.test(k));
   if (counterpartKeys.length > 0) {
+    const counterpartIsbns = [];
     for (const key of counterpartKeys) {
       const stack = [obj[key]];
       while (stack.length) {
@@ -1366,31 +1377,51 @@ function collectMetadataIsbns(obj, out = new Set()) {
         if (cur == null) continue;
         if (Array.isArray(cur)) { stack.push(...cur); continue; }
         if (typeof cur === 'object') { stack.push(...Object.values(cur)); continue; }
-        const cleaned = String(cur).replace(/[^0-9Xx]/g, '').trim();
-        if (cleaned.length === 10 || cleaned.length === 13) out.add(cleaned.toUpperCase());
+        const cleaned = String(cur).replace(/[^0-9Xx]/g, '').trim().toUpperCase();
+        if (cleaned.length === 10 || cleaned.length === 13) counterpartIsbns.push(cleaned);
       }
     }
+    const ownIsbns = [];
     for (const [key, value] of Object.entries(obj)) {
-      if (/isbn/i.test(key)) {
-        const vals = Array.isArray(value) ? value : [value];
-        for (const v of vals) {
-          if (v == null) continue;
-          if (typeof v === 'object') collectMetadataIsbns(v, out);
-          else {
-            const cleaned = String(v).replace(/[^0-9Xx]/g, '').trim();
-            if (cleaned.length === 10 || cleaned.length === 13) out.add(cleaned.toUpperCase());
-          }
+      if (/isbn/i.test(key) && !/counterpart|equivalent/i.test(key)) {
+        const stack = [value];
+        while (stack.length) {
+          const cur = stack.pop();
+          if (cur == null) continue;
+          if (Array.isArray(cur)) { stack.push(...cur); continue; }
+          if (typeof cur === 'object') { stack.push(...Object.values(cur)); continue; }
+          const cleaned = String(cur).replace(/[^0-9Xx]/g, '').trim().toUpperCase();
+          if (cleaned.length === 10 || cleaned.length === 13) ownIsbns.push(cleaned);
         }
       }
+    }
+
+    if (counterpartIsbns.length > 0 && ownIsbns.length > 0) {
+      for (const c of counterpartIsbns) for (const o of ownIsbns) pairs.push([c, o]);
+    } else if (counterpartIsbns.length >= 2) {
+      for (let i = 0; i < counterpartIsbns.length; i++)
+        for (let j = i + 1; j < counterpartIsbns.length; j++)
+          pairs.push([counterpartIsbns[i], counterpartIsbns[j]]);
     }
   }
 
   for (const [key, value] of Object.entries(obj)) {
+    if (counterpartKeys.includes(key)) continue;
     if (Array.isArray(value)) {
-      for (const item of value) collectMetadataIsbns(item, out);
+      for (const item of value) pairs.push(...collectMetadataIsbnPairs(item));
     } else if (value && typeof value === 'object') {
-      collectMetadataIsbns(value, out);
+      pairs.push(...collectMetadataIsbnPairs(value));
     }
+  }
+  return pairs;
+}
+
+function collectMetadataIsbns(obj, out = new Set()) {
+  for (const [a, b] of collectMetadataIsbnPairs(obj)) {
+    const na = String(a).toUpperCase();
+    const nb = String(b).toUpperCase();
+    if (na.length === 10 || na.length === 13) out.add(na);
+    if (nb.length === 10 || nb.length === 13) out.add(nb);
   }
   return out;
 }

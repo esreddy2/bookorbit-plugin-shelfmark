@@ -323,15 +323,17 @@ export function gatherTrustedIsbnsBridge(...sources) {
   return [...out];
 }
 
-export function collectEditionSpecificIsbnsBridge(obj, out = new Set()) {
-  if (!obj || typeof obj !== 'object') return out;
+export function collectEditionSpecificIsbnPairsBridge(obj) {
+  const pairs = [];
+  if (!obj || typeof obj !== 'object') return pairs;
+  if (Array.isArray(obj)) {
+    for (const item of obj) pairs.push(...collectEditionSpecificIsbnPairsBridge(item));
+    return pairs;
+  }
 
-  // Only explicitly named counterpart/equivalent relationships are trusted.
-  // Generic verification flags and broad related/edition collections never
-  // establish edition equivalence.
   const counterpartKeys = Object.keys(obj).filter((k) => /counterpart|equivalent/i.test(k));
   if (counterpartKeys.length > 0) {
-    // Collect the counterpart ISBNs themselves.
+    const counterpartIsbns = [];
     for (const key of counterpartKeys) {
       const stack = [obj[key]];
       while (stack.length) {
@@ -340,31 +342,55 @@ export function collectEditionSpecificIsbnsBridge(obj, out = new Set()) {
         if (Array.isArray(cur)) { stack.push(...cur); continue; }
         if (typeof cur === 'object') { stack.push(...Object.values(cur)); continue; }
         const cleaned = normalizeIsbnBridge(cur);
-        if (cleaned.length === 10 || cleaned.length === 13) out.add(cleaned);
+        if (cleaned.length === 10 || cleaned.length === 13) counterpartIsbns.push(cleaned);
       }
     }
-    // Collect sibling ISBNs of the same record to form the verified pair.
+    const ownIsbns = [];
     for (const [key, value] of Object.entries(obj)) {
-      if (/isbn/i.test(key)) {
-        const vals = Array.isArray(value) ? value : [value];
-        for (const v of vals) {
-          if (v == null) continue;
-          if (typeof v === 'object') collectEditionSpecificIsbnsBridge(v, out);
-          else {
-            const cleaned = normalizeIsbnBridge(v);
-            if (cleaned.length === 10 || cleaned.length === 13) out.add(cleaned);
-          }
+      if (/isbn/i.test(key) && !/counterpart|equivalent/i.test(key)) {
+        const stack = [value];
+        while (stack.length) {
+          const cur = stack.pop();
+          if (cur == null) continue;
+          if (Array.isArray(cur)) { stack.push(...cur); continue; }
+          if (typeof cur === 'object') { stack.push(...Object.values(cur)); continue; }
+          const cleaned = normalizeIsbnBridge(cur);
+          if (cleaned.length === 10 || cleaned.length === 13) ownIsbns.push(cleaned);
+        }
+      }
+    }
+
+    if (counterpartIsbns.length > 0 && ownIsbns.length > 0) {
+      for (const c of counterpartIsbns) {
+        for (const o of ownIsbns) {
+          pairs.push([c, o]);
+        }
+      }
+    } else if (counterpartIsbns.length >= 2) {
+      for (let i = 0; i < counterpartIsbns.length; i++) {
+        for (let j = i + 1; j < counterpartIsbns.length; j++) {
+          pairs.push([counterpartIsbns[i], counterpartIsbns[j]]);
         }
       }
     }
   }
 
   for (const [key, value] of Object.entries(obj)) {
-    if (Array.isArray(value)) {
-      for (const item of value) collectEditionSpecificIsbnsBridge(item, out);
-    } else if (value && typeof value === 'object') {
-      collectEditionSpecificIsbnsBridge(value, out);
+    if (counterpartKeys.includes(key)) continue;
+    if (value && typeof value === 'object') {
+      pairs.push(...collectEditionSpecificIsbnPairsBridge(value));
     }
+  }
+  return pairs;
+}
+
+// Backwards-compatible flattened view (not used for verification decisions).
+export function collectEditionSpecificIsbnsBridge(obj, out = new Set()) {
+  for (const [a, b] of collectEditionSpecificIsbnPairsBridge(obj)) {
+    const na = normalizeIsbnBridge(a);
+    const nb = normalizeIsbnBridge(b);
+    if (na.length === 10 || na.length === 13) out.add(na);
+    if (nb.length === 10 || nb.length === 13) out.add(nb);
   }
   return out;
 }
@@ -374,37 +400,30 @@ export function areVerifiedIsbnCounterpartsBridge(isbnA, isbnB, ...contexts) {
   const b = normalizeIsbnBridge(isbnB);
   if (!a || !b) return false;
   if (a === b) return true;
-  // A counterpart relationship is valid only when a SINGLE trusted source
-  // (metadata record, trusted ISBN list, ...) contains both ISBNs.
   for (const ctx of contexts) {
     if (!ctx) continue;
-    const sets = [];
-    if (Array.isArray(ctx)) {
-      // A flat ISBN array (including persisted trustedIsbns) is never proof of equivalence.
-      // Only edition-specific counterpart records below can establish a relationship.
-    } else if (typeof ctx === 'object') {
-      // bookMetadata/metadata record as a whole
+    const pairs = [];
+    if (typeof ctx === 'object') {
       if (ctx.bookMetadata && typeof ctx.bookMetadata === 'object') {
-        sets.push(collectEditionSpecificIsbnsBridge(ctx.bookMetadata));
+        pairs.push(...collectEditionSpecificIsbnPairsBridge(ctx.bookMetadata));
       }
       if (ctx.metadata && typeof ctx.metadata === 'object') {
-        sets.push(collectEditionSpecificIsbnsBridge(ctx.metadata));
+        pairs.push(...collectEditionSpecificIsbnPairsBridge(ctx.metadata));
       }
-      if (collectEditionSpecificIsbnsBridge(ctx).size > 0) {
-        sets.push(collectEditionSpecificIsbnsBridge(ctx));
-      }
+      pairs.push(...collectEditionSpecificIsbnPairsBridge(ctx));
       if (ctx.extra && typeof ctx.extra === 'object') {
         if (ctx.extra.bookMetadata && typeof ctx.extra.bookMetadata === 'object') {
-          sets.push(collectEditionSpecificIsbnsBridge(ctx.extra.bookMetadata));
+          pairs.push(...collectEditionSpecificIsbnPairsBridge(ctx.extra.bookMetadata));
         }
-        sets.push(collectEditionSpecificIsbnsBridge(ctx.extra));
+        pairs.push(...collectEditionSpecificIsbnPairsBridge(ctx.extra));
       }
-    } else if (typeof ctx === 'string') {
-      const n = normalizeIsbnBridge(ctx);
-      if (n.length === 10 || n.length === 13) sets.push(new Set([n]));
     }
-    for (const s of sets) {
-      if (s.has(a) && s.has(b)) return true;
+    for (const [x, y] of pairs) {
+      const nx = normalizeIsbnBridge(x);
+      const ny = normalizeIsbnBridge(y);
+      if ((nx === a && ny === b) || (nx === b && ny === a)) {
+        return true;
+      }
     }
   }
   return false;
