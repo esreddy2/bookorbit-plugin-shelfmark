@@ -149,10 +149,10 @@ export function sanitizeLog(msg) {
 /** Timing-safe string comparison to prevent timing attacks on secrets. */
 export function timingSafeCompare(a, b) {
   if (typeof a !== 'string' || typeof b !== 'string') return false;
-  const bufA = Buffer.from(a, 'utf8');
-  const bufB = Buffer.from(b, 'utf8');
-  if (bufA.length !== bufB.length) return false;
-  return crypto.timingSafeEqual(bufA, bufB);
+  // Compare fixed-length digests to avoid leaking input length.
+  const ha = crypto.createHash('sha256').update(a, 'utf8').digest();
+  const hb = crypto.createHash('sha256').update(b, 'utf8').digest();
+  return crypto.timingSafeEqual(ha, hb);
 }
 
 /** Checks whether a string conforms to JSON Web Token format (header.payload.signature). */
@@ -402,7 +402,7 @@ export function areEditionsCompatible(a, b) {
     const counterpart = areVerifiedIsbnCounterpartsBridge(isbnA, isbnB, a?.trustedIsbns, a?.bookMetadata, a?.extra?.bookMetadata, b?.trustedIsbns, b?.bookMetadata, b?.extra?.bookMetadata);
     if (!counterpart) return false;
   }
-  const isbnVerified = Boolean(isbnA && isbnB && isbnA === isbnB);
+  const isbnVerified = Boolean(isbnA && isbnB && ID.sameIsbn(isbnA, isbnB));
 
   // Publication year: distinct years indicate distinct editions!
   const yearA = parsePositiveInt(a.year || a.publicationYear || a.publishedYear || metaYearA);
@@ -421,8 +421,8 @@ export function areEditionsCompatible(a, b) {
   }
 
   // Known language mismatch indicates a distinct edition (e.g. translated title).
-  const langA = (a.language || '').trim().toLowerCase();
-  const langB = (b.language || '').trim().toLowerCase();
+  const langA = ID.normalizeString(a.language || '');
+  const langB = ID.normalizeString(b.language || '');
   if (langA && langB && langA !== langB) {
     return false;
   }
@@ -949,7 +949,18 @@ export class BridgeService {
           releases: parsed.releases || {},
           baselineRequestIds: parsed.baselineRequestIds || {},
           baselineEstablishedAt: parsed.baselineEstablishedAt || null,
-          uncertainQueues: parsed.uncertainQueues || {},
+          uncertainQueues: (function () {
+            const uq = parsed.uncertainQueues || {};
+            for (const rec of Object.values(uq)) {
+              if (rec && !Array.isArray(rec.requestIds)) {
+                rec.requestIds = rec.requestId ? [rec.requestId] : [];
+              }
+              if (rec && !Array.isArray(rec.userIds) && rec.userId) {
+                rec.userIds = [rec.userId];
+              }
+            }
+            return uq;
+          })(),
           failedReleases: parsed.failedReleases || {},
           requestSourceAttempts: parsed.requestSourceAttempts || {},
           requestAttempts: parsed.requestAttempts || {},
@@ -1454,6 +1465,10 @@ export class BridgeService {
         for (const req of requests) {
           // 1. Skip if part of historical baseline
           const reqId = req?.id ?? req?.requestId ?? req?.request_id ?? req?.taskId ?? req?.task_id;
+          if (reqId === undefined || reqId === null || String(reqId).trim() === '' || String(reqId) === 'undefined') {
+            console.warn('[Bridge] Skipping request with missing id');
+            continue;
+          }
           if (this.state.baselineRequestIds && this.state.baselineRequestIds[reqId]) {
             continue;
           }
@@ -1543,6 +1558,12 @@ export class BridgeService {
             const errorMessage = err instanceof Error ? err.message : String(err ?? 'unknown error');
             console.warn(`[Bridge] Plugin search error for "${query.title}": ${sanitizeLog(errorMessage)}`);
             this.setRequestProgress(reqId, 'search_failed', { reason: 'search_failed', error: errorMessage });
+            const attemptIdSf = `search_failed:${reqId}:${new Date().toISOString().slice(0,10)}`;
+            this.state.requestAttempts[reqId] = this.state.requestAttempts[reqId] || [];
+            if (!this.state.requestAttempts[reqId].some((a) => a.attemptId === attemptIdSf)) {
+              this.state.requestAttempts[reqId].push({ attemptId: attemptIdSf, timestamp: new Date().toISOString(), error: errorMessage });
+              this.state.requestSourceAttempts[reqId] = (this.state.requestSourceAttempts[reqId] || 0) + 1;
+            }
             this.state.requestErrors[reqId] = {
               error: errorMessage,
               errorType: 'search_failed',
@@ -1559,6 +1580,12 @@ export class BridgeService {
           if (!searchResults || searchResults.length === 0) {
             console.log(`[Bridge] No valid releases found for approved request ${reqId} ("${query.title}")`);
             this.setRequestProgress(reqId, 'no_releases', { reason: 'no_releases' });
+            const attemptIdNr = `no_releases:${reqId}:${new Date().toISOString().slice(0,10)}`;
+            this.state.requestAttempts[reqId] = this.state.requestAttempts[reqId] || [];
+            if (!this.state.requestAttempts[reqId].some((a) => a.attemptId === attemptIdNr)) {
+              this.state.requestAttempts[reqId].push({ attemptId: attemptIdNr, timestamp: new Date().toISOString(), error: 'No releases found' });
+              this.state.requestSourceAttempts[reqId] = (this.state.requestSourceAttempts[reqId] || 0) + 1;
+            }
             this.state.requestErrors[reqId] = {
               error: 'No releases found',
               errorType: 'no_releases',
@@ -1594,6 +1621,12 @@ export class BridgeService {
             const reason = ineligibilityReason || 'no_eligible_edition';
             console.log(`[Bridge] No eligible edition-compatible releases found for approved request ${reqId} ("${query.title}")`);
             this.setRequestProgress(reqId, 'no_eligible_edition', { reason });
+            const attemptIdNe = `no_eligible_edition:${reqId}:${new Date().toISOString().slice(0,10)}`;
+            this.state.requestAttempts[reqId] = this.state.requestAttempts[reqId] || [];
+            if (!this.state.requestAttempts[reqId].some((a) => a.attemptId === attemptIdNe)) {
+              this.state.requestAttempts[reqId].push({ attemptId: attemptIdNe, timestamp: new Date().toISOString(), error: reason });
+              this.state.requestSourceAttempts[reqId] = (this.state.requestSourceAttempts[reqId] || 0) + 1;
+            }
             this.state.requestErrors[reqId] = {
               error: reason,
               errorType: reason,
@@ -1728,6 +1761,12 @@ export class BridgeService {
     if (existingTaskId === 'uncertain') {
       const rec = this.state.uncertainQueues[releaseKey];
       if (rec) {
+        // ISBN compatibility check between incoming and existing uncertain record
+        const recIsbn = String(rec.requestIsbn || (Array.isArray(rec.requestIds) ? '' : '') || '').replace(/[^0-9X]/gi, '');
+        const incomingIsbn = String(requestIsbn || '').replace(/[^0-9X]/gi, '');
+        if (incomingIsbn && recIsbn && !ID.sameIsbn(incomingIsbn, recIsbn) && !areVerifiedIsbnCounterpartsBridge(incomingIsbn, recIsbn, rec?.trustedIsbns, rec?.bookMetadata, rec?.extra?.bookMetadata)) {
+          throw new Error(`Incompatible ISBN for uncertain queue ${releaseKey}: requested ${incomingIsbn} vs ${recIsbn}`);
+        }
         if (!Array.isArray(rec.requestIds)) rec.requestIds = rec.requestId ? [rec.requestId] : [];
         if (requestId && !rec.requestIds.includes(requestId)) rec.requestIds.push(requestId);
         if (requestId && !rec.requestId) rec.requestId = requestId;
@@ -1750,7 +1789,7 @@ export class BridgeService {
       if (!areEditionsCompatible(existing, release)) {
         throw new Error(`Incompatible edition for existing task ${existingTaskId}: requested "${release.title}" (${release.year || 'unknown year'}) vs task "${existing.title}" (${existing.year || 'unknown year'})`);
       }
-      const existingTaskIsbn = String(existing.requestIsbn || (existing.requestIsbns ? Object.values(existing.requestIsbns)[0] : '') || '').replace(/[^0-9X]/gi, '');
+      const existingTaskIsbn = String((existing.requestIsbns && existing.requestIsbns[requestId]) || existing.requestIsbn || '').replace(/[^0-9X]/gi, '');
       const incomingTaskIsbn = String(requestIsbn || '').replace(/[^0-9X]/gi, '');
       const existingFileIsbn = (existing.filePath && String(existing.filePath).toLowerCase().endsWith('.epub'))
         ? normalizeIsbnBridge(extractEpubMetadataFromFile(existing.filePath)?.isbn)
@@ -1913,7 +1952,9 @@ export class BridgeService {
       this.state.uncertainQueues[releaseKey] = {
         releaseKey,
         requestId,
+        requestIds: requestId ? [requestId] : [],
         userId,
+        userIds: userId ? [userId] : [],
         release: downloadPayload,
         trustedIsbns: gatherTrustedIsbnsBridge(release?.extra?.bookMetadata, release?.extra, release),
         bookMetadata: release?.extra?.bookMetadata || null,
@@ -1962,7 +2003,9 @@ export class BridgeService {
           this.state.uncertainQueues[releaseKey] = {
             releaseKey,
             requestId,
+            requestIds: requestId ? [requestId] : [],
             userId,
+            userIds: userId ? [userId] : [],
             release: downloadPayload,
             trustedIsbns: gatherTrustedIsbnsBridge(release?.extra?.bookMetadata, release?.extra, release),
             bookMetadata: release?.extra?.bookMetadata || null,
@@ -2018,7 +2061,7 @@ export class BridgeService {
       if (!areEditionsCompatible(existing, release)) {
         throw new Error(`Incompatible edition for existing task ${taskId}: requested "${release.title}" (${release.year || 'unknown year'}) vs task "${existing.title}" (${existing.year || 'unknown year'})`);
       }
-      const existingTaskIsbn = String(existing.requestIsbn || (existing.requestIsbns ? Object.values(existing.requestIsbns)[0] : '') || '').replace(/[^0-9X]/gi, '');
+      const existingTaskIsbn = String((existing.requestIsbns && existing.requestIsbns[requestId]) || existing.requestIsbn || '').replace(/[^0-9X]/gi, '');
       const incomingTaskIsbn = String(requestIsbn || '').replace(/[^0-9X]/gi, '');
       const existingFileIsbn = (existing.filePath && String(existing.filePath).toLowerCase().endsWith('.epub'))
         ? normalizeIsbnBridge(extractEpubMetadataFromFile(existing.filePath)?.isbn)
@@ -2176,7 +2219,14 @@ export class BridgeService {
         if (t.status === 'queued' || t.status === 'downloading' || t.status === 'awaiting_file') {
           const tTitle = (t.title || '').trim().toLowerCase();
           const fmtMatch = !format || (t.format || '').toLowerCase() === format.toLowerCase();
-          if (fmtMatch && (tTitle === candTitle || rawBase === tTitle || rawBase.startsWith(tTitle + '_') || rawBase.startsWith(tTitle + ' '))) {
+          const titleMatch = tTitle === candTitle || rawBase === tTitle || rawBase.startsWith(tTitle + '_') || rawBase.startsWith(tTitle + ' ');
+          // Require additional identity evidence when available to avoid wrong-task attachment.
+          let extraMatch = true;
+          if (title && t.title && ID.normalizeString(t.title) !== ID.normalizeString(title)) extraMatch = false;
+          if (payload.author && t.author && !ID.isAuthorMatch(t.author, payload.author)) extraMatch = false;
+          if (payload.year && t.year && String(t.year) !== String(payload.year)) extraMatch = false;
+          if (payload.isbn && t.isbn && !ID.sameIsbn(t.isbn, payload.isbn)) extraMatch = false;
+          if (fmtMatch && titleMatch && extraMatch) {
             matchingTasks.push(t);
           }
         }
@@ -2795,10 +2845,10 @@ export class BridgeService {
       this.state.requestAttempts[rid] = this.state.requestAttempts[rid] || [];
       if (!this.state.requestAttempts[rid].some((a) => a.attemptId === attemptId)) {
         this.state.requestAttempts[rid].push({ attemptId, taskId: task.taskId, releaseKey: task.releaseKey, timestamp: now, error: task.error });
-        const attempts = this.state.requestAttempts[rid].length;
-        this.state.requestSourceAttempts[rid] = attempts;
-        this.state.requestErrors[rid] = { error: task.error, errorType, lastAttemptAt: now, attempts };
       }
+      const attempts = this.state.requestAttempts[rid].length;
+      this.state.requestSourceAttempts[rid] = Math.max(this.state.requestSourceAttempts[rid] || 0, attempts);
+      this.state.requestErrors[rid] = { error: task.error, errorType, lastAttemptAt: now, attempts: this.state.requestSourceAttempts[rid] };
       if ((this.state.requestSourceAttempts[rid] || 0) < this.maxSourceAttempts) {
         delete this.state.requests[rid];
       }
@@ -2924,7 +2974,8 @@ export class BridgeService {
       }
     }
 
-    const requestIsbn = String(task?.requestIsbn || '').replace(/[^0-9X]/gi, '');
+    const distinctReqIsbns = [...new Set((task.requestIds || []).map((rid) => String((task.requestIsbns && task.requestIsbns[rid]) || task.requestIsbn || '').replace(/[^0-9X]/gi, '')))].filter(Boolean);
+    const requestIsbn = distinctReqIsbns.length === 1 ? distinctReqIsbns[0] : '';
     if (requestIsbn) {
       const opf = String(task?.filePath || '').toLowerCase().endsWith('.epub')
         ? extractEpubMetadataFromFile(task.filePath) : null;
@@ -2939,6 +2990,15 @@ export class BridgeService {
         task.errorSource = 'companion_isbn_verification';
         if (task.releaseKey && this.state.releases[task.releaseKey] === (task.taskId || task.id)) {
           delete this.state.releases[task.releaseKey];
+        }
+        if (task.releaseKey) {
+          this.state.failedReleases[task.releaseKey] = {
+            releaseKey: task.releaseKey,
+            source: task.source,
+            sourceId: task.sourceId,
+            failedAt: new Date().toISOString(),
+            error: task.error,
+          };
         }
         for (const rid of (task.requestIds || [])) {
           if (task.requestFulfillments?.[rid]?.fulfilled) continue;
@@ -3125,61 +3185,6 @@ export class BridgeService {
         this.saveState();
         continue;
       }
-      const requestIsbn = String(task?.requestIsbn || '').replace(/[^0-9X]/gi, '');
-      if (requestIsbn) {
-        const opf = String(task?.filePath || '').toLowerCase().endsWith('.epub')
-          ? extractEpubMetadataFromFile(task.filePath) : null;
-        const fileIsbn = String(opf?.isbn || '').replace(/[^0-9X]/gi, '');
-        const verified = Boolean(fileIsbn) && (fileIsbn === requestIsbn || areVerifiedIsbnCounterpartsBridge(requestIsbn, fileIsbn, task?.trustedIsbns, task?.bookMetadata, task?.extra?.bookMetadata));
-        if (!fileIsbn) {
-          task.requestFulfillments[reqId] = {
-            fulfilled: false,
-            errorType: 'unverified_isbn',
-            error: 'Release ISBN could not be verified in downloaded file',
-            updatedAt: new Date().toISOString(),
-          };
-          this.setRequestProgress(reqId, 'review_required', { reason: 'unverified_isbn' });
-          this.saveState();
-          // Record attempt failure and unmap to allow alternatives.
-          const attemptId = `unverified_isbn:${task.taskId}`;
-          this.state.requestAttempts[reqId] = this.state.requestAttempts[reqId] || [];
-          if (!this.state.requestAttempts[reqId].some((a) => a.attemptId === attemptId)) {
-            this.state.requestAttempts[reqId].push({ attemptId, taskId: task.taskId, timestamp: new Date().toISOString(), error: 'unverified_isbn' });
-            const attempts = this.state.requestAttempts[reqId].length;
-            this.state.requestSourceAttempts[reqId] = attempts;
-            this.state.requestErrors[reqId] = { error: 'Release ISBN could not be verified in downloaded file', errorType: 'unverified_isbn', lastAttemptAt: new Date().toISOString(), attempts };
-          }
-          if ((this.state.requestSourceAttempts[reqId] || 0) < this.maxSourceAttempts) delete this.state.requests[reqId];
-          task.isbnVerificationFailed = true;
-          this.saveState();
-          this.triggerProcessPendingRequests(100);
-          continue;
-        }
-        if (!verified) {
-          task.requestFulfillments[reqId] = {
-            fulfilled: false,
-            errorType: 'conflicting_isbn',
-            error: `Release ISBN ${fileIsbn} does not match requested ISBN ${requestIsbn}`,
-            updatedAt: new Date().toISOString(),
-          };
-          this.setRequestProgress(reqId, 'review_required', { reason: 'conflicting_isbn' });
-          this.saveState();
-          const attemptId = `conflicting_isbn:${task.taskId}`;
-          this.state.requestAttempts[reqId] = this.state.requestAttempts[reqId] || [];
-          if (!this.state.requestAttempts[reqId].some((a) => a.attemptId === attemptId)) {
-            this.state.requestAttempts[reqId].push({ attemptId, taskId: task.taskId, timestamp: new Date().toISOString(), error: 'conflicting_isbn' });
-            const attempts = this.state.requestAttempts[reqId].length;
-            this.state.requestSourceAttempts[reqId] = attempts;
-            this.state.requestErrors[reqId] = { error: `Release ISBN ${fileIsbn} does not match requested ISBN ${requestIsbn}`, errorType: 'conflicting_isbn', lastAttemptAt: new Date().toISOString(), attempts };
-          }
-          if ((this.state.requestSourceAttempts[reqId] || 0) < this.maxSourceAttempts) delete this.state.requests[reqId];
-          task.isbnVerificationFailed = true;
-          this.saveState();
-          this.triggerProcessPendingRequests(100);
-          continue;
-        }
-      }
-
       const reqIsbn = String((task.requestIsbns && task.requestIsbns[reqId]) || '').replace(/[^0-9X]/gi, '');
       if (reqIsbn) {
         const opf = String(task?.filePath || '').toLowerCase().endsWith('.epub')
@@ -3409,10 +3414,25 @@ export class BridgeService {
     if (this.state.uncertainQueues && Object.keys(this.state.uncertainQueues).length > 0) {
       const candidates = [...parsedStatus.downloading, ...parsedStatus.queued, ...parsedStatus.complete];
       for (const [rKey, unrec] of Object.entries(this.state.uncertainQueues)) {
+        const cancelledCandidates = (parsedStatus.cancelled || []).filter((t) => {
+          const titleMatch = (t.title || '').trim().toLowerCase() === (unrec.release?.title || '').trim().toLowerCase();
+          const formatMatch = !(t.format || unrec.release?.format) || (t.format || '').toLowerCase() === (unrec.release?.format || '').toLowerCase();
+          return titleMatch && formatMatch;
+        });
+        if (cancelledCandidates.length > 0) {
+          const unrecRequestIds = Array.isArray(unrec.requestIds) && unrec.requestIds.length ? unrec.requestIds : (unrec.requestId ? [unrec.requestId] : []);
+          for (const rid of unrecRequestIds) {
+            this.setRequestProgress(rid, 'cancelled', { reason: 'cancelled' });
+            delete this.state.requests[rid];
+          }
+          delete this.state.uncertainQueues[rKey];
+          updatedCount++;
+          continue;
+        }
         const matchedCandidates = candidates.filter((t) => {
           const titleMatch = (t.title || '').trim().toLowerCase() === (unrec.release?.title || '').trim().toLowerCase();
           const formatMatch = !(t.format || unrec.release?.format) || (t.format || '').toLowerCase() === (unrec.release?.format || '').toLowerCase();
-          const authorMatch = !unrec.release?.author || !t.author || ((t.author || '').toLowerCase().includes(unrec.release.author.toLowerCase()) || unrec.release.author.toLowerCase().includes((t.author || '').toLowerCase()));
+          const authorMatch = !unrec.release?.author || !t.author || ID.isAuthorMatch(t.author, unrec.release.author);
           // Also require source identity when available.
           const sourceIdMatch = !unrec.release?.source_id || !t.source_id || String(t.source_id) === String(unrec.release.source_id);
           return titleMatch && formatMatch && authorMatch && sourceIdMatch;
@@ -3431,18 +3451,22 @@ export class BridgeService {
               continue;
             }
 
-            this.state.requests[unrec.requestId] = realTaskId;
-            if (!existing.requestIds.includes(unrec.requestId)) {
-              existing.requestIds.push(unrec.requestId);
+            const unrecRequestIds = Array.isArray(unrec.requestIds) && unrec.requestIds.length
+              ? unrec.requestIds
+              : (unrec.requestId ? [unrec.requestId] : []);
+            for (const rid of unrecRequestIds) {
+              this.state.requests[rid] = realTaskId;
+              if (!existing.requestIds.includes(rid)) existing.requestIds.push(rid);
+              if (existing.unfulfilledRequestIds && !existing.requestFulfillments?.[rid]?.fulfilled && !existing.unfulfilledRequestIds.includes(rid)) {
+                existing.unfulfilledRequestIds.push(rid);
+              }
             }
-            if (unrec.userId && !existing.userIds.includes(unrec.userId)) {
-              existing.userIds.push(unrec.userId);
+            const unrecUserIds = Array.isArray(unrec.userIds) && unrec.userIds.length ? unrec.userIds : (unrec.userId ? [unrec.userId] : []);
+            for (const uid of unrecUserIds) {
+              if (!existing.userIds.includes(uid)) existing.userIds.push(uid);
             }
             if (rKey && !this.state.releases[rKey]) {
               this.state.releases[rKey] = realTaskId;
-            }
-            if (existing.unfulfilledRequestIds && !existing.unfulfilledRequestIds.includes(unrec.requestId)) {
-              existing.unfulfilledRequestIds.push(unrec.requestId);
             }
             existing.updatedAt = now;
             delete this.state.uncertainQueues[rKey];
@@ -3474,17 +3498,19 @@ export class BridgeService {
               filePath: null,
               dockFileId: null,
               matchedBookId: null,
-              requestIds: [unrec.requestId],
-              userIds: unrec.userId ? [unrec.userId] : [],
+              requestIds: (Array.isArray(unrec.requestIds) && unrec.requestIds.length ? unrec.requestIds : (unrec.requestId ? [unrec.requestId] : [])),
+              userIds: (Array.isArray(unrec.userIds) && unrec.userIds.length ? [...unrec.userIds] : (unrec.userId ? [unrec.userId] : [])),
               requestFulfillments: {},
               fulfilledRequestIds: [],
-              unfulfilledRequestIds: [unrec.requestId],
+              unfulfilledRequestIds: (Array.isArray(unrec.requestIds) && unrec.requestIds.length ? [...unrec.requestIds] : (unrec.requestId ? [unrec.requestId] : [])),
               createdAt: unrec.queuedAt || now,
               updatedAt: now,
             };
             this.state.tasks[realTaskId] = taskRecord;
             this.state.releases[rKey] = realTaskId;
-            this.state.requests[unrec.requestId] = realTaskId;
+            for (const rid of (Array.isArray(unrec.requestIds) && unrec.requestIds.length ? unrec.requestIds : (unrec.requestId ? [unrec.requestId] : []))) {
+              this.state.requests[rid] = realTaskId;
+            }
             delete this.state.uncertainQueues[rKey];
             updatedCount++;
           }
@@ -3853,7 +3879,14 @@ export class BridgeService {
       return next;
     };
     const server = http.createServer(async (req, res) => {
-      const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
+      let url;
+    try {
+      url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
+    } catch (e) {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: false, error: 'Bad Request' }));
+      return;
+    }
 
       // Helper to read and cap body size at 1MB
       const readCappedBody = (cb) => {
@@ -3958,10 +3991,26 @@ export class BridgeService {
 
       // Read-only diagnostics endpoint: GET /api/diagnostics or /api/diagnostics/:requestId
       if (req.method === 'GET' && (url.pathname === '/api/diagnostics' || url.pathname.startsWith('/api/diagnostics/'))) {
+        if (!checkAuth()) {
+          res.writeHead(401, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: 'Unauthorized' }));
+          return;
+        }
         await runLocked(async () => {
-          const rid = url.pathname === '/api/diagnostics' ? (url.searchParams.get('requestId') || null) : decodeURIComponent(url.pathname.slice('/api/diagnostics/'.length));
-          res.writeHead(200, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify(this.diagnose(rid)));
+          try {
+            let rid = null;
+            if (url.pathname !== '/api/diagnostics') {
+              try { rid = decodeURIComponent(url.pathname.slice('/api/diagnostics/'.length)); }
+              catch (e) { rid = null; }
+            } else {
+              rid = url.searchParams.get('requestId');
+            }
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify(this.diagnose(rid)));
+          } catch (e) {
+            res.writeHead(500, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ ok: false, error: sanitizeLog(e.message) }));
+          }
         });
         return;
       }

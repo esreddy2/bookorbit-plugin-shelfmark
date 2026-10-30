@@ -19,9 +19,10 @@ export const KNOWN_TITLE_EQUIVALENTS = new Map([
 export function normalizeString(str) {
   if (str == null) return '';
   return String(str)
+    .normalize('NFKC')
     .toLowerCase()
     .normalize('NFKD')
-    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/[\u0300-\u036f\u1ab0-\u1aff\u1dc0-\u1dff\u20d0-\u20ff\ufe20-\ufe2f]/g, '')
     .replace(/[^\p{L}\p{N}\s]/gu, ' ')
     .replace(/\s+/g, ' ')
     .trim();
@@ -58,7 +59,7 @@ export function extractCoreTitle(title) {
   if (byMatch.length > 1 && byMatch[0].trim().length >= 2) {
     const suffix = byMatch[1].trim();
     const suffixTokens = suffix.split(/\s+/).filter(Boolean);
-    const looksLikeAuthor = suffix.includes(',') || suffixTokens.length >= 2;
+    const looksLikeAuthor = suffix.includes(',') || (suffixTokens.length >= 2 && suffixTokens.some((t) => t.length >= 5));
     if (looksLikeAuthor) s = byMatch[0].trim();
   }
   const parts = s.split(/(?:\s+[-–—]\s+|[:;/|]|\s*[–—]\s*)/);
@@ -204,8 +205,16 @@ export function collectIsbnPairs(obj) {
       }
     }
     if (counterpartIsbns.length > 0 && ownIsbns.length > 0) {
-      for (const c of counterpartIsbns) for (const o of ownIsbns) pairs.push([c, o]);
+      if (counterpartIsbns.length === ownIsbns.length) {
+        for (let i = 0; i < counterpartIsbns.length; i++) pairs.push([counterpartIsbns[i], ownIsbns[i]]);
+      } else if (counterpartIsbns.length === 1) {
+        for (const o of ownIsbns) pairs.push([counterpartIsbns[0], o]);
+      } else if (ownIsbns.length === 1) {
+        for (const c of counterpartIsbns) pairs.push([c, ownIsbns[0]]);
+      }
+      // otherwise do not infer cartesian pairs
     } else if (counterpartIsbns.length >= 2) {
+      // Only pair counterparts that are explicitly listed as equivalents, not all combinations.
       for (let i = 0; i < counterpartIsbns.length; i++)
         for (let j = i + 1; j < counterpartIsbns.length; j++)
           pairs.push([counterpartIsbns[i], counterpartIsbns[j]]);
@@ -247,8 +256,33 @@ export function areVerifiedCounterparts(isbnA, isbnB, ...contexts) {
         if (ctx.extra.bookMetadata && typeof ctx.extra.bookMetadata === 'object') pairs.push(...collectIsbnPairs(ctx.extra.bookMetadata));
         pairs.push(...collectIsbnPairs(ctx.extra));
       }
+      // trustedIsbns: array of ISBN strings (all mutually trusted) or nested pairs
       if (ctx.trustedIsbns) {
-        // trustedIsbns may be array of pairs or isbns; only treat as pairs if nested
+        const trusted = Array.isArray(ctx.trustedIsbns) ? ctx.trustedIsbns : [ctx.trustedIsbns];
+        const trustedIsbns = [];
+        for (const item of trusted) {
+          if (Array.isArray(item)) {
+            const cleaned = item.map(normalizeIsbn).filter((x) => x.length === 10 || x.length === 13);
+            if (cleaned.length >= 2) {
+              for (let i = 0; i < cleaned.length; i++)
+                for (let j = i + 1; j < cleaned.length; j++) pairs.push([cleaned[i], cleaned[j]]);
+            }
+          } else if (item && typeof item === 'object') {
+            pairs.push(...collectIsbnPairs(item));
+            for (const v of Object.values(item)) {
+              const c = normalizeIsbn(v);
+              if (c.length === 10 || c.length === 13) trustedIsbns.push(c);
+            }
+          } else {
+            const c = normalizeIsbn(item);
+            if (c.length === 10 || c.length === 13) trustedIsbns.push(c);
+          }
+        }
+        // If both a and b are in the trusted set, treat as verified counterparts.
+        const aNorm = normalizeIsbn(a); const bNorm = normalizeIsbn(b);
+        if (trustedIsbns.some((x) => sameIsbn(x, aNorm)) && trustedIsbns.some((x) => sameIsbn(x, bNorm))) {
+          return true;
+        }
       }
     }
     for (const [x, y] of pairs) {
@@ -266,8 +300,9 @@ export function isNoiseDerivativeWrapper(candidateTitle, requestedTitle) {
 }
 
 function safePrefix(candidate, requested) {
-  const c = String(candidate).trim().toLowerCase();
-  const r = String(requested).trim().toLowerCase();
+  const c = normalizeString(candidate);
+  const r = normalizeString(requested);
+  if (!c || !r) return c === r;
   if (!c.startsWith(r) || c === r) return c === r;
   const rest = c.slice(r.length);
   return /^[\s]*[:;\-–—(\[]/.test(rest);
@@ -315,7 +350,8 @@ export function titleMatchDecision(candidateTitle, requestedTitle) {
   if (normCand.includes(normReq) || normReq.includes(normCand)) {
     const cTokens = getTokens(candidateTitle);
     const rTokens = getTokens(requestedTitle);
-    if (rTokens.length > 1 && rTokens.every((t) => cTokens.includes(t))) {
+    const boundaryOk = (normCand === normReq) || safePrefix(normCand, normReq) || safePrefix(normReq, normCand);
+    if (rTokens.length > 1 && rTokens.every((t) => cTokens.includes(t)) && boundaryOk) {
       evidence.push({ field: 'title', value: normCand, level: 'work', status: 'verified' });
       return { outcome: 'match', workConfidence: 'high', editionConfidence: 'medium', evidence, conflicts, reasonCodes };
     }
@@ -324,7 +360,7 @@ export function titleMatchDecision(candidateTitle, requestedTitle) {
   if (equivalents) {
     for (const eq of equivalents) {
       const normEq = normalizeString(eq);
-      if (normCand === normEq || normCand.startsWith(normEq) || normCand.includes(normEq)) {
+      if (normCand === normEq || safePrefix(normCand, normEq) || safePrefix(normEq, normCand)) {
         evidence.push({ field: 'title', value: normCand, level: 'work', status: 'verified' });
         return { outcome: 'match', workConfidence: 'high', editionConfidence: 'medium', evidence, conflicts, reasonCodes };
       }
@@ -334,7 +370,7 @@ export function titleMatchDecision(candidateTitle, requestedTitle) {
   if (candEquivalents) {
     for (const eq of candEquivalents) {
       const normEq = normalizeString(eq);
-      if (normReq === normEq || normReq.startsWith(normEq) || normReq.includes(normEq)) {
+      if (normReq === normEq || safePrefix(normReq, normEq) || safePrefix(normEq, normReq)) {
         evidence.push({ field: 'title', value: normCand, level: 'work', status: 'verified' });
         return { outcome: 'match', workConfidence: 'high', editionConfidence: 'medium', evidence, conflicts, reasonCodes };
       }
@@ -463,14 +499,23 @@ export function editionCompatibility(a, b) {
   if (titleA && titleB) {
     const td = titleMatchDecision(titleA, titleB);
     if (td.outcome !== 'match') { titleOk = false; conflicts.push('incompatible_title'); }
+  } else if (titleA || titleB) {
+    // one side missing title: cannot establish work identity
+    titleOk = false; conflicts.push('missing_title');
   }
   // author
-  const authorA = (a.author || (Array.isArray(a.authors) ? a.authors[0] : '') || '').trim();
-  const authorB = (b.author || (Array.isArray(b.authors) ? b.authors[0] : '') || '').trim();
+  const authorsA = Array.isArray(a.authors) ? a.authors : (a.author ? [a.author] : []);
+  const authorsB = Array.isArray(b.authors) ? b.authors : (b.author ? [b.author] : []);
   let authorOk = true;
-  if (authorA && authorB) {
-    const ad = authorMatchDecision(authorA, authorB);
-    if (ad.outcome !== 'match') { authorOk = false; conflicts.push('incompatible_author'); }
+  if (authorsA.length && authorsB.length) {
+    // require at least one compatible author pair
+    let anyMatch = false;
+    for (const aa of authorsA) for (const bb of authorsB) {
+      if (authorMatchDecision(aa, bb).outcome === 'match') anyMatch = true;
+    }
+    if (!anyMatch) { authorOk = false; conflicts.push('incompatible_author'); }
+  } else if (authorsA.length || authorsB.length) {
+    authorOk = false; conflicts.push('missing_author');
   }
   // format
   const fmtA = (a.format || '').trim().toLowerCase();
@@ -478,14 +523,22 @@ export function editionCompatibility(a, b) {
   let formatOk = true;
   if (fmtA && fmtB && fmtA !== fmtB) { formatOk = false; conflicts.push('incompatible_format'); }
   // language
-  const langA = (a.language || '').trim().toLowerCase();
-  const langB = (b.language || '').trim().toLowerCase();
+  const langA = normalizeString(a.language || '');
+  const langB = normalizeString(b.language || '');
   let langOk = true;
   if (langA && langB && langA !== langB) { langOk = false; conflicts.push('language_mismatch'); }
 
   // ISBN
-  const isbnAraw = a.isbn13 || a.isbn || a.extra?.isbn;
-  const isbnBraw = b.isbn13 || b.isbn || b.extra?.isbn;
+  const extractFirstIsbn = (x) => {
+    const vals = Array.isArray(x) ? x : [x];
+    for (const v of vals) {
+      const c = normalizeIsbn(v);
+      if (c.length === 10 || c.length === 13) return c;
+    }
+    return x;
+  };
+  const isbnAraw = extractFirstIsbn(a.isbn13 || a.isbn || a.extra?.isbn || a.extra?.isbn_13);
+  const isbnBraw = extractFirstIsbn(b.isbn13 || b.isbn || b.extra?.isbn || b.extra?.isbn_13);
   let isbnA = normalizeIsbn(isbnAraw);
   let isbnB = normalizeIsbn(isbnBraw);
   // epub metadata
@@ -533,7 +586,8 @@ export function editionCompatibility(a, b) {
   const workConfidence = (titleOk && authorOk) ? 'high' : 'none';
 
   evidence.push({ field: 'title', value: titleA, level: 'work', status: titleOk ? 'verified' : 'contradictory' });
-  evidence.push({ field: 'author', value: authorA, level: 'work', status: authorOk ? 'verified' : 'contradictory' });
+  const authorAVal = Array.isArray(a.authors) ? (a.authors[0] || a.author || '') : (a.author || '');
+  evidence.push({ field: 'author', value: authorAVal, level: 'work', status: authorOk ? 'verified' : 'contradictory' });
   if (fmtA || fmtB) evidence.push({ field: 'format', value: fmtA || fmtB, level: 'edition', status: formatOk ? 'verified' : 'contradictory' });
   if (isbnA || isbnB) evidence.push({ field: 'isbn', value: isbnA || isbnB, level: 'edition', status: (isbnA && isbnB && !isbnOk) ? 'contradictory' : (isbnVerified ? 'verified' : 'inferred') });
   if (yearA || yearB) evidence.push({ field: 'year', value: yearA || yearB, level: 'edition', status: (yearA && yearB && yearA !== yearB) ? 'contradictory' : (yearVerified ? 'verified' : 'inferred') });

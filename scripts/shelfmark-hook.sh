@@ -49,8 +49,22 @@ if [ -z "$TASK_ID_VAL" ]; then
 else
   TASK_JSON="\"$TASK_ID_VAL\""
 fi
-PAYLOAD=$(printf '{"version":1,"phase":"post_transfer","task":{"task_id":%s,"title":"%s"},"metadata":{"source":"shelfmark_hook","destination":"%s"},"paths":{"target":"%s","final_paths":["%s"],"destination":"%s"},"target_path":"%s","destination":"%s"}' \
-      "$TASK_JSON" "$FILE_NAME" "$TARGET_PATH" "$TARGET_PATH" "$TARGET_PATH" "$TARGET_PATH" "$TARGET_PATH" "$TARGET_PATH")
+PAYLOAD=$(TASK_JSON="$TASK_JSON" FILE_NAME="$FILE_NAME" TARGET_PATH="$TARGET_PATH" node -e '
+  const tj = process.env.TASK_JSON;
+  const fn = process.env.FILE_NAME || "";
+  const tp = process.env.TARGET_PATH || "";
+  const task_id = tj === "null" ? null : tj.replace(/^"|"$/g, "");
+  const obj = {
+    version: 1,
+    phase: "post_transfer",
+    task: { task_id, title: fn },
+    metadata: { source: "shelfmark_hook", destination: tp },
+    paths: { target: tp, final_paths: [tp], destination: tp },
+    target_path: tp,
+    destination: tp,
+  };
+  process.stdout.write(JSON.stringify(obj));
+')
   else
     echo "[Shelfmark Hook] Warning: No target path in \$1 and no stdin JSON received." >&2
     exit 0
