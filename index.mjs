@@ -26,7 +26,7 @@ const inFlightResolutions = new Map();
 /** Confident bidirectional title equivalents. */
 export default {
   apiVersion: 1,
-  version: '1.7.0',
+  version: '1.7.1',
   update: {
     manifestUrl: 'https://raw.githubusercontent.com/esreddy2/bookorbit-plugin-shelfmark/main/updates/shelfmark.json',
     ed25519PublicKey: '-0aHVhXqg7cGaDchc2p1Y8tDnn8A7cJ0WREKspNv5Bc',

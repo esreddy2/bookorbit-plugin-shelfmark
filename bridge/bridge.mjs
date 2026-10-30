@@ -1468,27 +1468,27 @@ export class BridgeService {
           if (req.mediaKind && req.mediaKind !== 'ebook') continue;
 
           // 3. Skip if already tracked (never blindly requeue on Socket.IO broadcasts)
-          if (this.state.requests[req.id]) {
+          if (this.state.requests[reqId]) {
             continue;
           }
 
           // 3b. Stop retry if request reached max attempts (never retry indefinitely)
-          if ((this.state.requestSourceAttempts[req.id] || 0) >= this.maxSourceAttempts) {
+          if ((this.state.requestSourceAttempts[reqId] || 0) >= this.maxSourceAttempts) {
             continue;
           }
 
           // Cancellation-aware: check request status before queueing/searching
-          const requestState = await this.getRequestStatus(req.id, fetchFn);
+          const requestState = await this.getRequestStatus(reqId, fetchFn);
           if (requestState === 'cancelled') {
-            this.setRequestProgress(req.id, 'cancelled', { reason: 'cancelled' });
+            this.setRequestProgress(reqId, 'cancelled', { reason: 'cancelled' });
             continue;
           }
           if (requestState !== 'active') {
-            this.setRequestProgress(req.id, 'status_unknown', { reason: 'status_unknown' });
+            this.setRequestProgress(reqId, 'status_unknown', { reason: 'status_unknown' });
             continue;
           }
 
-          this.setRequestProgress(req.id, 'searching');
+          this.setRequestProgress(reqId, 'searching');
 
           // 4. Search releases using corrected plugin logic (bounded per request)
           const query = {
@@ -1542,13 +1542,13 @@ export class BridgeService {
           } catch (err) {
             const errorMessage = err instanceof Error ? err.message : String(err ?? 'unknown error');
             console.warn(`[Bridge] Plugin search error for "${query.title}": ${sanitizeLog(errorMessage)}`);
-            this.setRequestProgress(req.id, 'search_failed', { reason: 'search_failed', error: errorMessage });
-            this.state.requestErrors[req.id] = {
+            this.setRequestProgress(reqId, 'search_failed', { reason: 'search_failed', error: errorMessage });
+            this.state.requestErrors[reqId] = {
               error: errorMessage,
               errorType: 'search_failed',
               reason: 'search_failed',
               lastAttemptAt: new Date().toISOString(),
-              attempts: this.state.requestSourceAttempts[req.id] || 0,
+              attempts: this.state.requestSourceAttempts[reqId] || 0,
             };
             this.saveState();
             continue;
@@ -1557,14 +1557,14 @@ export class BridgeService {
           }
 
           if (!searchResults || searchResults.length === 0) {
-            console.log(`[Bridge] No valid releases found for approved request ${req.id} ("${query.title}")`);
-            this.setRequestProgress(req.id, 'no_releases', { reason: 'no_releases' });
-            this.state.requestErrors[req.id] = {
+            console.log(`[Bridge] No valid releases found for approved request ${reqId} ("${query.title}")`);
+            this.setRequestProgress(reqId, 'no_releases', { reason: 'no_releases' });
+            this.state.requestErrors[reqId] = {
               error: 'No releases found',
               errorType: 'no_releases',
               reason: 'no_releases',
               lastAttemptAt: new Date().toISOString(),
-              attempts: this.state.requestSourceAttempts[req.id] || 0,
+              attempts: this.state.requestSourceAttempts[reqId] || 0,
             };
             this.saveState();
             continue;
@@ -1592,14 +1592,14 @@ export class BridgeService {
 
           if (eligibleReleases.length === 0) {
             const reason = ineligibilityReason || 'no_eligible_edition';
-            console.log(`[Bridge] No eligible edition-compatible releases found for approved request ${req.id} ("${query.title}")`);
-            this.setRequestProgress(req.id, 'no_eligible_edition', { reason });
-            this.state.requestErrors[req.id] = {
+            console.log(`[Bridge] No eligible edition-compatible releases found for approved request ${reqId} ("${query.title}")`);
+            this.setRequestProgress(reqId, 'no_eligible_edition', { reason });
+            this.state.requestErrors[reqId] = {
               error: reason,
               errorType: reason,
               reason,
               lastAttemptAt: new Date().toISOString(),
-              attempts: this.state.requestSourceAttempts[req.id] || 0,
+              attempts: this.state.requestSourceAttempts[reqId] || 0,
             };
             this.saveState();
             continue;
@@ -1621,21 +1621,21 @@ export class BridgeService {
             }
 
             // Cancellation-aware before queueing
-            const candidateRequestState = await this.getRequestStatus(req.id, fetchFn);
+            const candidateRequestState = await this.getRequestStatus(reqId, fetchFn);
             if (candidateRequestState === 'cancelled') {
-              this.setRequestProgress(req.id, 'cancelled', { reason: 'cancelled' });
+              this.setRequestProgress(reqId, 'cancelled', { reason: 'cancelled' });
               queuedSuccessfully = true; // stop trying candidates
               break;
             }
             if (candidateRequestState !== 'active') {
-              this.setRequestProgress(req.id, 'status_unknown', { reason: 'status_unknown' });
+              this.setRequestProgress(reqId, 'status_unknown', { reason: 'status_unknown' });
               queuedSuccessfully = true;
               break;
             }
 
             try {
               const queueRes = await this.queueRelease({
-                requestId: req.id,
+                requestId: reqId,
                 userId: req.userId || req.requesterUserId || req.requester_user_id || req.user_id,
                 release: candidateRelease,
                 libraryId: req.targetLibraryId || this.defaultLibraryId,
@@ -1644,12 +1644,12 @@ export class BridgeService {
                 fetchFn,
               });
               if (queueRes.adopted || queueRes.reused) {
-                console.log(`[Bridge] Adopted existing task ${queueRes.taskId} for request ${req.id} ("${candidateRelease.title}")`);
+                console.log(`[Bridge] Adopted existing task ${queueRes.taskId} for request ${reqId} ("${candidateRelease.title}")`);
               } else {
-                console.log(`[Bridge] Queued release for request ${req.id} ("${candidateRelease.title}")`);
+                console.log(`[Bridge] Queued release for request ${reqId} ("${candidateRelease.title}")`);
               }
               queuedSuccessfully = true;
-              this.setRequestProgress(req.id, 'queued', { reason: 'queued' });
+              this.setRequestProgress(reqId, 'queued', { reason: 'queued' });
               break;
             } catch (err) {
               const isEditionConflict = err.message && (err.message.toLowerCase().includes('incompatible edition') || err.message.toLowerCase().includes('incompatible'));
@@ -1659,7 +1659,7 @@ export class BridgeService {
                 continue;
               }
 
-              console.error(`[Bridge] Failed to queue release for request ${req.id}: ${sanitizeLog(err.message)}`);
+              console.error(`[Bridge] Failed to queue release for request ${reqId}: ${sanitizeLog(err.message)}`);
               const rKey = this.getReleaseKey(candidateRelease);
               if (rKey) {
                 this.state.failedReleases[rKey] = {
@@ -1671,9 +1671,9 @@ export class BridgeService {
                 };
               }
               const attemptId = `queue:${rKey || candidateRelease.sourceId || Date.now()}`;
-              this.state.requestAttempts[req.id] = this.state.requestAttempts[req.id] || [];
-              if (!this.state.requestAttempts[req.id].some((a) => a.attemptId === attemptId)) {
-                this.state.requestAttempts[req.id].push({
+              this.state.requestAttempts[reqId] = this.state.requestAttempts[reqId] || [];
+              if (!this.state.requestAttempts[reqId].some((a) => a.attemptId === attemptId)) {
+                this.state.requestAttempts[reqId].push({
                   attemptId,
                   releaseKey: rKey,
                   source: candidateRelease.source,
@@ -1681,9 +1681,9 @@ export class BridgeService {
                   timestamp: new Date().toISOString(),
                   error: err.message,
                 });
-                const attempts = this.state.requestAttempts[req.id].length;
-                this.state.requestSourceAttempts[req.id] = attempts;
-                this.state.requestErrors[req.id] = {
+                const attempts = this.state.requestAttempts[reqId].length;
+                this.state.requestSourceAttempts[reqId] = attempts;
+                this.state.requestErrors[reqId] = {
                   error: err.message,
                   errorType: 'queue_failed',
                   lastAttemptAt: new Date().toISOString(),
@@ -1694,8 +1694,8 @@ export class BridgeService {
             }
           }
 
-          if (!queuedSuccessfully && !this.state.requests[req.id]) {
-            console.warn(`[Bridge] Could not queue any compatible release candidate for request ${req.id} ("${query.title}")`);
+          if (!queuedSuccessfully && !this.state.requests[reqId]) {
+            console.warn(`[Bridge] Could not queue any compatible release candidate for request ${reqId} ("${query.title}")`);
           }
         }
 
@@ -1726,6 +1726,16 @@ export class BridgeService {
     // 1. Check if release already tracked or in uncertain queue
     const existingTaskId = this.state.releases[releaseKey];
     if (existingTaskId === 'uncertain') {
+      const rec = this.state.uncertainQueues[releaseKey];
+      if (rec) {
+        if (!Array.isArray(rec.requestIds)) rec.requestIds = rec.requestId ? [rec.requestId] : [];
+        if (requestId && !rec.requestIds.includes(requestId)) rec.requestIds.push(requestId);
+        if (requestId && !rec.requestId) rec.requestId = requestId;
+        if (userId && !Array.isArray(rec.userIds)) rec.userIds = rec.userId ? [rec.userId] : [];
+        if (userId && Array.isArray(rec.userIds) && !rec.userIds.includes(userId)) rec.userIds.push(userId);
+      }
+      if (requestId) this.state.requests[requestId] = 'uncertain';
+      this.saveState();
       return {
         status: 'uncertain_queue',
         taskId: null,
@@ -2773,6 +2783,29 @@ export class BridgeService {
    * 2. Persists matchedBookId before attempting fulfillment so uploads are never repeated
    * 3. Fulfills Book Requests independently per request ID (POST /api/v1/admin/book-requests/:id/fulfill)
    */
+  /**
+   * Account a failed task attempt for all its requests and unmap them so another
+   * source/candidate can be tried, subject to maxSourceAttempts.
+   */
+  recordTaskFailureAttempts(task, errorType = 'finalization_failed') {
+    const now = new Date().toISOString();
+    const attemptId = `${errorType}:${task.taskId}`;
+    for (const rid of (task.requestIds || [])) {
+      if (task.requestFulfillments?.[rid]?.fulfilled) continue;
+      this.state.requestAttempts[rid] = this.state.requestAttempts[rid] || [];
+      if (!this.state.requestAttempts[rid].some((a) => a.attemptId === attemptId)) {
+        this.state.requestAttempts[rid].push({ attemptId, taskId: task.taskId, releaseKey: task.releaseKey, timestamp: now, error: task.error });
+        const attempts = this.state.requestAttempts[rid].length;
+        this.state.requestSourceAttempts[rid] = attempts;
+        this.state.requestErrors[rid] = { error: task.error, errorType, lastAttemptAt: now, attempts };
+      }
+      if ((this.state.requestSourceAttempts[rid] || 0) < this.maxSourceAttempts) {
+        delete this.state.requests[rid];
+      }
+      this.setRequestProgress(rid, errorType, { reason: errorType });
+    }
+  }
+
   async fulfillBookOrbitRequests(task, fetchFn = globalThis.fetch) {
     const key = String(task?.taskId || task?.id || '');
     const prev = this._fulfillLocks.get(key) || Promise.resolve();
@@ -2904,6 +2937,9 @@ export class BridgeService {
         task.isbnVerificationFailed = true;
         task.status = 'failed';
         task.errorSource = 'companion_isbn_verification';
+        if (task.releaseKey && this.state.releases[task.releaseKey] === (task.taskId || task.id)) {
+          delete this.state.releases[task.releaseKey];
+        }
         for (const rid of (task.requestIds || [])) {
           if (task.requestFulfillments?.[rid]?.fulfilled) continue;
           const attemptId = `isbn:${task.taskId || task.id}`;
@@ -2932,7 +2968,11 @@ export class BridgeService {
       if (!task.filePath) {
         task.status = 'finalization_failed';
         task.error = 'Task filePath is missing';
+        this.recordTaskFailureAttempts(task, 'finalization_failed');
         this.saveState();
+        if ((task.requestIds || []).some((rid) => (this.state.requestSourceAttempts[rid] || 0) < this.maxSourceAttempts)) {
+          this.triggerProcessPendingRequests(100);
+        }
         return { fulfilled: false, error: task.error };
       }
 
@@ -2983,12 +3023,20 @@ export class BridgeService {
           } else if (directResult.conflict) {
             task.status = 'finalization_failed';
             task.error = directResult.error;
+            this.recordTaskFailureAttempts(task, 'finalization_failed');
             this.saveState();
+            if ((task.requestIds || []).some((rid) => (this.state.requestSourceAttempts[rid] || 0) < this.maxSourceAttempts)) {
+              this.triggerProcessPendingRequests(100);
+            }
             return { fulfilled: false, error: task.error };
           } else if (directResult.notFound) {
             task.status = 'finalization_failed';
             task.error = directResult.error || 'Direct library upload endpoint not available';
+            this.recordTaskFailureAttempts(task, 'finalization_failed');
             this.saveState();
+            if ((task.requestIds || []).some((rid) => (this.state.requestSourceAttempts[rid] || 0) < this.maxSourceAttempts)) {
+              this.triggerProcessPendingRequests(100);
+            }
             return { fulfilled: false, error: task.error };
           } else if (directResult.networkError) {
             task.status = 'uncertain_upload';
@@ -3004,7 +3052,11 @@ export class BridgeService {
           } else {
             task.status = 'finalization_failed';
             task.error = directResult.error;
+            this.recordTaskFailureAttempts(task, 'finalization_failed');
             this.saveState();
+            if ((task.requestIds || []).some((rid) => (this.state.requestSourceAttempts[rid] || 0) < this.maxSourceAttempts)) {
+              this.triggerProcessPendingRequests(100);
+            }
             return { fulfilled: false, error: task.error };
           }
         }
@@ -3014,7 +3066,11 @@ export class BridgeService {
     if (!matchedBookId) {
       task.status = 'finalization_failed';
       task.error = 'Finalization did not yield a valid BookOrbit book ID';
+      this.recordTaskFailureAttempts(task, 'finalization_failed');
       this.saveState();
+      if ((task.requestIds || []).some((rid) => (this.state.requestSourceAttempts[rid] || 0) < this.maxSourceAttempts)) {
+        this.triggerProcessPendingRequests(100);
+      }
       return { fulfilled: false, error: task.error };
     }
 
@@ -3493,8 +3549,14 @@ export class BridgeService {
         task.error = 'Shelfmark cancelled task';
         task.errorSource = 'shelfmark';
         task.updatedAt = now;
+        if (task.releaseKey && this.state.releases[task.releaseKey] === task.taskId) {
+          delete this.state.releases[task.releaseKey];
+        }
         for (const rid of (task.requestIds || [])) {
           this.setRequestProgress(rid, 'cancelled', { reason: 'cancelled' });
+          if (!task.requestFulfillments?.[rid]?.fulfilled) {
+            delete this.state.requests[rid];
+          }
         }
       }
 
@@ -3616,9 +3678,12 @@ export class BridgeService {
             // Terminal requests; nothing to upload or retry.
             continue;
           }
-          if (activeIds.length === 0) {
-            // The only unresolved requests cannot currently be checked. Keep task as-is.
-            continue;
+          if (activeIds.length === 0 && unknownIds.length > 0) {
+            // Unknown request status is temporary. Recover when durable upload evidence exists;
+            // otherwise keep task as-is until status becomes checkable.
+            if (!task.matchedBookId && !task.filePath) {
+              continue;
+            }
           }
           if (task.matchedBookId) {
             // Already uploaded! Retry fulfillment for unfulfilled requests directly without re-uploading
