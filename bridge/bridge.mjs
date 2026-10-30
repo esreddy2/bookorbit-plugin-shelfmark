@@ -325,10 +325,25 @@ export function gatherTrustedIsbnsBridge(...sources) {
 
 export function collectEditionSpecificIsbnsBridge(obj, out = new Set()) {
   if (!obj || typeof obj !== 'object') return out;
-  const counterpartFlags = ['verifiedCounterpart', 'counterpartVerified', 'verified_counterpart', 'counterpart_verified', 'verified', 'counterpart'];
-  const hasVerifiedFlag = counterpartFlags.some((f) => obj[f] === true || obj[f] === 'true' || obj[f] === 1);
 
-  if (hasVerifiedFlag) {
+  // Only explicitly named counterpart/equivalent relationships are trusted.
+  // Generic verification flags and broad related/edition collections never
+  // establish edition equivalence.
+  const counterpartKeys = Object.keys(obj).filter((k) => /counterpart|equivalent/i.test(k));
+  if (counterpartKeys.length > 0) {
+    // Collect the counterpart ISBNs themselves.
+    for (const key of counterpartKeys) {
+      const stack = [obj[key]];
+      while (stack.length) {
+        const cur = stack.pop();
+        if (cur == null) continue;
+        if (Array.isArray(cur)) { stack.push(...cur); continue; }
+        if (typeof cur === 'object') { stack.push(...Object.values(cur)); continue; }
+        const cleaned = normalizeIsbnBridge(cur);
+        if (cleaned.length === 10 || cleaned.length === 13) out.add(cleaned);
+      }
+    }
+    // Collect sibling ISBNs of the same record to form the verified pair.
     for (const [key, value] of Object.entries(obj)) {
       if (/isbn/i.test(key)) {
         const vals = Array.isArray(value) ? value : [value];
@@ -345,19 +360,9 @@ export function collectEditionSpecificIsbnsBridge(obj, out = new Set()) {
   }
 
   for (const [key, value] of Object.entries(obj)) {
-    if (/(counterpart|equivalent|related|alternate)/i.test(key)) {
-      const stack = [value];
-      while (stack.length) {
-        const cur = stack.pop();
-        if (cur == null) continue;
-        if (Array.isArray(cur)) { stack.push(...cur); continue; }
-        if (typeof cur === 'object') { stack.push(...Object.values(cur)); continue; }
-        const cleaned = normalizeIsbnBridge(cur);
-        if (cleaned.length === 10 || cleaned.length === 13) out.add(cleaned);
-      }
-    } else if (Array.isArray(value)) {
+    if (Array.isArray(value)) {
       for (const item of value) collectEditionSpecificIsbnsBridge(item, out);
-    } else if (typeof value === 'object' && value !== null) {
+    } else if (value && typeof value === 'object') {
       collectEditionSpecificIsbnsBridge(value, out);
     }
   }
@@ -375,18 +380,9 @@ export function areVerifiedIsbnCounterpartsBridge(isbnA, isbnB, ...contexts) {
     if (!ctx) continue;
     const sets = [];
     if (Array.isArray(ctx)) {
-      const s = new Set();
-      for (const v of ctx) {
-        const n = normalizeIsbnBridge(v);
-        if (n.length === 10 || n.length === 13) s.add(n);
-      }
-      sets.push(s);
+      // A flat ISBN array (including persisted trustedIsbns) is never proof of equivalence.
+      // Only edition-specific counterpart records below can establish a relationship.
     } else if (typeof ctx === 'object') {
-      // trustedIsbns-style array property
-      if (Array.isArray(ctx.trustedIsbns)) {
-        const s = new Set(ctx.trustedIsbns.map(normalizeIsbnBridge).filter((x) => x.length === 10 || x.length === 13));
-        sets.push(s);
-      }
       // bookMetadata/metadata record as a whole
       if (ctx.bookMetadata && typeof ctx.bookMetadata === 'object') {
         sets.push(collectEditionSpecificIsbnsBridge(ctx.bookMetadata));
