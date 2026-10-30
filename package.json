@@ -1,6 +1,6 @@
 {
   "name": "bookorbit-plugin-shelfmark",
-  "version": "1.5.25",
+  "version": "1.5.26",
   "description": "Shelfmark indexer plugin for BookOrbit",
   "type": "module",
   "scripts": {

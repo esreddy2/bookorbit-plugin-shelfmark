@@ -34,7 +34,7 @@ const KNOWN_TITLE_EQUIVALENTS = new Map([
 
 export default {
   apiVersion: 1,
-  version: '1.5.25',
+  version: '1.5.26',
   update: {
     manifestUrl: 'https://raw.githubusercontent.com/esreddy2/bookorbit-plugin-shelfmark/main/updates/shelfmark.json',
     ed25519PublicKey: '-0aHVhXqg7cGaDchc2p1Y8tDnn8A7cJ0WREKspNv5Bc',
@@ -1544,8 +1544,21 @@ function isTitleMatch(candidateTitle, requestedTitle) {
   }
 
   if (normCand === normReq) return true;
-  if (normCand.startsWith(normReq) || normReq.startsWith(normCand)) return true;
-  if (normCand.includes(normReq) || normReq.includes(normCand)) return true;
+
+  const safePrefix = (candidate, requested) => {
+    const c = String(candidate).trim().toLowerCase();
+    const r = String(requested).trim().toLowerCase();
+    if (!c.startsWith(r) || c === r) return c === r;
+    const rest = c.slice(r.length);
+    return /^[\s]*[:;\-–—(\[]/.test(rest);
+  };
+  if (safePrefix(candidateTitle, requestedTitle) || safePrefix(requestedTitle, candidateTitle)) return true;
+
+  if (normCand.includes(normReq) || normReq.includes(normCand)) {
+    const cTokens = getTokens(candidateTitle);
+    const rTokens = getTokens(requestedTitle);
+    if (rTokens.length > 1 && rTokens.every((t) => cTokens.includes(t))) return true;
+  }
 
   // Check confident equivalents (e.g. 1984 vs Nineteen Eighty-Four)
   const equivalents = KNOWN_TITLE_EQUIVALENTS.get(normReq);
@@ -1579,8 +1592,12 @@ function isTitleMatch(candidateTitle, requestedTitle) {
   const reqTokens = getTokens(requestedTitle);
   if (reqTokens.length === 0) return true;
 
+  if (reqTokens.length === 1) {
+    return false;
+  }
+
   const matchingTokens = reqTokens.filter((t) => candTokens.includes(t));
-  return matchingTokens.length / reqTokens.length >= 0.7;
+  return matchingTokens.length === reqTokens.length;
 }
 
 function isAuthorMatch(candidateAuthors, requestedAuthor) {
@@ -1619,7 +1636,15 @@ function isAuthorMatch(candidateAuthors, requestedAuthor) {
     if (candTokens.includes(reqSurname)) {
       if (reqTokens.length === 1) return true;
       const reqFirst = reqTokens[0];
-      if (candTokens.some((t) => t === reqFirst || t.startsWith(reqFirst[0]) || reqFirst.startsWith(t[0]))) {
+      const candFirsts = candTokens.filter((t) => t !== reqSurname);
+      const compatibleFirst = candFirsts.some((t) => {
+        if (t === reqFirst) return true;
+        if (t.length === 1 || reqFirst.length === 1) {
+          return t.startsWith(reqFirst[0]) || reqFirst.startsWith(t[0]);
+        }
+        return false;
+      });
+      if (compatibleFirst) {
         return true;
       }
     }
@@ -1630,7 +1655,8 @@ function isAuthorMatch(candidateAuthors, requestedAuthor) {
       if (candTokens.length === 1) return true;
       const candFirst = candTokens[candTokens.length - 1];
       const reqFirst = reqTokens[0];
-      if (reqTokens.some((t) => t === candFirst || t.startsWith(candFirst[0]) || candFirst.startsWith(t[0]))) {
+      if (candFirst === reqFirst) return true;
+      if ((candFirst.length === 1 || reqFirst.length === 1) && (candFirst.startsWith(reqFirst[0]) || reqFirst.startsWith(candFirst[0]))) {
         return true;
       }
     }
