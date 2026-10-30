@@ -1,5 +1,5 @@
 /**
- * BookOrbit ↔ Shelfmark acceptance and regression verification, v1.5.20.
+ * BookOrbit ↔ Shelfmark acceptance and regression verification, v1.5.21.
  *
  * EXTERNAL ORACLES — NOT AN IMPLEMENTATION-DERIVED TEST PLAN:
  *   - BookOrbit v3.5.0 API/host contracts and request behavior.
@@ -15,7 +15,7 @@
  *
  * Place at repository ROOT as verify.mjs, then run:
  *   node verify.mjs                # acceptance tests while developing
- *   node verify.mjs --release      # additionally require signed v1.5.20 release
+ *   node verify.mjs --release      # additionally require signed v1.5.21 release
  *
  * A 404 for an unknown route is intentional. NEVER add a made-up endpoint
  * to the allowlist just to make a test green. Verify an API contract first.
@@ -53,7 +53,7 @@ import {
 } from './bridge/bridge.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
-const EXPECTED_VERSION = '1.5.20';
+const EXPECTED_VERSION = '1.5.21';
 const RELEASE_MODE = process.argv.includes('--release');
 const TEST_TIMEOUT_MS = 10_000;
 const tests = [];
@@ -373,7 +373,7 @@ test('DECLARATION: BookOrbit API v1, Shelfmark indexer and ebook-only', () => {
   assert.equal(plugin.type, 'shelfmark');
   assert.deepEqual(plugin.mediaKinds, ['ebook']);
 });
-test('DECLARATION: native indexer advertises v1.5.20, never a previous version', () => {
+test('DECLARATION: native indexer advertises v1.5.21, never a previous version', () => {
   assert.equal(plugin.version, EXPECTED_VERSION);
 });
 test('DECLARATION: exposes search, test, and resolveFile entry points', () => {
@@ -399,7 +399,7 @@ test('RELEASE CONTRACT: package version, plugin version and release target agree
   assert.equal(plugin.version, EXPECTED_VERSION);
 });
 if (RELEASE_MODE) {
-  test('RELEASE: signed manifest has declared format and v1.5.20 version', () => {
+  test('RELEASE: signed manifest has declared format and v1.5.21 version', () => {
     const manifest = JSON.parse(readFileSync(join(HERE, 'updates', 'shelfmark.json'), 'utf8'));
     assert.equal(manifest.schemaVersion, 1);
     assert.equal(manifest.type, 'shelfmark');
@@ -583,13 +583,13 @@ test('SEARCH: metadata wrong-author match is not allowed to dictate a wrong rele
   });
   assert.deepEqual(result, []);
 });
-test('SEARCH: fallback to title/author release search when metadata provider returns nothing', async () => {
+test('SEARCH: no metadata match yields no release discovery (no fabricated IDs)', async () => {
   const { result, fake } = await searchScenario({
     query: standardQuery('Underground Book', 'Rare Author'),
     books: [], releases: [release('Underground Book', 'Rare Author')],
   });
-  assert.ok(result.length > 0);
-  assert.ok(fake.called('sm.releases').length >= 1);
+  assert.deepEqual(result, []);
+  assert.equal(fake.called('sm.releases').length, 0);
 });
 test('SEARCH: no match does not fabricate a candidate', async () => {
   const { result } = await searchScenario({
@@ -688,14 +688,14 @@ test('SEARCH: release language must not be fabricated from parent English metada
   if (found) assert.ok(!['English', 'en'].includes(found.language),
     'unknown release language was incorrectly asserted to be English');
 });
-test('SEARCH: ISBN-only BookOrbit query works without a title', async () => {
+test('SEARCH: ISBN-only BookOrbit query without metadata yields no releases', async () => {
   const isbn = '9780451524935';
   const { result, fake } = await searchScenario({
     query: { isbn13: isbn, isbn13s: [isbn], mediaKind: 'ebook' }, books: [],
     releases: [release('1984', 'George Orwell', { isbn })],
   });
-  assert.ok(fake.called('sm.releases').some((c) => c.query.get('isbn') === isbn));
-  assert.ok(result.some((r) => r.isbn === isbn));
+  assert.deepEqual(result, []);
+  assert.equal(fake.called('sm.releases').length, 0);
 });
 test('SEARCH: metadata ISBN is carried into the release lookup', async () => {
   const { fake } = await searchScenario({
@@ -829,7 +829,7 @@ test('SEARCH: release source "all" or empty omits the source query parameter ent
   assert.ok(callsDirect.every((c) => c.query.get('source') === 'direct_download'),
     'explicit source direct_download must be preserved');
 
-  // Test direct fallback search (metadata returns empty) also omits source for 'all'
+  // No direct /api/releases fallback without metadata-derived provider/book_id
   const { fake: fakeFallbackAll } = await searchScenario({
     query: standardQuery('Rare Book Title', 'Unknown Author'),
     books: [],
@@ -837,9 +837,7 @@ test('SEARCH: release source "all" or empty omits the source query parameter ent
     settings: { releaseSource: 'all' },
   });
   const callsFallbackAll = fakeFallbackAll.called('sm.releases');
-  assert.ok(callsFallbackAll.length > 0, 'must query releases on direct fallback');
-  assert.ok(callsFallbackAll.every((c) => !c.query.has('source')),
-    'direct fallback must omit source parameter when releaseSource is "all"');
+  assert.equal(callsFallbackAll.length, 0, 'must not query releases without metadata');
 });
 
 test('SEARCH: release payload carries the documented Shelfmark contract fields', async () => {

@@ -278,6 +278,103 @@ export function parsePositiveInt(val) {
   return null;
 }
 
+export function normalizeIsbnBridge(value) {
+  return String(value || '').replace(/[^0-9X]/gi, '').trim().toUpperCase();
+}
+
+export function collectMetadataIsbnsBridge(obj, out = new Set()) {
+  if (!obj || typeof obj !== 'object') return out;
+  for (const [key, value] of Object.entries(obj)) {
+    if (/isbn/i.test(key)) {
+      const vals = Array.isArray(value) ? value : [value];
+      for (const v of vals) {
+        if (v == null) continue;
+        if (typeof v === 'object') collectMetadataIsbnsBridge(v, out);
+        else {
+          const cleaned = normalizeIsbnBridge(v);
+          if (cleaned.length === 10 || cleaned.length === 13) out.add(cleaned);
+        }
+      }
+    } else if (typeof value === 'object') {
+      collectMetadataIsbnsBridge(value, out);
+    }
+  }
+  return out;
+}
+
+export function gatherTrustedIsbnsBridge(...sources) {
+  const out = new Set();
+  for (const src of sources) {
+    if (!src) continue;
+    if (Array.isArray(src)) {
+      for (const v of src) {
+        const n = normalizeIsbnBridge(v);
+        if (n.length === 10 || n.length === 13) out.add(n);
+      }
+      continue;
+    }
+    if (typeof src === 'string') {
+      const n = normalizeIsbnBridge(src);
+      if (n.length === 10 || n.length === 13) out.add(n);
+      continue;
+    }
+    collectMetadataIsbnsBridge(src, out);
+  }
+  return [...out];
+}
+
+export function areVerifiedIsbnCounterpartsBridge(isbnA, isbnB, ...contexts) {
+  const a = normalizeIsbnBridge(isbnA);
+  const b = normalizeIsbnBridge(isbnB);
+  if (!a || !b) return false;
+  if (a === b) return true;
+  // A counterpart relationship is valid only when a SINGLE trusted source
+  // (metadata record, trusted ISBN list, ...) contains both ISBNs.
+  for (const ctx of contexts) {
+    if (!ctx) continue;
+    const sets = [];
+    if (Array.isArray(ctx)) {
+      const s = new Set();
+      for (const v of ctx) {
+        const n = normalizeIsbnBridge(v);
+        if (n.length === 10 || n.length === 13) s.add(n);
+      }
+      sets.push(s);
+    } else if (typeof ctx === 'object') {
+      // trustedIsbns-style array property
+      if (Array.isArray(ctx.trustedIsbns)) {
+        const s = new Set(ctx.trustedIsbns.map(normalizeIsbnBridge).filter((x) => x.length === 10 || x.length === 13));
+        sets.push(s);
+      }
+      // bookMetadata/metadata record as a whole
+      if (ctx.bookMetadata && typeof ctx.bookMetadata === 'object') {
+        sets.push(collectMetadataIsbnsBridge(ctx.bookMetadata));
+      }
+      if (ctx.metadata && typeof ctx.metadata === 'object') {
+        sets.push(collectMetadataIsbnsBridge(ctx.metadata));
+      }
+      // If ctx itself looks like a metadata record (has isbn-ish fields), test it alone.
+      if (collectMetadataIsbnsBridge(ctx).size > 0) {
+        sets.push(collectMetadataIsbnsBridge(ctx));
+      }
+      // extra object
+      if (ctx.extra && typeof ctx.extra === 'object') {
+        if (ctx.extra.bookMetadata && typeof ctx.extra.bookMetadata === 'object') {
+          sets.push(collectMetadataIsbnsBridge(ctx.extra.bookMetadata));
+        }
+        sets.push(collectMetadataIsbnsBridge(ctx.extra));
+      }
+    } else if (typeof ctx === 'string') {
+      const n = normalizeIsbnBridge(ctx);
+      if (n.length === 10 || n.length === 13) sets.push(new Set([n]));
+    }
+    for (const s of sets) {
+      if (s.has(a) && s.has(b)) return true;
+    }
+  }
+  return false;
+}
+
 /**
  * Authoritatively verifies whether two release or edition descriptors are compatible.
  * Enforces strict matching on normalized title, author, publication year, format, and ISBN.
@@ -346,7 +443,9 @@ export function areEditionsCompatible(a, b) {
   const isbnA = (a.isbn13 || a.isbn || a.extra?.isbn || metaIsbnA || '').replace(/[^0-9X]/gi, '');
   const isbnB = (b.isbn13 || b.isbn || b.extra?.isbn || metaIsbnB || '').replace(/[^0-9X]/gi, '');
   if (isbnA && isbnB && isbnA !== isbnB) {
-    return false;
+    // Allow publisher-verified print/ebook counterparts only when trusted metadata says so.
+    const counterpart = areVerifiedIsbnCounterpartsBridge(isbnA, isbnB, a?.trustedIsbns, a?.bookMetadata, a?.extra?.bookMetadata, b?.trustedIsbns, b?.bookMetadata, b?.extra?.bookMetadata);
+    if (!counterpart) return false;
   }
   const isbnVerified = Boolean(isbnA && isbnB && isbnA === isbnB);
 
@@ -1688,8 +1787,19 @@ export class BridgeService {
       }
       const existingTaskIsbn = String(existing.requestIsbn || (existing.requestIsbns ? Object.values(existing.requestIsbns)[0] : '') || '').replace(/[^0-9X]/gi, '');
       const incomingTaskIsbn = String(requestIsbn || '').replace(/[^0-9X]/gi, '');
-      if (existingTaskIsbn && incomingTaskIsbn && existingTaskIsbn !== incomingTaskIsbn) {
-        throw new Error(`Incompatible ISBN for existing task ${existingTaskId}: requested ${incomingTaskIsbn} vs task ${existingTaskIsbn}`);
+      const existingFileIsbn = (existing.filePath && String(existing.filePath).toLowerCase().endsWith('.epub'))
+        ? normalizeIsbnBridge(extractEpubMetadataFromFile(existing.filePath)?.isbn)
+        : '';
+      const existingEvidenceIsbn = existingTaskIsbn || normalizeIsbnBridge(existing.isbn) || existingFileIsbn;
+      if (incomingTaskIsbn) {
+        if (existingEvidenceIsbn) {
+          if (existingEvidenceIsbn !== incomingTaskIsbn &&
+              !areVerifiedIsbnCounterpartsBridge(existingEvidenceIsbn, incomingTaskIsbn, existing?.trustedIsbns, existing?.bookMetadata, existing?.extra?.bookMetadata, release?.trustedIsbns, release?.extra?.bookMetadata)) {
+            throw new Error(`Incompatible ISBN for existing task ${existingTaskId}: requested ${incomingTaskIsbn} vs task ${existingEvidenceIsbn}`);
+          }
+        } else if (!areVerifiedIsbnCounterpartsBridge(incomingTaskIsbn, incomingTaskIsbn, existing?.trustedIsbns, existing?.bookMetadata, existing?.extra?.bookMetadata, release?.trustedIsbns, release?.extra?.bookMetadata)) {
+          throw new Error(`Incompatible ISBN for existing task ${existingTaskId}: no verified ISBN evidence`);
+        }
       }
 
       this.state.requests[requestId] = existingTaskId;
@@ -1705,6 +1815,8 @@ export class BridgeService {
         existing.requestIsbns = existing.requestIsbns || {};
         if (!existing.requestIsbns[requestId]) existing.requestIsbns[requestId] = requestIsbn;
       }
+      existing.trustedIsbns = gatherTrustedIsbnsBridge(existing.trustedIsbns, existing.bookMetadata, existing.extra, release?.extra?.bookMetadata, release?.extra, release);
+      existing.bookMetadata = existing.bookMetadata || release?.extra?.bookMetadata || null;
       this.saveState();
 
       if ((existing.status === 'completed' || existing.status === 'fulfilled') && existing.filePath) {
@@ -1837,6 +1949,8 @@ export class BridgeService {
         requestId,
         userId,
         release: downloadPayload,
+        trustedIsbns: gatherTrustedIsbnsBridge(release?.extra?.bookMetadata, release?.extra, release),
+        bookMetadata: release?.extra?.bookMetadata || null,
         libraryId: libraryId ?? this.defaultLibraryId,
         folderId: folderId ?? this.defaultFolderId,
         queuedAt: now,
@@ -1884,6 +1998,8 @@ export class BridgeService {
             requestId,
             userId,
             release: downloadPayload,
+            trustedIsbns: gatherTrustedIsbnsBridge(release?.extra?.bookMetadata, release?.extra, release),
+            bookMetadata: release?.extra?.bookMetadata || null,
             libraryId: libraryId ?? this.defaultLibraryId,
             folderId: folderId ?? this.defaultFolderId,
             queuedAt: now,
@@ -1938,14 +2054,27 @@ export class BridgeService {
       }
       const existingTaskIsbn = String(existing.requestIsbn || (existing.requestIsbns ? Object.values(existing.requestIsbns)[0] : '') || '').replace(/[^0-9X]/gi, '');
       const incomingTaskIsbn = String(requestIsbn || '').replace(/[^0-9X]/gi, '');
-      if (existingTaskIsbn && incomingTaskIsbn && existingTaskIsbn !== incomingTaskIsbn) {
-        throw new Error(`Incompatible ISBN for existing task ${taskId}: requested ${incomingTaskIsbn} vs task ${existingTaskIsbn}`);
+      const existingFileIsbn = (existing.filePath && String(existing.filePath).toLowerCase().endsWith('.epub'))
+        ? normalizeIsbnBridge(extractEpubMetadataFromFile(existing.filePath)?.isbn)
+        : '';
+      const existingEvidenceIsbn = existingTaskIsbn || normalizeIsbnBridge(existing.isbn) || existingFileIsbn;
+      if (incomingTaskIsbn) {
+        if (existingEvidenceIsbn) {
+          if (existingEvidenceIsbn !== incomingTaskIsbn &&
+              !areVerifiedIsbnCounterpartsBridge(existingEvidenceIsbn, incomingTaskIsbn, existing?.trustedIsbns, existing?.bookMetadata, existing?.extra?.bookMetadata, release?.trustedIsbns, release?.extra?.bookMetadata)) {
+            throw new Error(`Incompatible ISBN for existing task ${taskId}: requested ${incomingTaskIsbn} vs task ${existingEvidenceIsbn}`);
+          }
+        } else if (!areVerifiedIsbnCounterpartsBridge(incomingTaskIsbn, incomingTaskIsbn, existing?.trustedIsbns, existing?.bookMetadata, existing?.extra?.bookMetadata, release?.trustedIsbns, release?.extra?.bookMetadata)) {
+          throw new Error(`Incompatible ISBN for existing task ${taskId}: no verified ISBN evidence`);
+        }
       }
       if (requestIsbn && !existing.requestIsbn) existing.requestIsbn = requestIsbn;
       if (requestIsbn) {
         existing.requestIsbns = existing.requestIsbns || {};
         if (!existing.requestIsbns[requestId]) existing.requestIsbns[requestId] = requestIsbn;
       }
+      existing.trustedIsbns = gatherTrustedIsbnsBridge(existing.trustedIsbns, existing.bookMetadata, existing.extra, release?.extra?.bookMetadata, release?.extra, release);
+      existing.bookMetadata = existing.bookMetadata || release?.extra?.bookMetadata || null;
 
       this.state.requests[requestId] = taskId;
       if (!existing.requestIds.includes(requestId)) {
@@ -2005,6 +2134,8 @@ export class BridgeService {
       isbn: release.isbn13 || release.isbn || downloadPayload.isbn || null,
       requestIsbn: requestIsbn || null,
       requestIsbns: requestIsbn ? { [requestId]: requestIsbn } : {},
+      trustedIsbns: gatherTrustedIsbnsBridge(release?.extra?.bookMetadata, release?.extra, release),
+      bookMetadata: release?.extra?.bookMetadata || null,
       language: release.language || downloadPayload.language || null,
       format: (downloadPayload.format || release.format || 'epub').toLowerCase(),
       source: downloadPayload.source,
@@ -2808,10 +2939,29 @@ export class BridgeService {
       const opf = String(task?.filePath || '').toLowerCase().endsWith('.epub')
         ? extractEpubMetadataFromFile(task.filePath) : null;
       const fileIsbn = String(opf?.isbn || '').replace(/[^0-9X]/gi, '');
-      if (!fileIsbn || fileIsbn !== requestIsbn) {
+      const verified = Boolean(fileIsbn) && (fileIsbn === requestIsbn || areVerifiedIsbnCounterpartsBridge(requestIsbn, fileIsbn, task?.trustedIsbns, task?.bookMetadata, task?.extra?.bookMetadata));
+      if (!verified) {
         task.error = !fileIsbn
           ? 'Release ISBN could not be verified in downloaded file'
           : `Release ISBN ${fileIsbn} does not match requested ISBN ${requestIsbn}`;
+        task.isbnVerificationFailed = true;
+        task.status = 'failed';
+        task.errorSource = 'companion_isbn_verification';
+        // Record attempts and unmap requests so alternatives can be evaluated.
+        for (const rid of (task.requestIds || [])) {
+          if (task.requestFulfillments?.[rid]?.fulfilled) continue;
+          const attemptId = `isbn:${task.taskId || task.id}`;
+          this.state.requestAttempts[rid] = this.state.requestAttempts[rid] || [];
+          if (!this.state.requestAttempts[rid].some((a) => a.attemptId === attemptId)) {
+            this.state.requestAttempts[rid].push({ attemptId, taskId: task.taskId, timestamp: new Date().toISOString(), error: task.error });
+            const attempts = this.state.requestAttempts[rid].length;
+            this.state.requestSourceAttempts[rid] = attempts;
+            this.state.requestErrors[rid] = { error: task.error, errorType: 'isbn_verification_failed', lastAttemptAt: new Date().toISOString(), attempts };
+          }
+          if ((this.state.requestSourceAttempts[rid] || 0) < this.maxSourceAttempts) {
+            delete this.state.requests[rid];
+          }
+        }
         this.saveState();
         return { fulfilled: false, error: task.error };
       }
@@ -2964,6 +3114,7 @@ export class BridgeService {
         const opf = String(task?.filePath || '').toLowerCase().endsWith('.epub')
           ? extractEpubMetadataFromFile(task.filePath) : null;
         const fileIsbn = String(opf?.isbn || '').replace(/[^0-9X]/gi, '');
+        const verified = Boolean(fileIsbn) && (fileIsbn === requestIsbn || areVerifiedIsbnCounterpartsBridge(requestIsbn, fileIsbn, task?.trustedIsbns, task?.bookMetadata, task?.extra?.bookMetadata));
         if (!fileIsbn) {
           task.requestFulfillments[reqId] = {
             fulfilled: false,
@@ -2973,9 +3124,21 @@ export class BridgeService {
           };
           this.setRequestProgress(reqId, 'review_required', { reason: 'unverified_isbn' });
           this.saveState();
+          // Record attempt failure and unmap to allow alternatives.
+          const attemptId = `unverified_isbn:${task.taskId}`;
+          this.state.requestAttempts[reqId] = this.state.requestAttempts[reqId] || [];
+          if (!this.state.requestAttempts[reqId].some((a) => a.attemptId === attemptId)) {
+            this.state.requestAttempts[reqId].push({ attemptId, taskId: task.taskId, timestamp: new Date().toISOString(), error: 'unverified_isbn' });
+            const attempts = this.state.requestAttempts[reqId].length;
+            this.state.requestSourceAttempts[reqId] = attempts;
+            this.state.requestErrors[reqId] = { error: 'Release ISBN could not be verified in downloaded file', errorType: 'unverified_isbn', lastAttemptAt: new Date().toISOString(), attempts };
+          }
+          if ((this.state.requestSourceAttempts[reqId] || 0) < this.maxSourceAttempts) delete this.state.requests[reqId];
+          task.isbnVerificationFailed = true;
+          this.saveState();
           continue;
         }
-        if (fileIsbn !== requestIsbn) {
+        if (!verified) {
           task.requestFulfillments[reqId] = {
             fulfilled: false,
             errorType: 'conflicting_isbn',
@@ -2983,6 +3146,17 @@ export class BridgeService {
             updatedAt: new Date().toISOString(),
           };
           this.setRequestProgress(reqId, 'review_required', { reason: 'conflicting_isbn' });
+          this.saveState();
+          const attemptId = `conflicting_isbn:${task.taskId}`;
+          this.state.requestAttempts[reqId] = this.state.requestAttempts[reqId] || [];
+          if (!this.state.requestAttempts[reqId].some((a) => a.attemptId === attemptId)) {
+            this.state.requestAttempts[reqId].push({ attemptId, taskId: task.taskId, timestamp: new Date().toISOString(), error: 'conflicting_isbn' });
+            const attempts = this.state.requestAttempts[reqId].length;
+            this.state.requestSourceAttempts[reqId] = attempts;
+            this.state.requestErrors[reqId] = { error: `Release ISBN ${fileIsbn} does not match requested ISBN ${requestIsbn}`, errorType: 'conflicting_isbn', lastAttemptAt: new Date().toISOString(), attempts };
+          }
+          if ((this.state.requestSourceAttempts[reqId] || 0) < this.maxSourceAttempts) delete this.state.requests[reqId];
+          task.isbnVerificationFailed = true;
           this.saveState();
           continue;
         }
@@ -2993,16 +3167,28 @@ export class BridgeService {
         const opf = String(task?.filePath || '').toLowerCase().endsWith('.epub')
           ? extractEpubMetadataFromFile(task.filePath) : null;
         const fileIsbn = String(opf?.isbn || '').replace(/[^0-9X]/gi, '');
-        if (!fileIsbn || fileIsbn !== reqIsbn) {
+        const verified = Boolean(fileIsbn) && (fileIsbn === reqIsbn || areVerifiedIsbnCounterpartsBridge(reqIsbn, fileIsbn, task?.trustedIsbns, task?.bookMetadata, task?.extra?.bookMetadata));
+        if (!fileIsbn || !verified) {
+          const errorType = !fileIsbn ? 'unverified_isbn' : 'conflicting_isbn';
           task.requestFulfillments[reqId] = {
             fulfilled: false,
-            errorType: !fileIsbn ? 'unverified_isbn' : 'conflicting_isbn',
+            errorType,
             error: !fileIsbn
               ? 'Release ISBN could not be verified in downloaded file'
               : `Release ISBN ${fileIsbn} does not match requested ISBN ${reqIsbn}`,
             updatedAt: new Date().toISOString(),
           };
-          this.setRequestProgress(reqId, 'review_required', { reason: !fileIsbn ? 'unverified_isbn' : 'conflicting_isbn' });
+          this.setRequestProgress(reqId, 'review_required', { reason: errorType });
+          const attemptId = `${errorType}:${task.taskId}:${reqId}`;
+          this.state.requestAttempts[reqId] = this.state.requestAttempts[reqId] || [];
+          if (!this.state.requestAttempts[reqId].some((a) => a.attemptId === attemptId)) {
+            this.state.requestAttempts[reqId].push({ attemptId, taskId: task.taskId, timestamp: new Date().toISOString(), error: errorType });
+            const attempts = this.state.requestAttempts[reqId].length;
+            this.state.requestSourceAttempts[reqId] = attempts;
+            this.state.requestErrors[reqId] = { error: task.requestFulfillments[reqId].error, errorType, lastAttemptAt: new Date().toISOString(), attempts };
+          }
+          if ((this.state.requestSourceAttempts[reqId] || 0) < this.maxSourceAttempts) delete this.state.requests[reqId];
+          task.isbnVerificationFailed = true;
           this.saveState();
           continue;
         }
@@ -3257,6 +3443,8 @@ export class BridgeService {
               author: unrec.release?.author,
               year: parsePositiveInt(unrec.release?.year || unrec.release?.publicationYear) || null,
               isbn: unrec.release?.isbn13 || unrec.release?.isbn || null,
+              trustedIsbns: gatherTrustedIsbnsBridge(unrec.trustedIsbns, unrec.bookMetadata, unrec.release?.extra?.bookMetadata, unrec.release),
+              bookMetadata: unrec.bookMetadata || unrec.release?.extra?.bookMetadata || null,
               format: (unrec.release?.format || 'epub').toLowerCase(),
               source: unrec.release?.source,
               sourceId: unrec.release?.source_id,
@@ -3318,6 +3506,9 @@ export class BridgeService {
 
     for (const task of Object.values(this.state.tasks)) {
       if (task.status === 'fulfilled') {
+        continue;
+      }
+      if (task.isbnVerificationFailed) {
         continue;
       }
 

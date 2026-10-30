@@ -34,7 +34,7 @@ const KNOWN_TITLE_EQUIVALENTS = new Map([
 
 export default {
   apiVersion: 1,
-  version: '1.5.20',
+  version: '1.5.21',
   update: {
     manifestUrl: 'https://raw.githubusercontent.com/esreddy2/bookorbit-plugin-shelfmark/main/updates/shelfmark.json',
     ed25519PublicKey: '-0aHVhXqg7cGaDchc2p1Y8tDnn8A7cJ0WREKspNv5Bc',
@@ -214,7 +214,6 @@ export default {
       if (seenReleaseKeys.has(dedupKey)) {
         return;
       }
-      seenReleaseKeys.add(dedupKey);
 
       const sizeBytes = parseSizeBytes(rel.size_bytes ?? rel.sizeBytes ?? rel.size);
       const directUrl = rel.download_url || rel.downloadUrl || rel.url || null;
@@ -256,11 +255,15 @@ export default {
       // Never use the parent catalog ISBN as proof of a release's edition: only the
       // release's own ISBN (or EPUB metadata discovered later) is authentic.
       const authenticIsbn = (rel.isbn ? String(rel.isbn).trim() : null) || (rel.extra?.isbn ? String(rel.extra.isbn).trim() : null) || (rel.extra?.isbn13 ? String(rel.extra.isbn13).trim() : null);
-      if (searchIsbn && authenticIsbn && authenticIsbn !== searchIsbn) return;
-      const releaseYear = toNumber(rel.year || rel.publish_year || rel.publication_year || rel.published_year || rel.publicationYear || rel.publishedYear || rel.extra?.year || rel.extra?.publish_year || rel.extra?.publication_year || book?.publish_year || book?.publishYear || book?.year || book?.publication_year || rel?.book?.publish_year || rel?.book?.publishYear || rel?.book?.year || null);
+      if (searchIsbn && authenticIsbn && authenticIsbn !== searchIsbn) {
+        const metaIsbns = collectMetadataIsbns(book);
+        const counterpartVerified = metaIsbns.has(String(searchIsbn).toUpperCase()) && metaIsbns.has(String(authenticIsbn).toUpperCase());
+        if (!counterpartVerified) return;
+      }
+      const releaseYear = toNumber(rel.year || rel.publish_year || rel.publication_year || rel.published_year || rel.publicationYear || rel.publishedYear || rel.extra?.year || rel.extra?.publish_year || rel.extra?.publication_year || rel?.book?.publish_year || rel?.book?.publishYear || rel?.book?.year || null);
       if (requestedYear && releaseYear && requestedYear !== releaseYear) return;
       payload.author = displayAuthor || null;
-      payload.year = toNumber(rel.year || rel.publish_year || rel.publication_year || rel.published_year || rel.publicationYear || rel.publishedYear || rel.extra?.year || rel.extra?.publish_year || rel.extra?.publication_year || book?.publish_year || book?.publishYear || book?.year || book?.publication_year || rel?.book?.publish_year || rel?.book?.publishYear || rel?.book?.year || null);
+      payload.year = toNumber(rel.year || rel.publish_year || rel.publication_year || rel.published_year || rel.publicationYear || rel.publishedYear || rel.extra?.year || rel.extra?.publish_year || rel.extra?.publication_year || rel?.book?.publish_year || rel?.book?.publishYear || rel?.book?.year || null);
       payload.language = rel.language || rel.extra?.language || null;
       // Reject known language mismatches; unknown stays unknown.
       if (requestedLanguage && payload.language) {
@@ -282,6 +285,7 @@ export default {
       // Do NOT blindly substitute searchTitle when the release represents a different edition or title.
       const bookTitle = book?.title || extractCoreTitle(rel.title) || rel.title;
 
+      seenReleaseKeys.add(dedupKey);
       releases.push({
         guid: JSON.stringify(payload),
         title: rel.title || book?.title || searchTitle,
@@ -289,7 +293,7 @@ export default {
         author: displayAuthor,
         isbn: authenticIsbn,
         format: detectedFormat,
-        year: toNumber(rel.year || rel.publish_year || rel.publication_year || rel.published_year || rel.publicationYear || rel.publishedYear || rel.extra?.year || rel.extra?.publish_year || rel.extra?.publication_year || book?.publish_year || book?.publishYear || book?.year || book?.publication_year || rel?.book?.publish_year || rel?.book?.publishYear || rel?.book?.year || null),
+        year: toNumber(rel.year || rel.publish_year || rel.publication_year || rel.published_year || rel.publicationYear || rel.publishedYear || rel.extra?.year || rel.extra?.publish_year || rel.extra?.publication_year || rel?.book?.publish_year || rel?.book?.publishYear || rel?.book?.year || null),
         sizeBytes,
         language: rel.language || rel.extra?.language || null,
         seeders: toNumber(rel.seeders),
@@ -357,7 +361,8 @@ export default {
     }
 
     // Step 1 Fallback A: Known confident alternate title representations (e.g. "1984" -> "Nineteen Eighty-Four")
-    if (books.length === 0 && searchTitle) {
+    const hasValidCandidates = (bs) => Array.isArray(bs) && bs.some((b) => isTitleMatch(b.search_title || b.title || b.name, searchTitle) && isAuthorMatch(b.search_author || b.authors || b.author, searchAuthor));
+    if (searchTitle && (!books.length || !hasValidCandidates(books))) {
       const normTitle = normalizeString(searchTitle);
       const equivalents = KNOWN_TITLE_EQUIVALENTS.get(normTitle);
       if (equivalents) {
@@ -384,7 +389,7 @@ export default {
     }
 
     // Step 1 Fallback B: ISBN search when title search returned empty
-    if (books.length === 0 && searchIsbn && searchIsbn !== metadataQuery) {
+    if (searchIsbn && searchIsbn !== metadataQuery && (!books.length || !hasValidCandidates(books))) {
       const isbnMetaUrl = new URL(`${baseUrl}/api/metadata/search`);
       isbnMetaUrl.searchParams.set('query', searchIsbn);
       isbnMetaUrl.searchParams.set('content_type', 'ebook');
@@ -409,8 +414,9 @@ export default {
       const bookYear = toNumber(book.year ?? book.publish_year ?? book.publication_year ?? book.published_year ?? book.publishYear ?? book.publicationYear);
       const titleMatches = isTitleMatch(bookTitle, searchTitle);
       const authorMatches = isAuthorMatch(bookAuthors, searchAuthor);
-      const yearMatches = !requestedYear || !bookYear || requestedYear === bookYear;
-      return titleMatches && authorMatches && yearMatches;
+      // Metadata publication year may represent the original work while the
+      // request targets a modern edition; do not eliminate candidates on year.
+      return titleMatches && authorMatches;
     });
 
     if (validBooks.length > 0) {
@@ -480,7 +486,12 @@ export default {
                 if (signal?.aborted) throw err;
               return [];
             }
-            if (!relRes.ok) return [];
+            if (!relRes.ok) {
+              if (relRes.status === 400) {
+                throw host.fail('error', `Shelfmark releases query rejected (HTTP 400): ${await relRes.text().catch(() => '')}`);
+              }
+              return [];
+            }
             const relData = await relRes.json().catch(() => ({ releases: [] }));
             return Array.isArray(relData)
               ? relData
@@ -531,104 +542,8 @@ export default {
           }
         }
       }
-    } else if ((searchTitle || searchIsbn) && releases.length === 0) {
-      // Step 2 Fallback: Direct search via /api/releases if metadata returned zero matches or failed
-      const directTitles = searchTitle ? [extractCoreTitle(searchTitle)] : [''];
-      if (searchTitle) {
-        const normSearch = normalizeString(searchTitle);
-        const eqSet = KNOWN_TITLE_EQUIVALENTS.get(normSearch) || [];
-        for (const eq of eqSet) {
-          if (!directTitles.some((t) => normalizeString(t) === normalizeString(eq))) {
-            directTitles.push(eq);
-          }
-        }
-      }
 
-      const naturalSearchAuthor = toNaturalAuthor(searchAuthor);
-      const queryIsbn = extractIsbn(null, query);
-
-      for (const queryTitle of directTitles) {
-        if (hasSufficientResults()) break;
-        if (signal?.aborted || Date.now() - searchStartTime >= SEARCH_BUDGET_MS) break;
-
-        const fetchDirectReleases = async (useIsbn) => {
-          const key = `direct:${queryTitle.toLowerCase()}:${naturalSearchAuthor.toLowerCase()}:${useIsbn ? (queryIsbn || '') : ''}`;
-          if (queriedKeys.has(key)) return [];
-          queriedKeys.add(key);
-          const directRelUrl = new URL(`${baseUrl}/api/releases`);
-          if (queryTitle) {
-            directRelUrl.searchParams.set('title', queryTitle);
-          }
-          if (naturalSearchAuthor) {
-            directRelUrl.searchParams.set('author', naturalSearchAuthor);
-          }
-          if (useIsbn && queryIsbn) {
-            directRelUrl.searchParams.set('isbn', queryIsbn);
-          }
-          directRelUrl.searchParams.set('content_type', 'ebook');
-          if (source && source !== 'all') {
-            directRelUrl.searchParams.set('source', source);
-          }
-          const directRelRes = await safeHostFetch(host, directRelUrl.href, { headers }, signal);
-          if (!directRelRes.ok) return [];
-          const directData = await directRelRes.json().catch(() => ({ releases: [] }));
-          return Array.isArray(directData)
-            ? directData
-            : Array.isArray(directData.releases)
-              ? directData.releases
-              : Array.isArray(directData.items)
-                ? directData.items
-                : Array.isArray(directData.results)
-                  ? directData.results
-                  : [];
-        };
-
-        if ((!source || source === 'all') && !queryTitle && !naturalSearchAuthor && !queryIsbn) {
-          continue;
-        }
-
-        let directReleases = [];
-        try {
-          directReleases = await fetchDirectReleases(true);
-          if ((!directReleases || directReleases.length === 0) && queryIsbn) {
-            directReleases = await fetchDirectReleases(false);
-          }
-        } catch (err) {
-          if (signal?.aborted) {
-            if (releases.length > 0) return rankAndSlice();
-            throw classifyAbort(signal, host, 'Search was cancelled.');
-          }
-          if (providerError && releases.length === 0) {
-            throw host.fail('unreachable', `Shelfmark search failed: ${providerError}`);
-          }
-          continue;
-        }
-
-        if (Array.isArray(directReleases)) {
-          for (const rel of directReleases) {
-              const relTitle = rel.title || '';
-const relAuthor = toNaturalAuthor(rel.author || rel.extra?.author || rel.extra?.Author);
-              // Strictly validate title and author on direct releases
-              if (searchTitle && !isTitleMatch(relTitle, searchTitle)) continue;
-              if (searchAuthor && relAuthor && !isAuthorMatch(relAuthor, searchAuthor)) continue;
-              if (searchAuthor && !relAuthor && !isAuthorMatch(relTitle, searchAuthor)) {
-                // If release has no author and title has "by <Someone Else>", reject
-                const byMatch = relTitle.split(/\s+by\s+/i);
-                if (byMatch.length > 1) {
-                  const __suffix = byMatch[1].trim();
-                  const __toks = __suffix.split(/\s+/).filter(Boolean);
-                  const __looks = __suffix.includes(',') || __toks.length >= 2;
-                  if (__looks && !isAuthorMatch(__suffix, searchAuthor)) {
-                    continue;
-                  }
-                }
-              }
-              addRelease(rel, null);
-            }
-          }
-        }
-      }
-
+    }
     // Check deadline / cancellation state
     if (signal?.aborted) {
       if (releases.length > 0) return rankAndSlice();
@@ -1433,6 +1348,30 @@ function extractIsbn(book, query) {
     }
   }
   return null;
+}
+
+/**
+ * Collects ISBN-like identifiers from a metadata object (including arrays/nested fields)
+ * so trusted print/ebook counterpart relationships can be recognized.
+ */
+function collectMetadataIsbns(obj, out = new Set()) {
+  if (!obj || typeof obj !== 'object') return out;
+  for (const [key, value] of Object.entries(obj)) {
+    if (/isbn/i.test(key)) {
+      const vals = Array.isArray(value) ? value : [value];
+      for (const v of vals) {
+        if (v == null) continue;
+        if (typeof v === 'object') collectMetadataIsbns(v, out);
+        else {
+          const cleaned = String(v).replace(/[^0-9Xx]/g, '').trim();
+          if (cleaned.length === 10 || cleaned.length === 13) out.add(cleaned.toUpperCase());
+        }
+      }
+    } else if (typeof value === 'object') {
+      collectMetadataIsbns(value, out);
+    }
+  }
+  return out;
 }
 
 /**
