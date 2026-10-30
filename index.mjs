@@ -34,7 +34,7 @@ const KNOWN_TITLE_EQUIVALENTS = new Map([
 
 export default {
   apiVersion: 1,
-  version: '1.5.26',
+  version: '1.5.27',
   update: {
     manifestUrl: 'https://raw.githubusercontent.com/esreddy2/bookorbit-plugin-shelfmark/main/updates/shelfmark.json',
     ed25519PublicKey: '-0aHVhXqg7cGaDchc2p1Y8tDnn8A7cJ0WREKspNv5Bc',
@@ -1621,7 +1621,7 @@ function isAuthorMatch(candidateAuthors, requestedAuthor) {
     if (candTokens.length === 0) continue;
 
     // Direct match or substring
-    if (candNorm === reqNorm || candNorm.includes(reqNorm) || reqNorm.includes(candNorm)) {
+    if (candNorm === reqNorm) {
       return true;
     }
 

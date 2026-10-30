@@ -530,7 +530,7 @@ export function isAuthorMatch(candidateAuthors, requestedAuthor) {
     if (candTokens.length === 0) continue;
 
     // Direct match or substring
-    if (candNorm === reqNorm || candNorm.includes(reqNorm) || reqNorm.includes(candNorm)) {
+    if (candNorm === reqNorm) {
       return true;
     }
 
