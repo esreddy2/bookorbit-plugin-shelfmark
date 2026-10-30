@@ -66,7 +66,7 @@ import {
 } from './bridge/bridge.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
-const EXPECTED_VERSION = '1.7.3';
+const EXPECTED_VERSION = '1.7.4';
 const RELEASE_MODE = process.argv.includes('--release');
 const TEST_TIMEOUT_MS = 10_000;
 const tests = [];
@@ -386,7 +386,7 @@ test('DECLARATION: BookOrbit API v1, Shelfmark indexer and ebook-only', () => {
   assert.equal(plugin.type, 'shelfmark');
   assert.deepEqual(plugin.mediaKinds, ['ebook']);
 });
-test('DECLARATION: native indexer advertises v1.7.3, never a previous version', () => {
+test('DECLARATION: native indexer advertises v1.7.4, never a previous version', () => {
   assert.equal(plugin.version, EXPECTED_VERSION);
 });
 test('DECLARATION: exposes search, test, and resolveFile entry points', () => {
@@ -412,7 +412,7 @@ test('RELEASE CONTRACT: package version, plugin version and release target agree
   assert.equal(plugin.version, EXPECTED_VERSION);
 });
 if (RELEASE_MODE) {
-  test('RELEASE: signed manifest has declared format and v1.7.3 version', () => {
+  test('RELEASE: signed manifest has declared format and v1.7.4 version', () => {
     const manifest = JSON.parse(readFileSync(join(HERE, 'updates', 'shelfmark.json'), 'utf8'));
     assert.equal(manifest.schemaVersion, 1);
     assert.equal(manifest.type, 'shelfmark');
@@ -3409,6 +3409,23 @@ test('PROPERTY: unrelated counterpart pairs remain independent', () => {
   assert.equal(areVerifiedCounterparts('9781111111111', '9782222222222', ctxA), true);
   assert.equal(areVerifiedCounterparts('9781111111111', '9783333333333', ctxA, ctxB), false);
   assert.equal(areVerifiedCounterparts('9782222222222', '9784444444444', ctxA, ctxB), false);
+});
+
+test('REGRESSION: flat trustedIsbns list does not grant counterpart equivalence', () => {
+  assert.equal(areVerifiedCounterparts('9781111111111', '9782222222222', { trustedIsbns: ['9781111111111', '9782222222222'] }), false);
+  assert.equal(areVerifiedCounterparts('9781111111111', '9782222222222', { trustedIsbns: [['9781111111111', '9782222222222']] }), false);
+});
+
+test('REGRESSION: explicit counterpart pairs still grant equivalence', () => {
+  assert.equal(areVerifiedCounterparts('9781111111111', '9782222222222', { bookMetadata: { isbn: '9781111111111', counterpart_isbn: '9782222222222' } }), true);
+});
+
+test('REGRESSION: editionCompatibility rejects differing ISBNs sharing only trustedIsbns', () => {
+  const a = { title: 'Dune', author: 'Frank Herbert', isbn: '9781111111111', trustedIsbns: ['9781111111111', '9782222222222'] };
+  const b = { title: 'Dune', author: 'Frank Herbert', isbn: '9782222222222', trustedIsbns: ['9781111111111', '9782222222222'] };
+  assert.equal(areEditionsCompatible(a, b), false);
+  const d = editionCompatibility(a, b);
+  assert.ok(d.conflicts.includes('conflicting_isbn'), d.conflicts.join(','));
 });
 
 test('PROPERTY: unknown evidence cannot become verified (year)', () => {

@@ -12,7 +12,7 @@
  * Single-file and dependency-free following BookOrbit's indexer plugin specification.
  */
 
-const USER_AGENT = 'BookOrbit-Shelfmark-Plugin/1.7.3';
+const USER_AGENT = 'BookOrbit-Shelfmark-Plugin/1.7.4';
 
 /** Fallback maximum number of releases to return per search. */
 const MAX_RESULTS = 25;
@@ -26,7 +26,7 @@ const inFlightResolutions = new Map();
 /** Confident bidirectional title equivalents. */
 export default {
   apiVersion: 1,
-  version: '1.7.3',
+  version: '1.7.4',
   update: {
     manifestUrl: 'https://raw.githubusercontent.com/esreddy2/bookorbit-plugin-shelfmark/main/updates/shelfmark.json',
     ed25519PublicKey: '-0aHVhXqg7cGaDchc2p1Y8tDnn8A7cJ0WREKspNv5Bc',
@@ -1539,34 +1539,6 @@ function areVerifiedCounterparts(isbnA, isbnB, ...contexts) {
       if (ctx.extra && typeof ctx.extra === 'object') {
         if (ctx.extra.bookMetadata && typeof ctx.extra.bookMetadata === 'object') pairs.push(...collectIsbnPairs(ctx.extra.bookMetadata));
         pairs.push(...collectIsbnPairs(ctx.extra));
-      }
-      // trustedIsbns: array of ISBN strings (all mutually trusted) or nested pairs
-      if (ctx.trustedIsbns) {
-        const trusted = Array.isArray(ctx.trustedIsbns) ? ctx.trustedIsbns : [ctx.trustedIsbns];
-        const trustedIsbns = [];
-        for (const item of trusted) {
-          if (Array.isArray(item)) {
-            const cleaned = item.map(normalizeIsbn).filter((x) => x.length === 10 || x.length === 13);
-            if (cleaned.length >= 2) {
-              for (let i = 0; i < cleaned.length; i++)
-                for (let j = i + 1; j < cleaned.length; j++) pairs.push([cleaned[i], cleaned[j]]);
-            }
-          } else if (item && typeof item === 'object') {
-            pairs.push(...collectIsbnPairs(item));
-            for (const v of Object.values(item)) {
-              const c = normalizeIsbn(v);
-              if (c.length === 10 || c.length === 13) trustedIsbns.push(c);
-            }
-          } else {
-            const c = normalizeIsbn(item);
-            if (c.length === 10 || c.length === 13) trustedIsbns.push(c);
-          }
-        }
-        // If both a and b are in the trusted set, treat as verified counterparts.
-        const aNorm = normalizeIsbn(a); const bNorm = normalizeIsbn(b);
-        if (trustedIsbns.some((x) => sameIsbn(x, aNorm)) && trustedIsbns.some((x) => sameIsbn(x, bNorm))) {
-          return true;
-        }
       }
     }
     for (const [x, y] of pairs) {

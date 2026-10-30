@@ -138,12 +138,46 @@ export function extractEpubMetadataFromFile(filePath) {
   }
 }
 
+const SENSITIVE_KEYS = /^(token|secret|password|passwd|pwd|api[_-]?key|authorization|auth|cookie|credential|credentials|private[_-]?key|refresh[_-]?token|access[_-]?token|jwt|session[_-]?id|client[_-]?secret|apikey)$/i;
+
+/** Deep, key-aware redaction shared by logs and diagnostics. */
+export function redactSensitive(value, seen = new WeakSet()) {
+  if (value == null) return value;
+  if (typeof value === 'string') {
+    let s = value;
+    s = s.replace(/(Bearer\s+)[A-Za-z0-9._~+/-]+=*/gi, '$1[REDACTED]');
+    s = s.replace(/(apiKey|api_key|token|secret|password|auth|authorization)=([^&\s]+)/gi, '$1=[REDACTED]');
+    s = s.replace(/([?&](?:token|secret|key|password|auth|api_key|apiKey)=)([^&\s]+)/gi, '$1[REDACTED]');
+    s = s.replace(/([a-z][a-z0-9+.-]*:\/\/)[^\s/@]+:[^\s/@]+@/gi, '$1[REDACTED]:[REDACTED]@');
+    s = s.replace(/\b[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b/g, '[REDACTED]');
+    return s;
+  }
+  if (typeof value !== 'object') return value;
+  if (seen.has(value)) return value;
+  seen.add(value);
+  if (Array.isArray(value)) {
+    const out = value.map((v) => redactSensitive(v, seen));
+    seen.delete(value);
+    return out;
+  }
+  const out = {};
+  for (const [k, v] of Object.entries(value)) {
+    if (SENSITIVE_KEYS.test(k)) {
+      out[k] = '[REDACTED]';
+    } else {
+      out[k] = redactSensitive(v, seen);
+    }
+  }
+  seen.delete(value);
+  return out;
+}
+
+export const redact = redactSensitive;
+
 /** Redacts sensitive tokens and secrets from diagnostic logs. */
 export function sanitizeLog(msg) {
   if (typeof msg !== 'string') return String(msg);
-  return msg
-    .replace(/(Bearer\s+)[A-Za-z0-9._~+/-]+=*/gi, '$1[REDACTED]')
-    .replace(/(apiKey|api_key|token|secret|password)=([^&\s]+)/gi, '$1=[REDACTED]');
+  return redactSensitive(msg);
 }
 
 /** Timing-safe string comparison to prevent timing attacks on secrets. */
@@ -353,129 +387,35 @@ export function areVerifiedIsbnCounterpartsBridge(isbnA, isbnB, ...contexts) {
  * A known requested year with an unknown release year must not be treated as a verified edition match
  * unless verified by a matching ISBN or EPUB metadata.
  */
-export function areEditionsCompatible(a, b) {
-  if (!a || !b) return false;
-
-  const rawTitleA = (a.bookTitle || a.title || '').trim();
-  const rawTitleB = (b.bookTitle || b.title || '').trim();
-  if (rawTitleA && rawTitleB && !isTitleMatch(rawTitleA, rawTitleB)) {
-    return false;
-  }
-
-  const authorA = (a.author || (Array.isArray(a.authors) ? a.authors[0] : '') || '').trim();
-  const authorB = (b.author || (Array.isArray(b.authors) ? b.authors[0] : '') || '').trim();
-  if (authorA && authorB && !ID.isAuthorMatch(authorA, authorB)) {
-    return false;
-  }
-
-  const fmtA = (a.format || '').trim().toLowerCase();
-  const fmtB = (b.format || '').trim().toLowerCase();
-  if (fmtA && fmtB && fmtA !== fmtB) {
-    return false;
-  }
-
-  // Inspect EPUB metadata if file path is available
-  let metaYearA = a.epubMetadata?.year;
-  let metaYearB = b.epubMetadata?.year;
-  let metaIsbnA = a.epubMetadata?.isbn;
-  let metaIsbnB = b.epubMetadata?.isbn;
-  if (a.filePath && (a.format === 'epub' || (a.filePath || '').endsWith('.epub'))) {
-    const meta = extractEpubMetadataFromFile(a.filePath);
-    if (meta && (!meta.title || isTitleMatch(meta.title, rawTitleA))) {
-      metaYearA = metaYearA || meta.year;
-      metaIsbnA = metaIsbnA || meta.isbn;
+export function withEpubMetadata(obj) {
+  if (!obj || typeof obj !== 'object') return obj;
+  const copy = { ...obj };
+  const base = (copy.epubMetadata && typeof copy.epubMetadata === 'object') ? { ...copy.epubMetadata } : {};
+  const merged = { ...base };
+  const rawTitle = (copy.bookTitle || copy.title || '').trim();
+  if (copy.filePath && (copy.format === 'epub' || String(copy.filePath).toLowerCase().endsWith('.epub'))) {
+    const meta = extractEpubMetadataFromFile(copy.filePath);
+    if (meta && (!meta.title || isTitleMatch(meta.title, rawTitle))) {
+      if (meta.year != null && merged.year == null) merged.year = meta.year;
+      if (meta.isbn != null && merged.isbn == null) merged.isbn = meta.isbn;
     }
   }
-  if (b.filePath && (b.format === 'epub' || (b.filePath || '').endsWith('.epub'))) {
-    const meta = extractEpubMetadataFromFile(b.filePath);
-    if (meta && (!meta.title || isTitleMatch(meta.title, rawTitleB))) {
-      metaYearB = metaYearB || meta.year;
-      metaIsbnB = metaIsbnB || meta.isbn;
-    }
-  }
-
-  // ISBN: distinct ISBNs indicate distinct editions!
-  const isbnA = (a.isbn13 || a.isbn || a.extra?.isbn || metaIsbnA || '').replace(/[^0-9X]/gi, '');
-  const isbnB = (b.isbn13 || b.isbn || b.extra?.isbn || metaIsbnB || '').replace(/[^0-9X]/gi, '');
-  if (isbnA && isbnB && isbnA !== isbnB) {
-    // Allow publisher-verified print/ebook counterparts only when trusted metadata says so.
-    const counterpart = areVerifiedIsbnCounterpartsBridge(isbnA, isbnB, a?.trustedIsbns, a?.bookMetadata, a?.extra?.bookMetadata, b?.trustedIsbns, b?.bookMetadata, b?.extra?.bookMetadata);
-    if (!counterpart) return false;
-  }
-  const isbnVerified = Boolean(isbnA && isbnB && ID.sameIsbn(isbnA, isbnB));
-
-  // Publication year: distinct years indicate distinct editions!
-  const yearA = parsePositiveInt(a.year || a.publicationYear || a.publishedYear || metaYearA);
-  const yearB = parsePositiveInt(b.year || b.publicationYear || b.publishedYear || metaYearB);
-
-  if (yearA && yearB) {
-    if (yearA !== yearB) {
-      return false;
-    }
-  } else if ((yearA && !yearB) || (!yearA && yearB)) {
-    // A known requested year with an unknown release year must NOT be treated as a verified edition match
-    // unless verified by a matching ISBN.
-    if (!isbnVerified) {
-      return false;
-    }
-  }
-
-  // Known language mismatch indicates a distinct edition (e.g. translated title).
-  const langA = ID.normalizeString(a.language || '');
-  const langB = ID.normalizeString(b.language || '');
-  if (langA && langB && langA !== langB) {
-    return false;
-  }
-
-  return true;
+  if (Object.keys(merged).length) copy.epubMetadata = merged;
+  return copy;
 }
 
-function getEditionIncompatibilityReason(req, rel) {
+export function areEditionsCompatible(a, b) {
+  if (!a || !b) return false;
+  return ID.areEditionsCompatible(withEpubMetadata(a), withEpubMetadata(b));
+}
+
+export function getEditionIncompatibilityReason(req, rel) {
   if (!req || !rel) return 'incompatible_edition';
-
-  const titleReq = (req.bookTitle || req.title || '').trim();
-  const titleRel = (rel.bookTitle || rel.title || '').trim();
-  if (titleReq && titleRel && !isTitleMatch(titleReq, titleRel)) {
-    return 'incompatible_title';
-  }
-
-  const authorReq = (req.author || (Array.isArray(req.authors) ? req.authors[0] : '') || '').trim();
-  const authorRel = (rel.author || (Array.isArray(rel.authors) ? rel.authors[0] : '') || '').trim();
-  if (authorReq && authorRel && !isAuthorMatch(authorReq, authorRel)) {
-    return 'incompatible_author';
-  }
-
-  const formatReq = (req.format || '').trim().toLowerCase();
-  const formatRel = (rel.format || '').trim().toLowerCase();
-  if (formatReq && formatRel && formatReq !== formatRel) {
-    return 'incompatible_format';
-  }
-
-  const langReq = (req.language || '').trim().toLowerCase();
-  const langRel = (rel.language || '').trim().toLowerCase();
-  if (langReq && langRel && langReq !== langRel) {
-    return 'language_mismatch';
-  }
-
-  const isbnReq = String(req.requestIsbn || req.isbn13 || req.isbn || req.extra?.isbn || '').replace(/[^0-9X]/gi, '');
-  const isbnRel = String(rel.isbn13 || rel.isbn || rel.extra?.isbn || '').replace(/[^0-9X]/gi, '');
-  // Unknown release ISBNs are allowed into staging for later OPF verification;
-  // only known ISBN conflicts are rejected before download.
-  if (isbnReq && isbnRel && isbnReq !== isbnRel) {
-    return 'conflicting_isbn';
-  }
-
-  const yearReq = parsePositiveInt(req.year || req.publicationYear || req.publishedYear);
-  const yearRel = parsePositiveInt(rel.year || rel.publicationYear || rel.publishedYear);
-  if (yearReq && yearRel && yearReq !== yearRel) {
-    return 'incompatible_year';
-  }
-  if (yearReq && !yearRel && !isbnReq && !isbnRel) {
-    // Known requested year with unknown release year is not verified.
-    return 'unknown_release_year';
-  }
-
-  return null;
+  const d = ID.editionCompatibility(withEpubMetadata(req), withEpubMetadata(rel));
+  if (d.outcome === 'match' || d.outcome === 'provisional') return null;
+  if (Array.isArray(d.conflicts) && d.conflicts.length) return d.conflicts[0];
+  if (Array.isArray(d.reasonCodes) && d.reasonCodes.length) return d.reasonCodes[0];
+  return 'incompatible_edition';
 }
 
 function isHttpUrlBridge(value) {
@@ -914,8 +854,12 @@ export class BridgeService {
       requestProgress: {},    // requestId -> { stage, status, updatedAt, ... }
       requestStages: {},      // alias for requestProgress
       requestStatus: {},      // alias for requestProgress
-      requestFailureReasons: {}, // requestId -> reason
-    };
+       requestFailureReasons: {}, // requestId -> reason
+       requestCandidateCounts: {}, // requestId -> { metadataCandidateCount, releaseCandidateCount }
+       requestMetadataCandidateCounts: {}, // requestId -> number
+       requestReleaseCandidateCounts: {}, // requestId -> number
+       requestCandidateRejectionReasons: {}, // requestId -> { reason: count }
+     };
 
     this.reconcileTimer = null;
     this.debounceTimer = null;
@@ -968,8 +912,12 @@ export class BridgeService {
           requestProgress: { ...(parsed.requestProgress || {}), ...(parsed.requestStages || {}), ...(parsed.requestStatus || {}) },
           requestStages: { ...(parsed.requestStages || {}), ...(parsed.requestProgress || {}), ...(parsed.requestStatus || {}) },
           requestStatus: { ...(parsed.requestStatus || {}), ...(parsed.requestProgress || {}), ...(parsed.requestStages || {}) },
-          requestFailureReasons: parsed.requestFailureReasons || {},
-        };
+           requestFailureReasons: parsed.requestFailureReasons || {},
+           requestCandidateCounts: parsed.requestCandidateCounts || {},
+           requestMetadataCandidateCounts: parsed.requestMetadataCandidateCounts || {},
+           requestReleaseCandidateCounts: parsed.requestReleaseCandidateCounts || {},
+           requestCandidateRejectionReasons: parsed.requestCandidateRejectionReasons || {},
+         };
       }
     } catch (err) {
       console.warn(`[Bridge] Warning: Failed to read state file: ${sanitizeLog(err.message)}. Starting fresh.`);
@@ -1317,20 +1265,31 @@ export class BridgeService {
     if (this.debounceTimer.unref) this.debounceTimer.unref();
   }
 
-  setRequestProgress(reqId, stage, details = {}) {
-    if (!reqId) return;
-    const entry = {
-      stage,
-      status: stage,
-      updatedAt: new Date().toISOString(),
-      ...details,
-    };
-    this.state.requestProgress = this.state.requestProgress || {};
-    this.state.requestStages = this.state.requestStages || {};
-    this.state.requestStatus = this.state.requestStatus || {};
-    this.state.requestProgress[reqId] = entry;
-    this.state.requestStages[reqId] = entry;
-    this.state.requestStatus[reqId] = entry;
+   setRequestProgress(reqId, stage, details = {}) {
+     if (!reqId) return;
+     const prev = this.state.requestProgress?.[reqId] || {};
+     const counts = {
+       metadataCandidateCount: details.metadataCandidateCount ?? prev.metadataCandidateCount ?? this.state.requestMetadataCandidateCounts?.[reqId],
+       releaseCandidateCount: details.releaseCandidateCount ?? prev.releaseCandidateCount ?? this.state.requestReleaseCandidateCounts?.[reqId],
+       candidateRejectionReasonCounts: details.candidateRejectionReasonCounts ?? prev.candidateRejectionReasonCounts ?? this.state.requestCandidateRejectionReasons?.[reqId],
+     };
+     const mergedDetails = { ...counts, ...details };
+     // drop undefined count fields
+     for (const k of ['metadataCandidateCount','releaseCandidateCount','candidateRejectionReasonCounts']) {
+       if (mergedDetails[k] === undefined) delete mergedDetails[k];
+     }
+     const entry = {
+       stage,
+       status: stage,
+       updatedAt: new Date().toISOString(),
+       ...mergedDetails,
+     };
+     this.state.requestProgress = this.state.requestProgress || {};
+     this.state.requestStages = this.state.requestStages || {};
+     this.state.requestStatus = this.state.requestStatus || {};
+     this.state.requestProgress[reqId] = entry;
+     this.state.requestStages[reqId] = entry;
+     this.state.requestStatus[reqId] = entry;
     if (details && details.reason) {
       this.state.requestFailureReasons = this.state.requestFailureReasons || {};
       this.state.requestFailureReasons[reqId] = details.reason;
@@ -1577,9 +1536,18 @@ export class BridgeService {
             clearTimeout(searchTimeout);
           }
 
-          if (!searchResults || searchResults.length === 0) {
-            console.log(`[Bridge] No valid releases found for approved request ${reqId} ("${query.title}")`);
-            this.setRequestProgress(reqId, 'no_releases', { reason: 'no_releases' });
+           if (!searchResults || searchResults.length === 0) {
+             console.log(`[Bridge] No valid releases found for approved request ${reqId} ("${query.title}")`);
+             const emptyCounts = { metadataCandidateCount: 0, releaseCandidateCount: 0, candidateRejectionReasonCounts: {} };
+             this.state.requestProgress[reqId] = { ...(this.state.requestProgress[reqId] || {}), ...emptyCounts, updatedAt: new Date().toISOString() };
+             this.state.requestStages[reqId] = this.state.requestProgress[reqId];
+             this.state.requestStatus[reqId] = this.state.requestProgress[reqId];
+             this.state.requestCandidateCounts[reqId] = { metadataCandidateCount: 0, releaseCandidateCount: 0 };
+             this.state.requestMetadataCandidateCounts[reqId] = 0;
+             this.state.requestReleaseCandidateCounts[reqId] = 0;
+             this.state.requestCandidateRejectionReasons[reqId] = {};
+             this.setRequestProgress(reqId, 'no_releases', { reason: 'no_releases', ...emptyCounts });
+             this.saveState();
             const attemptIdNr = `no_releases:${reqId}:${new Date().toISOString().slice(0,10)}`;
             this.state.requestAttempts[reqId] = this.state.requestAttempts[reqId] || [];
             if (!this.state.requestAttempts[reqId].some((a) => a.attemptId === attemptIdNr)) {
@@ -1597,30 +1565,44 @@ export class BridgeService {
             continue;
           }
 
-          // 5. Filter releases for edition compatibility and filter out recently failed releases
-          let ineligibilityReason = null;
-          const eligibleReleases = searchResults.filter((rel) => {
-            const reason = getEditionIncompatibilityReason(req, rel);
-            if (reason) {
-              if (!ineligibilityReason) ineligibilityReason = reason;
-              return false;
-            }
-            const rKey = this.getReleaseKey(rel);
-            if (rKey && this.state.failedReleases && this.state.failedReleases[rKey]) {
-              const failedRecord = this.state.failedReleases[rKey];
-              const timeSinceFail = Date.now() - new Date(failedRecord.failedAt).getTime();
-              if (timeSinceFail < this.releaseFailureCooldownMs) {
-                if (!ineligibilityReason) ineligibilityReason = 'cooldown';
-                return false;
-              }
-            }
-            return true;
-          });
+           // 5. Filter releases for edition compatibility and filter out recently failed releases
+           let ineligibilityReason = null;
+           const candidateRejectionReasonCounts = {};
+           const eligibleReleases = searchResults.filter((rel) => {
+             const reason = getEditionIncompatibilityReason(req, rel);
+             if (reason) {
+               candidateRejectionReasonCounts[reason] = (candidateRejectionReasonCounts[reason] || 0) + 1;
+               if (!ineligibilityReason) ineligibilityReason = reason;
+               return false;
+             }
+             const rKey = this.getReleaseKey(rel);
+             if (rKey && this.state.failedReleases && this.state.failedReleases[rKey]) {
+               const failedRecord = this.state.failedReleases[rKey];
+               const timeSinceFail = Date.now() - new Date(failedRecord.failedAt).getTime();
+               if (timeSinceFail < this.releaseFailureCooldownMs) {
+                 candidateRejectionReasonCounts.cooldown = (candidateRejectionReasonCounts.cooldown || 0) + 1;
+                 if (!ineligibilityReason) ineligibilityReason = 'cooldown';
+                 return false;
+               }
+             }
+             return true;
+           });
+           const metadataCandidateCount = Array.isArray(searchResults) ? searchResults.length : 0;
+           const releaseCandidateCount = eligibleReleases.length;
+           const candidateCounts = { metadataCandidateCount, releaseCandidateCount, candidateRejectionReasonCounts };
+           this.state.requestCandidateCounts[reqId] = { metadataCandidateCount, releaseCandidateCount };
+           this.state.requestMetadataCandidateCounts[reqId] = metadataCandidateCount;
+           this.state.requestReleaseCandidateCounts[reqId] = releaseCandidateCount;
+           this.state.requestCandidateRejectionReasons[reqId] = candidateRejectionReasonCounts;
+           const progressEntry = { ...(this.state.requestProgress[reqId] || {}), ...candidateCounts, updatedAt: new Date().toISOString() };
+           this.state.requestProgress[reqId] = progressEntry;
+           this.state.requestStages[reqId] = progressEntry;
+           this.state.requestStatus[reqId] = progressEntry;
 
           if (eligibleReleases.length === 0) {
             const reason = ineligibilityReason || 'no_eligible_edition';
             console.log(`[Bridge] No eligible edition-compatible releases found for approved request ${reqId} ("${query.title}")`);
-            this.setRequestProgress(reqId, 'no_eligible_edition', { reason });
+             this.setRequestProgress(reqId, 'no_eligible_edition', { reason, ...candidateCounts });
             const attemptIdNe = `no_eligible_edition:${reqId}:${new Date().toISOString().slice(0,10)}`;
             this.state.requestAttempts[reqId] = this.state.requestAttempts[reqId] || [];
             if (!this.state.requestAttempts[reqId].some((a) => a.attemptId === attemptIdNe)) {
@@ -2397,8 +2379,14 @@ export class BridgeService {
         format: wantedFormat && formats.includes(wantedFormat) ? wantedFormat : primaryFormat,
       };
       const expectedAuthor = String(task?.author || (Array.isArray(task?.authors) ? task.authors[0] : '') || '').trim();
-      const compatTask = { ...task, author: expectedAuthor };
-      const compatBook = { ...book };
+      const compatTask = { ...task, author: expectedAuthor, authors: expectedAuthor ? [expectedAuthor] : [] };
+      const compatBook = { ...book, authors: book.author ? [book.author] : [] };
+      if (!expectedAuthor || !book.author) {
+        compatTask.author = '';
+        compatTask.authors = [];
+        compatBook.author = '';
+        compatBook.authors = [];
+      }
       if (ignoreTitleMismatch) {
         compatTask.title = book.title || compatTask.title;
         compatTask.bookTitle = book.title || compatTask.bookTitle;
@@ -3784,16 +3772,8 @@ export class BridgeService {
    * Read-only diagnostic report for a request or the whole bridge state.
    * Never includes credentials, authorization headers, private URLs or full payloads.
    */
-  diagnose(requestId = null) {
-    const sanitize = (v) => {
-      if (v == null) return v;
-      if (typeof v === 'string') {
-        // redact anything that looks like a token/key/secret/url with credentials
-        return v.replace(/(token|secret|key|password|auth)=([^&\s]+)/gi, '$1=[REDACTED]');
-      }
-      return v;
-    };
-    const tasks = this.state.tasks || {};
+   diagnose(requestId = null) {
+     const tasks = this.state.tasks || {};
     const requests = this.state.requests || {};
     const progress = this.state.requestProgress || {};
     const attempts = this.state.requestAttempts || {};
@@ -3802,19 +3782,7 @@ export class BridgeService {
     const uncertain = this.state.uncertainQueues || {};
     const sourceAttempts = this.state.requestSourceAttempts || {};
 
-    const filterByRequest = (obj) => {
-      if (!requestId) return obj;
-      const out = {};
-      for (const [k, v] of Object.entries(obj || {})) {
-        const matches = k === requestId || (v && (v.requestId === requestId || (Array.isArray(v.requestIds) && v.requestIds.includes(requestId))));
-        if (matches) {
-          out[k] = v;
-        }
-      }
-      return out;
-    };
-
-    const report = {
+     const report = {
       generatedAt: new Date().toISOString(),
       requestId: requestId || null,
       request: requestId ? (requests[requestId] ? { taskId: requests[requestId] } : null) : undefined,
@@ -3822,53 +3790,89 @@ export class BridgeService {
       lastTransitionReason: requestId ? (this.state.requestFailureReasons?.[requestId] || null) : undefined,
       searchAttempts: requestId ? (sourceAttempts[requestId] ?? 0) : sourceAttempts,
       attempts: requestId ? (attempts[requestId] || []) : attempts,
-      errors: requestId ? (errors[requestId] || null) : errors,
-      metadataCandidateCounts: requestId ? undefined : undefined,
-      candidateRejectionReasonCounts: undefined,
-      associatedShelfmarkTask: requestId ? (requests[requestId] ? tasks[requests[requestId]] || null : null) : undefined,
-      verificationEvidence: requestId ? (tasks[requests[requestId]]?.verificationEvidence || null) : undefined,
-      verificationConflicts: requestId ? (tasks[requests[requestId]]?.verificationConflicts || null) : undefined,
+       errors: requestId ? (errors[requestId] || null) : errors,
+       verificationEvidence: requestId ? (tasks[requests[requestId]]?.verificationEvidence || null) : undefined,
+       verificationConflicts: requestId ? (tasks[requests[requestId]]?.verificationConflicts || null) : undefined,
       retryState: requestId ? { attempts: sourceAttempts[requestId] ?? 0, max: this.maxSourceAttempts } : undefined,
       taskStatuses: Object.fromEntries(Object.entries(tasks).map(([k, v]) => [k, v?.status || v?.state || 'unknown'])),
-      uncertainQueueCount: Object.keys(uncertain).length,
-      failedReleaseCount: Object.keys(failedReleases).length,
-    };
+       uncertainQueueCount: Object.keys(uncertain).length,
+       failedReleaseCount: Object.keys(failedReleases).length,
+     };
+     // Candidate counts (per request or global aggregate below)
+     const getCandidateCounts = (rid) => {
+       const p = (rid && progress[rid]) || {};
+       const meta = p.metadataCandidateCount ?? this.state.requestMetadataCandidateCounts?.[rid] ?? this.state.requestCandidateCounts?.[rid]?.metadataCandidateCount;
+       const rel = p.releaseCandidateCount ?? this.state.requestReleaseCandidateCounts?.[rid] ?? this.state.requestCandidateCounts?.[rid]?.releaseCandidateCount;
+       const rej = p.candidateRejectionReasonCounts ?? this.state.requestCandidateRejectionReasons?.[rid];
+       const out = {};
+       if (meta !== undefined) { out.metadataCandidateCount = meta; out.metadataCandidateCounts = meta; }
+       if (rel !== undefined) { out.releaseCandidateCount = rel; out.releaseCandidateCounts = rel; }
+       if (rej !== undefined) { out.candidateRejectionReasonCounts = rej; }
+       if (rej !== undefined) {
+         let total = 0;
+         for (const n of Object.values(rej || {})) total += (Number(n) || 0);
+         out.candidateRejectionReasonCount = total;
+       }
+       return out;
+     };
+     if (requestId) {
+       Object.assign(report, getCandidateCounts(requestId));
+     }
 
-    if (requestId) {
-      const t = requests[requestId] ? tasks[requests[requestId]] : null;
-      if (t) {
-        report.task = {
-          id: t.id || t.taskId || t.task_id || null,
-          status: t.status || t.state || null,
-          format: t.format || null,
-          source: t.source || null,
-          sourceId: t.source_id || t.sourceId || null,
-          year: t.year || t.publicationYear || null,
-          isbn: t.isbn || t.isbn13 || null,
-          title: t.title || t.book_title || null,
-          author: t.author || null,
-          verificationEvidence: t.verificationEvidence || t.verification?.evidence || null,
-          verificationConflicts: t.verificationConflicts || t.verification?.conflicts || null,
-        };
-      }
-      report.uncertainQueues = filterByRequest(uncertain);
-      report.failedReleases = Object.fromEntries(Object.entries(failedReleases).filter(([, v]) => !requestId || (v && (v.requestId === requestId || (Array.isArray(v.requestIds) && v.requestIds.includes(requestId))))));
-    } else {
-      report.uncertainQueues = uncertain;
-      report.failedReleases = failedReleases;
-    }
+     if (requestId) {
+       const t = requests[requestId] ? tasks[requests[requestId]] : null;
+       if (t) {
+         report.task = {
+           id: t.id || t.taskId || t.task_id || null,
+           status: t.status || t.state || null,
+           format: t.format || null,
+           source: t.source || null,
+           sourceId: t.source_id || t.sourceId || null,
+           year: t.year || t.publicationYear || null,
+           isbn: t.isbn || t.isbn13 || null,
+           title: t.title || t.book_title || null,
+           author: t.author || null,
+           verificationEvidence: t.verificationEvidence || t.verification?.evidence || null,
+           verificationConflicts: t.verificationConflicts || t.verification?.conflicts || null,
+         };
+       }
+       // Raw uncertain-queue / failed-release records are intentionally not returned.
+     } else {
+       // Global candidate aggregates
+       const metadataCandidateCounts = {};
+       const releaseCandidateCounts = {};
+       const candidateRejectionReasonCounts = {};
+       let metadataTotal = 0;
+       let releaseTotal = 0;
+       let hasMeta = false;
+       let hasRel = false;
+       for (const rid of Object.keys(progress)) {
+         const c = getCandidateCounts(rid);
+         if (c.metadataCandidateCount !== undefined) {
+           metadataCandidateCounts[rid] = c.metadataCandidateCount;
+           metadataTotal += c.metadataCandidateCount;
+           hasMeta = true;
+         }
+         if (c.releaseCandidateCount !== undefined) {
+           releaseCandidateCounts[rid] = c.releaseCandidateCount;
+           releaseTotal += c.releaseCandidateCount;
+           hasRel = true;
+         }
+         const rej = c.candidateRejectionReasonCounts;
+         if (rej && typeof rej === 'object') {
+           for (const [r, n] of Object.entries(rej)) {
+             candidateRejectionReasonCounts[r] = (candidateRejectionReasonCounts[r] || 0) + (Number(n) || 0);
+           }
+         }
+       }
+       report.metadataCandidateCounts = metadataCandidateCounts;
+       report.releaseCandidateCounts = releaseCandidateCounts;
+       report.candidateRejectionReasonCounts = candidateRejectionReasonCounts;
+       if (hasMeta) report.metadataCandidateCount = metadataTotal;
+       if (hasRel) report.releaseCandidateCount = releaseTotal;
+     }
 
-    // Sanitize string fields recursively (shallow)
-    const walk = (o) => {
-      if (Array.isArray(o)) return o.map(walk);
-      if (o && typeof o === 'object') {
-        const r = {};
-        for (const [k, v] of Object.entries(o)) r[k] = walk(v);
-        return r;
-      }
-      return sanitize(o);
-    };
-    return walk(report);
+     return redactSensitive(report);
   }
 
   createServer(port = 8085, host = this.host) {
