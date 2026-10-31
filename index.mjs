@@ -12,7 +12,7 @@
  * Single-file and dependency-free following BookOrbit's indexer plugin specification.
  */
 
-const USER_AGENT = 'BookOrbit-Shelfmark-Plugin/1.7.6';
+const USER_AGENT = 'BookOrbit-Shelfmark-Plugin/1.7.7';
 
 /** Fallback maximum number of releases to return per search. */
 const MAX_RESULTS = 25;
@@ -26,7 +26,7 @@ const inFlightResolutions = new Map();
 /** Confident bidirectional title equivalents. */
 export default {
   apiVersion: 1,
-  version: '1.7.6',
+  version: '1.7.7',
   update: {
     manifestUrl: 'https://raw.githubusercontent.com/esreddy2/bookorbit-plugin-shelfmark/main/updates/shelfmark.json',
     ed25519PublicKey: '-0aHVhXqg7cGaDchc2p1Y8tDnn8A7cJ0WREKspNv5Bc',
@@ -241,34 +241,15 @@ export default {
         : toNaturalAuthor(book?.author);
       const displayAuthor = releaseAuthor || metadataAuthor || null;
 
-      // Extract authentic ISBN
-      // Never claim a release has the request's ISBN without independent evidence.
-      // Preserve the release's own ISBN (or metadata book ISBN), never the query ISBN.
-      // Never use the parent catalog ISBN as proof of a release's edition: only the
-      // release's own ISBN (or EPUB metadata discovered later) is authentic.
+      // Extract authentic ISBN and year passively (never fabricate from query or parent catalog).
+      // ISBN is positive ranking evidence only: different or absent ISBN never blocks discovery.
+      // Publication year never affects matching, ranking, or discovery.
       const authenticIsbn = (rel.isbn ? String(rel.isbn).trim() : null) || (rel.extra?.isbn ? String(rel.extra.isbn).trim() : null) || (rel.extra?.isbn13 ? String(rel.extra.isbn13).trim() : null);
-      if (searchIsbn && authenticIsbn && !sameIsbn(searchIsbn, authenticIsbn)) {
-        const metaPairs = collectMetadataIsbnPairs(book);
-        const counterpartVerified = metaPairs.some(([x, y]) => {
-          const nx = normalizeIsbn(x);
-          const ny = normalizeIsbn(y);
-          const a = normalizeIsbn(searchIsbn);
-          const b = normalizeIsbn(authenticIsbn);
-          return (nx === a && ny === b) || (nx === b && ny === a) || (sameIsbn(nx, a) && sameIsbn(ny, b)) || (sameIsbn(nx, b) && sameIsbn(ny, a));
-        });
-        if (!counterpartVerified) return;
-      }
       const releaseYear = parsePositiveIntLocal(rel.year || rel.publish_year || rel.publication_year || rel.published_year || rel.publicationYear || rel.publishedYear || rel.extra?.year || rel.extra?.publish_year || rel.extra?.publication_year || null);
-      if (requestedYear && releaseYear && requestedYear !== releaseYear) return;
       payload.author = displayAuthor || null;
       payload.year = releaseYear;
+      // Treat release language metadata as a ranking hint, not authoritative truth; unknown stays null.
       payload.language = rel.language || rel.extra?.language || null;
-      // Reject known language mismatches; unknown stays unknown.
-      if (requestedLanguage && payload.language) {
-        const reqCode = normalizeLanguageCode(requestedLanguage);
-        const relCode = normalizeLanguageCode(payload.language);
-        if (reqCode && relCode && reqCode !== relCode) return;
-      }
 
       payload.isbn = authenticIsbn || null;
       payload.size_bytes = sizeBytes;
@@ -308,34 +289,48 @@ export default {
       });
     };
 
-    // Helper to check if search has enough high-confidence results to stop expensive queries early
+    const reqLangCode = normalizeLanguageCode(requestedLanguage) || 'en';
+    const getLanguageHintTier = (r) => {
+      const relCode = normalizeLanguageCode(r.language);
+      if (!relCode) return 1; // unknown language metadata
+      return relCode === reqLangCode ? 0 : 2; // 0 = matching hint, 2 = conflicting hint
+    };
+    const isNonConflictingLanguageHint = (r) => getLanguageHintTier(r) < 2;
+
+    // Helper to check if search has enough non-conflicting results to stop expensive queries early
     const hasSufficientResults = () => {
-      if (releases.length >= 3) {
-        const matchingPref = releases.filter((r) => r.format === preferredFormat);
-        if (matchingPref.length >= 2 || releases.length >= 5) {
+      const nonConflicting = releases.filter(isNonConflictingLanguageHint);
+      if (nonConflicting.length >= 3) {
+        const matchingPref = nonConflicting.filter((r) => r.format === preferredFormat);
+        if (matchingPref.length >= 2 || nonConflicting.length >= 5) {
           return true;
         }
       }
       return false;
     };
 
-    const scoreEditionTier = (r) => {
-      if (!searchIsbn && !requestedYear) return 0;
-      const hasIsbnMatch = Boolean(searchIsbn && r.isbn && (sameIsbn(searchIsbn, r.isbn) || areVerifiedCounterparts(searchIsbn, r.isbn, r?.extra?.bookMetadata, r)));
-      const hasYearMatch = Boolean(requestedYear && r.year && r.year === requestedYear);
-      if (hasIsbnMatch && hasYearMatch) return 0;
-      if (hasIsbnMatch || hasYearMatch) return 1;
-      return 2;
+    const hasExactIsbnBoost = (r) => {
+      if (!searchIsbn || !r.isbn) return false;
+      return Boolean(sameIsbn(searchIsbn, r.isbn) || areVerifiedCounterparts(searchIsbn, r.isbn, r?.extra?.bookMetadata, r));
     };
 
-    // Helper to rank and slice releases for return
+    // Helper to rank and slice releases for return:
+    // 1. Non-conflicting language hint ahead of conflicting language hint
+    // 2. Preferred format (epub before pdf by default)
+    // 3. Exact/counterpart ISBN match boost (different ISBN and absent ISBN tie with zero penalty)
+    // 4. Positive language hint (explicitly matching language hint ahead of absent language hint)
+    // 5. Larger file size tie-breaker (publication year is never used)
     const rankAndSlice = () => {
       return releases
         .sort((a, b) => {
+          const langConflictDiff = (getLanguageHintTier(a) === 2 ? 1 : 0) - (getLanguageHintTier(b) === 2 ? 1 : 0);
+          if (langConflictDiff !== 0) return langConflictDiff;
           const rankDiff = rankFormat(a.format, preferredFormat) - rankFormat(b.format, preferredFormat);
           if (rankDiff !== 0) return rankDiff;
-          const tierDiff = scoreEditionTier(a) - scoreEditionTier(b);
-          if (tierDiff !== 0) return tierDiff;
+          const isbnBoostDiff = (hasExactIsbnBoost(a) ? 0 : 1) - (hasExactIsbnBoost(b) ? 0 : 1);
+          if (isbnBoostDiff !== 0) return isbnBoostDiff;
+          const langHintDiff = getLanguageHintTier(a) - getLanguageHintTier(b);
+          if (langHintDiff !== 0) return langHintDiff;
           return (b.sizeBytes || 0) - (a.sizeBytes || 0);
         })
         .slice(0, maxResults);
@@ -541,12 +536,12 @@ export default {
             }
           };
 
-          const beforeCount = releases.length;
+          const beforeNonConflicting = releases.filter(isNonConflictingLanguageHint).length;
           let triedWithoutIsbn = !isbn;
           try {
             const initialReleases = await fetchBookReleases(true);
             filterAndAddReleases(initialReleases);
-            if (releases.length === beforeCount && !triedWithoutIsbn) {
+            if (releases.filter(isNonConflictingLanguageHint).length === beforeNonConflicting && !triedWithoutIsbn) {
               triedWithoutIsbn = true;
               const fallbackReleases = await fetchBookReleases(false);
               filterAndAddReleases(fallbackReleases);
@@ -1933,18 +1928,27 @@ function isAuthorMatch(candidateAuthors, requestedAuthor) {
   return d.outcome === 'match';
 }
 
-// ---------- Edition compatibility ----------
+// ---------- Work + language compatibility (ISBN positive-only, year ignored) ----------
 
 function editionCompatibility(a, b, options = {}) {
   const evidence = [];
   const conflicts = [];
   const reasonCodes = [];
   if (!a || !b) {
-    return { outcome: 'unknown', workConfidence: 'none', editionConfidence: 'none', evidence, conflicts, reasonCodes: ['missing_input'] };
+    return {
+      outcome: 'unknown',
+      workConfidence: 'none',
+      editionConfidence: 'none',
+      languageHint: 'unknown',
+      isbnVerified: false,
+      evidence,
+      conflicts,
+      reasonCodes: ['missing_input'],
+    };
   }
-  const requireVerifiedEdition = Boolean(options?.requireVerifiedEdition || options?.strict || options?.stage === 'final');
+  const treatLanguageAsHint = Boolean(options?.treatLanguageAsHint || options?.stage === 'candidate');
 
-  // title
+  // 1. Work title (preserves canonical equivalents & rejects summaries/anthologies/abridgments)
   const titleA = (a.bookTitle || a.title || '').trim();
   const titleB = (b.bookTitle || b.title || '').trim();
   let titleOk = true;
@@ -1955,12 +1959,12 @@ function editionCompatibility(a, b, options = {}) {
     // one side missing title: cannot establish work identity
     titleOk = false; conflicts.push('missing_title');
   }
-  // author
+
+  // 2. Work author
   const authorsA = Array.isArray(a.authors) && a.authors.length ? a.authors : (a.author ? [a.author] : []);
   const authorsB = Array.isArray(b.authors) && b.authors.length ? b.authors : (b.author ? [b.author] : []);
   let authorOk = true;
   if (authorsA.length && authorsB.length) {
-    // require at least one compatible author pair
     let anyMatch = false;
     for (const aa of authorsA) for (const bb of authorsB) {
       if (authorMatchDecision(aa, bb).outcome === 'match') anyMatch = true;
@@ -1969,18 +1973,35 @@ function editionCompatibility(a, b, options = {}) {
   } else if (authorsA.length || authorsB.length) {
     authorOk = false; conflicts.push('missing_author');
   }
-  // format
+
+  // 3. File format
   const fmtA = (a.format || '').trim().toLowerCase();
   const fmtB = (b.format || '').trim().toLowerCase();
   let formatOk = true;
   if (fmtA && fmtB && fmtA !== fmtB) { formatOk = false; conflicts.push('incompatible_format'); }
-  // language
-  const langA = normalizeLanguageCode(a.language || a.epubMetadata?.language || '') || 'en';
-  const langB = normalizeLanguageCode(b.language || b.epubMetadata?.language || '');
-  let langOk = true;
-  if (langA && langB && langA !== langB) { langOk = false; conflicts.push('language_mismatch'); }
 
-  // ISBN (collect all authentic ISBNs on each side, including OPF multi-identifier lists)
+  // 4. Language (defaults to English 'en'; treated as a hint in candidate discovery)
+  const langA = normalizeLanguageCode(a.requestLanguage || a.language || a.epubMetadata?.language || '') || 'en';
+  const langB = normalizeLanguageCode(b.requestLanguage || b.language || b.epubMetadata?.language || '');
+  let langOk = true;
+  let languageHint = 'unknown';
+  if (langB) {
+    if (langA === langB) {
+      languageHint = 'match';
+    } else {
+      languageHint = 'mismatch';
+      if (treatLanguageAsHint) {
+        reasonCodes.push('language_hint_mismatch');
+      } else {
+        langOk = false;
+        conflicts.push('language_mismatch');
+      }
+    }
+  } else {
+    reasonCodes.push('unknown_release_language');
+  }
+
+  // 5. ISBN — positive evidence ONLY (exact/counterpart match boosts priority; different or absent ISBN never penalizes or blocks)
   const collectIsbnList = (obj) => {
     const out = [];
     const seen = new Set();
@@ -2011,96 +2032,29 @@ function editionCompatibility(a, b, options = {}) {
   const isbnsB = collectIsbnList(b);
   const isbnA = isbnsA[0] || '';
   const isbnB = isbnsB[0] || '';
-  let isbnOk = true;
   let isbnVerified = false;
   if (isbnsA.length > 0 && isbnsB.length > 0) {
-    let matchedIsbn = false;
     for (const ia of isbnsA) {
       for (const ib of isbnsB) {
         if (sameIsbn(ia, ib) || areVerifiedCounterparts(ia, ib, a?.trustedIsbns, a?.bookMetadata, a?.extra?.bookMetadata, b?.trustedIsbns, b?.bookMetadata, b?.extra?.bookMetadata, a, b)) {
-          matchedIsbn = true;
+          isbnVerified = true;
           break;
         }
       }
-      if (matchedIsbn) break;
-    }
-    if (matchedIsbn) {
-      isbnVerified = true;
-    } else {
-      isbnOk = false;
-      conflicts.push('conflicting_isbn');
-    }
-  } else if (isbnsA.length > 0 && isbnsB.length === 0) {
-    reasonCodes.push('unknown_release_isbn');
-    if (requireVerifiedEdition && options?.requireIsbn !== false) {
-      isbnOk = false;
-      conflicts.push('unverified_isbn');
+      if (isbnVerified) break;
     }
   }
 
-  // year (collect primary year on A and all authentic publication years on B)
-  const extractYears = (obj) => {
-    const out = [];
-    const seen = new Set();
-    const candidates = [
-      obj?.year,
-      obj?.publicationYear,
-      obj?.publishedYear,
-      obj?.publishYear,
-      obj?.publish_year,
-      obj?.publication_year,
-      obj?.published_year,
-      ...(Array.isArray(obj?.epubMetadata?.years) ? obj.epubMetadata.years : []),
-      obj?.epubMetadata?.year,
-    ];
-    for (const c of candidates) {
-      const y = parsePositiveIntLocal(c);
-      if (y && !seen.has(y)) {
-        seen.add(y);
-        out.push(y);
-      }
-    }
-    return out;
-  };
-  const yearsA = extractYears(a);
-  const yearsB = extractYears(b);
-  const yearA = yearsA[0] || null;
-  const yearB = yearsB[0] || null;
-  let yearOk = true;
-  let yearVerified = false;
-  if (yearA && yearsB.length > 0) {
-    if (yearsB.includes(yearA)) {
-      yearVerified = true;
-    } else {
-      yearOk = false;
-      conflicts.push('incompatible_year');
-    }
-  } else if (yearA && yearsB.length === 0) {
-    reasonCodes.push('unknown_release_year');
-    if (!isbnVerified && requireVerifiedEdition) {
-      yearOk = false;
-      conflicts.push('unverified_edition_year');
-    }
-  }
+  // Note: Publication year is intentionally NOT used for matching, ranking, or rejection.
 
-  const allOk = titleOk && authorOk && formatOk && langOk && isbnOk && yearOk;
-  const hasUnverifiedRequestedEdition = Boolean(
-    (yearA && !yearVerified && !isbnVerified) ||
-    (isbnsA.length > 0 && !isbnVerified)
-  );
-  // Determine edition confidence:
-  //   'high'   — verified by ISBN/counterpart or publication year with zero conflicts
-  //   'medium' — no specific edition year/ISBN requested and zero conflicts
-  //   'low'    — plausible work/expression candidate, but requested year/ISBN is missing on candidate (requires post-download inspection)
-  //   'none'   — conflicting evidence or missing required evidence in final stage
+  const allOk = titleOk && authorOk && formatOk && langOk;
   let editionConfidence = 'none';
   if (allOk) {
-    if (isbnVerified || yearVerified) editionConfidence = 'high';
-    else if (hasUnverifiedRequestedEdition) editionConfidence = 'low';
+    if (isbnVerified && languageHint !== 'mismatch') editionConfidence = 'high';
+    else if (languageHint === 'mismatch') editionConfidence = 'low';
     else editionConfidence = 'medium';
   }
-  const outcome = allOk ? (editionConfidence === 'high' ? 'match' : 'provisional') : 'reject';
-  // work confidence based on title+author
+  const outcome = allOk ? (isbnVerified && languageHint !== 'mismatch' ? 'match' : 'provisional') : 'reject';
   const workConfidence = (titleOk && authorOk) ? 'high' : 'none';
 
   evidence.push({ field: 'title', value: titleA, level: 'work', status: titleOk ? 'verified' : 'contradictory' });
@@ -2108,24 +2062,21 @@ function editionCompatibility(a, b, options = {}) {
   evidence.push({ field: 'author', value: authorAVal, level: 'work', status: authorOk ? 'verified' : 'contradictory' });
   if (fmtA || fmtB) evidence.push({ field: 'format', value: fmtA || fmtB, level: 'edition', status: formatOk ? 'verified' : 'contradictory' });
   if (isbnA || isbnB) {
-    const isbnStatus = (isbnsA.length > 0 && isbnsB.length > 0 && !isbnOk)
-      ? 'contradictory'
-      : (isbnVerified ? 'verified' : 'unverified');
+    const isbnStatus = isbnVerified ? 'verified' : (isbnB ? 'informational' : 'absent');
     evidence.push({ field: 'isbn', value: isbnA || isbnB, candidateValue: isbnB || null, level: 'edition', status: isbnStatus });
   }
-  if (yearA || yearB) {
-    const yearStatus = (yearA && yearsB.length > 0 && !yearsB.includes(yearA))
+  if (langA || langB) {
+    const langStatus = !langOk
       ? 'contradictory'
-      : (yearVerified ? 'verified' : 'unverified');
-    evidence.push({ field: 'year', value: yearA || yearB, candidateValue: yearB || null, level: 'edition', status: yearStatus });
+      : (languageHint === 'match' ? 'hint_match' : (languageHint === 'mismatch' ? 'hint_conflict' : 'unverified'));
+    evidence.push({ field: 'language', value: langA || langB, candidateValue: langB || null, level: 'expression', status: langStatus });
   }
-  if (langA || langB) evidence.push({ field: 'language', value: langA || langB, candidateValue: langB || null, level: 'expression', status: langOk ? (langB ? 'verified' : 'unverified') : 'contradictory' });
 
-  return { outcome, workConfidence, editionConfidence, evidence, conflicts, reasonCodes };
+  return { outcome, workConfidence, editionConfidence, languageHint, isbnVerified, evidence, conflicts, reasonCodes };
 }
 
 function candidateCompatibility(request, candidate) {
-  return editionCompatibility(request, candidate, { stage: 'candidate' });
+  return editionCompatibility(request, candidate, { stage: 'candidate', treatLanguageAsHint: true });
 }
 
 function parsePositiveIntLocal(val) {
@@ -2141,19 +2092,6 @@ function parsePositiveIntLocal(val) {
 
 function areEditionsCompatible(a, b) {
   const d = editionCompatibility(a, b);
-  if (d.outcome === 'reject' || d.outcome === 'unknown') return false;
-  const reqYearA = parsePositiveIntLocal(a?.year || a?.publicationYear || a?.publishedYear || a?.publishYear || a?.publish_year || a?.publication_year || a?.published_year || a?.epubMetadata?.year);
-  const reqIsbnA = normalizeIsbn(
-    (Array.isArray(a?.isbn13s) ? a.isbn13s[0] : null) ||
-    a?.isbn13 || a?.isbn || a?.extra?.isbn || a?.extra?.isbn_13 || a?.epubMetadata?.isbn || ''
-  );
-  // Authoritative compatibility: when `a` specifies a known edition year or ISBN,
-  // an unverified candidate (`provisional` without verified year or ISBN) is NOT
-  // treated as a verified match. Pre-download candidate selection uses
-  // `candidateCompatibility` / `editionCompatibility` directly.
-  if (reqYearA || (reqIsbnA.length === 10 || reqIsbnA.length === 13)) {
-    return d.outcome === 'match';
-  }
   return d.outcome === 'match' || d.outcome === 'provisional';
 }
 
@@ -2227,9 +2165,7 @@ function matchStrongTask(taskId, task, payload, resolvedFormat) {
   const payloadSource = (payload.source || '').toLowerCase();
   if (taskSource && payloadSource && taskSource !== payloadSource) return false;
 
-  // Edition-aware checks: do not adopt a task for a different year/author/ISBN.
-  if (task.year && payload.year && String(task.year) !== String(payload.year)) return false;
-  if (task.isbn && payload.isbn && !sameIsbn(task.isbn, payload.isbn)) return false;
+  // Work-identity guard: do not adopt a task for a different author (ISBN and year never block).
   if (task.author && payload.author && !isAuthorMatch(task.author, payload.author)) return false;
 
   return true;
@@ -2431,9 +2367,7 @@ function matchTaskByDetails(task, payload, resolvedFormat) {
   const payloadSourceId = String(payload.source_id || payload.id || '').trim();
   if (taskSourceId && payloadSourceId && taskSourceId !== payloadSourceId) return false;
 
-  // Edition-aware checks: do not adopt a task for a different year/author/ISBN.
-  if (task.year && payload.year && String(task.year) !== String(payload.year)) return false;
-  if (task.isbn && payload.isbn && !sameIsbn(task.isbn, payload.isbn)) return false;
+  // Work-identity guard: do not adopt a task for a different author (ISBN and year never block).
   if (task.author && payload.author && !isAuthorMatch(task.author, payload.author)) return false;
 
   return true;

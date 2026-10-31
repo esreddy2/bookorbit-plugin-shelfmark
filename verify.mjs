@@ -33,6 +33,7 @@ import { readFileSync, writeFileSync, existsSync, rmSync, mkdirSync, mkdtempSync
 import { dirname, join, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
+import { deflateRawSync, deflateSync } from 'node:zlib';
 
 import plugin from './index.mjs';
 import {
@@ -66,12 +67,15 @@ import {
   stripLeadingArticle,
   extractEpubMetadata,
   extractEpubMetadataFromFile,
+  extractEpubReadingSamples,
+  extractEpubReadingSamplesFromFile,
+  identifyReadingLanguage,
   MAGIC_BYTES,
   sanitizeLog,
 } from './bridge/bridge.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
-const EXPECTED_VERSION = '1.7.6';
+const EXPECTED_VERSION = '1.7.7';
 const RELEASE_MODE = process.argv.includes('--release');
 const TEST_TIMEOUT_MS = 10_000;
 const tests = [];
@@ -353,14 +357,49 @@ function zipBytes(entries) {
   end.writeUInt32LE(offset, 16);
   return Buffer.concat([...locals, ...central, end]);
 }
-function epubBytes({ title = 'Frankenstein', author = 'Mary Wollstonecraft Shelley',
-  year = 1818, isbn = '9780141439471', language = 'en' } = {}) {
-  const opf = `<?xml version="1.0" encoding="UTF-8"?>\n<package xmlns="http://www.idpf.org/2007/opf" version="3.0" unique-identifier="id">\n<metadata xmlns:dc="http://purl.org/dc/elements/1.1/">\n<dc:title>${title}</dc:title><dc:creator>${author}</dc:creator>\n<dc:language>${language}</dc:language><dc:date>${year}-01-01</dc:date>\n<dc:identifier id="id">urn:isbn:${isbn}</dc:identifier>\n</metadata><manifest><item id="text" href="chapter.xhtml" media-type="application/xhtml+xml"/></manifest>\n<spine><itemref idref="text"/></spine></package>`;
+const DEFAULT_ENGLISH_CHAPTERS = [
+  `<html xmlns="http://www.w3.org/1999/xhtml"><body>
+    <h1>Chapter 1</h1>
+    <p>The cold rain drifted steadily across the harbour while the streetlights flickered above the wet cobblestones. Margaret stood beside the narrow window of the library, watching the last ferry turn slowly toward the distant shore before darkness settled over the water.</p>
+    <p>She had waited nearly three months for a letter that would explain why her brother had left London without speaking to their family, yet every envelope on the hall table brought only ordinary accounts and polite invitations from old acquaintances.</p>
+  </body></html>`,
+  `<html xmlns="http://www.w3.org/1999/xhtml"><body>
+    <h1>Chapter 2</h1>
+    <p>When morning returned, the fog had lifted from the hills behind the town, revealing the stone tower where the archivist kept the parish registers and the journals of earlier travellers who had crossed the northern pass.</p>
+    <p>Inside the quiet reading room, they examined the worn leather volumes together, comparing each entry against the map he had sketched before his departure and noting every village where horses could have been changed during the storm.</p>
+  </body></html>`,
+  `<html xmlns="http://www.w3.org/1999/xhtml"><body>
+    <h1>Chapter 3</h1>
+    <p>By late afternoon they understood that nothing in the journey had happened by chance, for the witnesses along the river remembered a tall stranger carrying a brass compass and asking about the road beyond the bridge.</p>
+    <p>Though winter was already closing the higher valleys, she resolved that they would follow the same trail at dawn and bring back the truth before another season could erase what remained of his footsteps.</p>
+  </body></html>`,
+];
+
+function epubBytes({
+  title = 'Frankenstein',
+  author = 'Mary Wollstonecraft Shelley',
+  year = 1818,
+  isbn = '9780141439471',
+  language = 'en',
+  chapters = DEFAULT_ENGLISH_CHAPTERS,
+  extraEntries = [],
+  extraManifest = '',
+  extraSpineBefore = '',
+} = {}) {
+  const dateTag = year != null ? `<dc:date>${year}-01-01</dc:date>` : '';
+  const isbnTag = isbn != null ? `<dc:identifier id="id">urn:isbn:${isbn}</dc:identifier>` : '<dc:identifier id="id">urn:uuid:11111111-2222-3333-4444-555555555555</dc:identifier>';
+  const langTag = language != null ? `<dc:language>${language}</dc:language>` : '';
+  const authorTag = author != null ? `<dc:creator>${author}</dc:creator>` : '';
+  const chapterItems = chapters.map((_, idx) => `<item id="ch${idx + 1}" href="chapter${idx + 1}.xhtml" media-type="application/xhtml+xml"/>`).join('');
+  const chapterRefs = chapters.map((_, idx) => `<itemref idref="ch${idx + 1}"/>`).join('');
+  const opf = `<?xml version="1.0" encoding="UTF-8"?>\n<package xmlns="http://www.idpf.org/2007/opf" version="3.0" unique-identifier="id">\n<metadata xmlns:dc="http://purl.org/dc/elements/1.1/">\n<dc:title>${title}</dc:title>${authorTag}\n${langTag}${dateTag}\n${isbnTag}\n</metadata><manifest>${extraManifest}${chapterItems}</manifest>\n<spine>${extraSpineBefore}${chapterRefs}</spine></package>`;
+  const chapterEntries = chapters.map((html, idx) => [`OEBPS/chapter${idx + 1}.xhtml`, html]);
   return zipBytes([
     ['mimetype', 'application/epub+zip'],
     ['META-INF/container.xml', '<?xml version="1.0"?><container xmlns="urn:oasis:names:tc:opendocument:xmlns:container" version="1.0"><rootfiles><rootfile full-path="OEBPS/content.opf" media-type="application/oebps-package+xml"/></rootfiles></container>'],
     ['OEBPS/content.opf', opf],
-    ['OEBPS/chapter.xhtml', '<html xmlns="http://www.w3.org/1999/xhtml"><body><p>Fixture only</p></body></html>'],
+    ...extraEntries,
+    ...chapterEntries,
   ]);
 }
 const FILES = {
@@ -391,7 +430,7 @@ test('DECLARATION: BookOrbit API v1, Shelfmark indexer and ebook-only', () => {
   assert.equal(plugin.type, 'shelfmark');
   assert.deepEqual(plugin.mediaKinds, ['ebook']);
 });
-test('DECLARATION: native indexer advertises v1.7.6, never a previous version', () => {
+test('DECLARATION: native indexer advertises v1.7.7, never a previous version', () => {
   assert.equal(plugin.version, EXPECTED_VERSION);
 });
 test('DECLARATION: exposes search, test, and resolveFile entry points', () => {
@@ -686,15 +725,19 @@ test('SEARCH: mixed EPUB/PDF provider formats produce an eligible ebook', async 
   });
   assert.ok(result.some((r) => r.format === 'epub'));
 });
-test('SEARCH: explicit mismatched release language is rejected for an English request', async () => {
+test('SEARCH: release language metadata is treated as a ranking hint (matching > unknown > conflicting) without blocking inspection', async () => {
   const { result } = await searchScenario({
     query: standardQuery('1984', 'George Orwell', { language: 'en' }),
     books: [metadata('1984', 'George Orwell', { language: 'en' })],
-    releases: [release('1984', 'George Orwell', { source_id: 'lt-1984', language: 'Lithuanian' }),
-      release('1984', 'George Orwell', { source_id: 'en-1984', language: 'English' })],
+    releases: [
+      release('1984', 'George Orwell', { source_id: 'lt-1984', language: 'Lithuanian', size_bytes: 900000 }),
+      release('1984', 'George Orwell', { source_id: 'unknown-1984', language: null, size_bytes: 800000 }),
+      release('1984', 'George Orwell', { source_id: 'en-1984', language: 'English', size_bytes: 500000 }),
+    ],
   });
-  assert.ok(result.some((r) => r.extra?.sourceId === 'en-1984'));
-  assert.ok(!result.some((r) => r.extra?.sourceId === 'lt-1984'));
+  const ids = result.map((r) => r.extra?.sourceId);
+  assert.deepEqual(ids, ['en-1984', 'unknown-1984', 'lt-1984']);
+  assert.equal(result.find((r) => r.extra?.sourceId === 'lt-1984')?.language, 'Lithuanian');
 });
 test('SEARCH: release language must not be fabricated from parent English metadata', async () => {
   const { result } = await searchScenario({
@@ -737,14 +780,21 @@ test('SEARCH: ISBN-locked release query falls back to title and author without I
   assert.ok(result.length > 0);
 });
 
-test('SEARCH: a release with a conflicting authentic ISBN is rejected', async () => {
+test('SEARCH: exact ISBN match gets priority while different or absent ISBN and publication year never penalize or block', async () => {
   const requestedIsbn = '9791223228388';
   const { result } = await searchScenario({
-    query: standardQuery('1984', 'George Orwell', { isbn13: requestedIsbn }),
-    books: [metadata('1984', 'George Orwell', { isbn: [requestedIsbn] })],
-    releases: [release('1984', 'George Orwell', { isbn: '9780451524935' })],
+    query: standardQuery('1984', 'George Orwell', { isbn13: requestedIsbn, year: 2026 }),
+    books: [metadata('1984', 'George Orwell', { isbn: [requestedIsbn], year: 2026 })],
+    releases: [
+      release('1984', 'George Orwell', { source_id: 'absent-isbn', isbn: null, year: 2026, size_bytes: 400000 }),
+      release('1984', 'George Orwell', { source_id: 'different-isbn', isbn: '9780451524935', year: 1950, size_bytes: 600000 }),
+      release('1984', 'George Orwell', { source_id: 'exact-isbn', isbn: requestedIsbn, year: 1984, size_bytes: 300000 }),
+    ],
   });
-  assert.equal(result.length, 0);
+  const ids = result.map((r) => r.extra?.sourceId);
+  assert.equal(ids[0], 'exact-isbn', 'exact ISBN match must get ranking priority');
+  // Different ISBN is NOT penalized relative to absent ISBN (larger size wins tie-break, ignoring year 1950 vs 2026)
+  assert.deepEqual(ids.slice(1), ['different-isbn', 'absent-isbn']);
 });
 
 test('SEARCH: no ISBN is fabricated when release metadata lacks one', async () => {
@@ -1453,20 +1503,22 @@ test('QUEUE: bridge normalizes older release candidate with numeric size to stri
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 6. Edition semantics — never merge different requested books
+// 6. Work + language compatibility semantics (ISBN positive-only, year ignored)
 // ─────────────────────────────────────────────────────────────────────────────
 const FRANK = (year, isbn, extra = {}) => ({ title: 'Frankenstein', author: 'Mary Shelley',
   format: 'epub', year, ...(isbn ? { isbn } : {}), ...extra });
 const editionCases = [
   ['same title/author/year', FRANK(1818), FRANK(1818), true],
   ['author middle names and same year', FRANK(1818), FRANK(1818, null, { author: 'Mary Wollstonecraft Shelley' }), true],
-  ['1818 and 2015 years', FRANK(1818), FRANK(2015), false],
-  ['2015 and 1818 years', FRANK(2015), FRANK(1818), false],
-  ['different known ISBNs', FRANK(null, '9780141439471'), FRANK(null, '9780199537150'), false],
+  ['1818 and 2015 years (year never blocks)', FRANK(1818), FRANK(2015), true],
+  ['2015 and 1818 years (year never blocks)', FRANK(2015), FRANK(1818), true],
+  ['different known ISBNs (different ISBN never blocks)', FRANK(null, '9780141439471'), FRANK(null, '9780199537150'), true],
   ['same verified ISBN', FRANK(null, '9780141439471'), FRANK(null, '9780141439471'), true],
-  ['known requested year and unknown candidate year', FRANK(1818), FRANK(undefined), false],
+  ['known requested year and unknown candidate year', FRANK(1818), FRANK(undefined), true],
   ['different file media', FRANK(1818), FRANK(1818, null, { format: 'mp3' }), false],
   ['different title', FRANK(1818), { title: 'Dracula', author: 'Mary Shelley', year: 1818, format: 'epub' }, false],
+  ['different author', FRANK(1818), { title: 'Frankenstein', author: 'Bram Stoker', year: 1818, format: 'epub' }, false],
+  ['conflicting explicit language', FRANK(1818, null, { requestLanguage: 'en' }), FRANK(1818, null, { requestLanguage: 'es' }), false],
 ];
 for (const [name, requested, candidate, compatible] of editionCases) {
   test(`EDITION: ${name} → ${compatible ? 'compatible' : 'not compatible'}`, () => {
@@ -1492,11 +1544,11 @@ test('EDITION: EPUB missing/corrupt inputs do not invent authoritative metadata'
   assert.equal(extractEpubMetadata('not a Buffer'), null);
   assert.equal(extractEpubMetadata(Buffer.from('x')), null);
 });
-test('EDITION: same title but different EPUB OPF years must not be cross-adopted', () => {
+test('EDITION: same work with different EPUB OPF years or ISBNs remains compatible', () => {
   assert.equal(areEditionsCompatible(FRANK(1818),
     { title: 'Frankenstein', author: 'Mary Shelley', format: 'epub', filePath: FILES.validEpub }), true);
-  assert.equal(areEditionsCompatible(FRANK(2015),
-    { title: 'Frankenstein', author: 'Mary Shelley', format: 'epub', filePath: FILES.validEpub }), false);
+  assert.equal(areEditionsCompatible(FRANK(2015, '9780199537150'),
+    { title: 'Frankenstein', author: 'Mary Shelley', format: 'epub', filePath: FILES.validEpub }), true);
 });
 test('EDITION: second EPUB has different embedded year and ISBN', () => {
   const result = extractEpubMetadataFromFile(FILES.laterEpub);
@@ -2044,26 +2096,26 @@ test('FULFILL: 409 without authoritative compatible book must NOT guess an ID', 
   assert.equal(fake.called('bo.fulfill').length, 0);
   fake.assertKnownRoutes();
 });
-test('FULFILL: 409 response with incompatible edition details must NOT be adopted', async () => {
+test('FULFILL: 409 response with incompatible work or language must NOT be adopted', async () => {
   const { task, result, fake } = await directFulfillScenario({
     taskOptions: { title: 'Frankenstein', author: 'Mary Shelley', year: 1818,
-      filePath: FILES.validEpub, requestIds: ['frank-1818'] },
+      filePath: FILES.validEpub, requestIds: ['frank-wrong-work'] },
     uploadStatus: 409,
     uploadResult: { error: 'Conflict', id: 1500,
-      existingBook: { id: 1500, title: 'Frankenstein', author: 'Mary Shelley', year: 2015, format: 'epub' } },
+      existingBook: { id: 1500, title: 'Summary of Frankenstein', author: 'Mary Shelley', year: 1818, format: 'epub' } },
   });
   assert.equal(result.fulfilled, false);
   assert.equal(task.matchedBookId == null, true);
   assert.equal(fake.called('bo.fulfill').length, 0);
 });
-test('FULFILL: 409 compatible authoritative ID can be adopted when same edition is verified', async () => {
+test('FULFILL: 409 compatible authoritative ID is adopted for same work even when year or ISBN differs', async () => {
   const { task, fake } = await directFulfillScenario({
-    taskOptions: { title: 'Frankenstein', author: 'Mary Shelley', year: 1818,
-      filePath: FILES.validEpub, requestIds: ['frank-same-edition'] },
+    taskOptions: { title: 'Frankenstein', author: 'Mary Shelley', year: 1818, requestIsbn: '9780141439471',
+      filePath: FILES.validEpub, requestIds: ['frank-same-work'] },
     uploadStatus: 409,
     uploadResult: { error: 'Conflict', id: 1222,
       existingBook: { id: 1222, title: 'Frankenstein', author: 'Mary Shelley',
-        year: 1818, isbn: '9780141439471', format: 'epub' } },
+        year: 2015, isbn: '9780199537150', format: 'epub' } },
   });
   assert.equal(task.matchedBookId, 1222);
   assert.equal(fake.called('bo.fulfill').length, 1);
@@ -2310,15 +2362,20 @@ test('VERIFY BOOK: renamed book is not declared deleted when exact ID still exis
   assert.equal(status, 'exists');
 });
 
-test('VERIFY BOOK: different edition returns incompatible rather than deleted', async () => {
+test('VERIFY BOOK: same work with different year/ISBN returns exists, while different author returns incompatible', async () => {
   const bridge = new BridgeService(bridgeOpts());
-  const task = createTask(bridge, { title: 'Frankenstein', author: 'Mary Shelley', year: 1818, format: 'epub' });
-  const fake = apiScenarios({
-    'bo.book': () => response({ id: 502, libraryId: 1, title: 'Frankenstein', author: 'Mary Shelley', publishedYear: 2015, format: 'epub' }),
-    'bo.libraryBooks': () => response({ items: [{ id: 502, title: 'Frankenstein', author: 'Mary Shelley', year: 2015, format: 'epub' }], total: 1 }),
+  const task = createTask(bridge, { title: 'Frankenstein', author: 'Mary Shelley', year: 1818, isbn: '9780141439471', format: 'epub' });
+  const fakeSameWork = apiScenarios({
+    'bo.book': () => response({ id: 502, libraryId: 1, title: 'Frankenstein', author: 'Mary Shelley', publishedYear: 2015, isbn13: '9780199537150', format: 'epub' }),
+    'bo.libraryBooks': () => response({ items: [{ id: 502, title: 'Frankenstein', author: 'Mary Shelley', year: 2015, isbn13: '9780199537150', format: 'epub' }], total: 1 }),
   });
-  const status = await bridge.verifyBookInLibrary(task, 1, 502, {}, fake.fetch);
-  assert.equal(status, 'incompatible');
+  assert.equal(await bridge.verifyBookInLibrary(task, 1, 502, {}, fakeSameWork.fetch), 'exists');
+
+  const fakeWrongAuthor = apiScenarios({
+    'bo.book': () => response({ id: 502, libraryId: 1, title: 'Frankenstein', author: 'Dean Koontz', publishedYear: 2005, format: 'epub' }),
+    'bo.libraryBooks': () => response({ items: [{ id: 502, title: 'Frankenstein', author: 'Dean Koontz', year: 2005, format: 'epub' }], total: 1 }),
+  });
+  assert.equal(await bridge.verifyBookInLibrary(task, 1, 502, {}, fakeWrongAuthor.fetch), 'incompatible');
 });
 
 test('VERIFY BOOK: deleted book returns deleted via exact-ID route', async () => {
@@ -2396,8 +2453,8 @@ test('FULFILL: incompatible matched book fails closed without upload, fulfillmen
   });
   const fake = apiScenarios({
     requests: [request('compat-req-1', 'Frankenstein', 'Mary Shelley', { year: 1818 })],
-    'bo.libraryBooks': () => response({ items: [{ id: 509, title: 'Frankenstein', author: 'Mary Shelley', year: 2015, format: 'epub' }], total: 1 }),
-    'bo.book': () => response({ id: 509, libraryId: 1, title: 'Frankenstein', author: 'Mary Shelley', publishedYear: 2015, format: 'epub' }),
+    'bo.libraryBooks': () => response({ items: [{ id: 509, title: 'Frankenstein', author: 'Dean Koontz', year: 2005, format: 'epub' }], total: 1 }),
+    'bo.book': () => response({ id: 509, libraryId: 1, title: 'Frankenstein', author: 'Dean Koontz', publishedYear: 2005, format: 'epub' }),
     'bo.upload': () => response({ id: 9999 }),
     'bo.fulfill': { status: 'AVAILABLE' },
   });
@@ -2409,12 +2466,12 @@ test('FULFILL: incompatible matched book fails closed without upload, fulfillmen
 });
 
 
-test('VERIFY BOOK: missing author still rejects mismatched publication year', async () => {
+test('VERIFY BOOK: missing author still rejects mismatched format or explicit language', async () => {
   const bridge = new BridgeService(bridgeOpts());
-  const task = createTask(bridge, { title: 'Frankenstein', author: '', year: 1818, format: 'epub' });
+  const task = createTask(bridge, { title: 'Frankenstein', author: '', requestLanguage: 'en', format: 'epub' });
   const fake = apiScenarios({
-    'bo.book': () => response({ id: 510, libraryId: 1, title: 'Frankenstein', author: '', publishedYear: 2015, format: 'epub' }),
-    'bo.libraryBooks': () => response({ items: [{ id: 510, title: 'Frankenstein', author: '', year: 2015, format: 'epub' }], total: 1 }),
+    'bo.book': () => response({ id: 510, libraryId: 1, title: 'Frankenstein', author: '', language: 'es', format: 'epub' }),
+    'bo.libraryBooks': () => response({ items: [{ id: 510, title: 'Frankenstein', author: '', language: 'es', format: 'epub' }], total: 1 }),
   });
   const status = await bridge.verifyBookInLibrary(task, 1, 510, {}, fake.fetch);
   assert.equal(status, 'incompatible');
@@ -2428,7 +2485,7 @@ test('VERIFY BOOK: missing author with matching year and no ISBN fails closed', 
     'bo.libraryBooks': () => response({ items: [{ id: 511, title: 'Frankenstein', author: '', year: 1818, format: 'epub' }], total: 1 }),
   });
   const status = await bridge.verifyBookInLibrary(task, 1, 511, {}, fake.fetch);
-  assert.equal(status, 'exists');
+  assert.equal(status, 'unknown');
 });
 
 test('VERIFY BOOK: Frankenstein editions are not accepted on title alone', async () => {
@@ -2443,19 +2500,23 @@ test('VERIFY BOOK: Frankenstein editions are not accepted on title alone', async
 });
 
 
-test('ISBN: different requested ISBNs do not share a task', async () => {
+test('ISBN: different requested ISBNs or years share a task for the same work+language, while different requested languages do not', async () => {
   const bridge = new BridgeService(bridgeOpts());
   const fake = apiScenarios({});
   const rel = release('Frankenstein', 'Mary Shelley', { source_id: 'isbn-unknown-shared', isbn: null });
-  const first = await bridge.queueRelease({ requestId: 'req-a', userId: 'u1', release: rel, libraryId: 1, folderId: 1, requestIsbn: '9780141439471', fetchFn: fake.fetch });
+  const first = await bridge.queueRelease({ requestId: 'req-a', userId: 'u1', release: rel, libraryId: 1, folderId: 1, requestIsbn: '9780141439471', requestYear: 1818, requestLanguage: 'English', fetchFn: fake.fetch });
   assert.ok(first.taskId);
-  let threw = false;
+  const second = await bridge.queueRelease({ requestId: 'req-b', userId: 'u2', release: rel, libraryId: 1, folderId: 1, requestIsbn: '9780199537150', requestYear: 2026, requestLanguage: 'en', fetchFn: fake.fetch });
+  assert.equal(second.taskId, first.taskId, 'different requested ISBNs/years for the same book and language must share the task');
+  assert.equal(second.adopted, true);
+
+  let langThrew = false;
   try {
-    await bridge.queueRelease({ requestId: 'req-b', userId: 'u2', release: rel, libraryId: 1, folderId: 1, requestIsbn: '9780199537150', fetchFn: fake.fetch });
-  } catch (err) {
-    threw = true;
+    await bridge.queueRelease({ requestId: 'req-es', userId: 'u3', release: rel, libraryId: 1, folderId: 1, requestLanguage: 'Spanish', fetchFn: fake.fetch });
+  } catch {
+    langThrew = true;
   }
-  assert.equal(threw, true, 'adopting a task with a conflicting requested ISBN must fail');
+  assert.equal(langThrew, true, 'conflicting requested languages must not adopt the same task');
 });
 
 // 10. Security: real local files, path containment, webhook identity and size
@@ -3447,40 +3508,53 @@ test('REGRESSION: explicit counterpart pairs still grant equivalence', () => {
   assert.equal(areVerifiedCounterparts('9781111111111', '9782222222222', { bookMetadata: { isbn: '9781111111111', counterpart_isbn: '9782222222222' } }), true);
 });
 
-test('REGRESSION: editionCompatibility rejects differing ISBNs sharing only trustedIsbns', () => {
+test('REGRESSION: differing ISBNs sharing only flat trustedIsbns do not fabricate isbnVerified while remaining compatible', () => {
   const a = { title: 'Dune', author: 'Frank Herbert', isbn: '9781111111111', trustedIsbns: ['9781111111111', '9782222222222'] };
   const b = { title: 'Dune', author: 'Frank Herbert', isbn: '9782222222222', trustedIsbns: ['9781111111111', '9782222222222'] };
-  assert.equal(areEditionsCompatible(a, b), false);
+  assert.equal(areEditionsCompatible(a, b), true);
   const d = editionCompatibility(a, b);
-  assert.ok(d.conflicts.includes('conflicting_isbn'), d.conflicts.join(','));
-});
-
-test('PROPERTY: unknown evidence cannot become verified (year)', () => {
-  const req = { title: 'Dune', author: 'Frank Herbert', year: 1965 };
-  const cand = { title: 'Dune', author: 'Frank Herbert', year: null };
-  const d = editionCompatibility(req, cand);
-  // Stage 1 candidate discovery: plausible work with missing release year is provisional (never 'match' or 'verified')
+  assert.equal(d.isbnVerified, false, 'flat trustedIsbns array must not fabricate verified ISBN match');
   assert.equal(d.outcome, 'provisional');
-  assert.equal(d.editionConfidence, 'low');
-  assert.ok(d.reasonCodes.includes('unknown_release_year'));
-  assert.ok(!d.conflicts.includes('unknown_release_year'));
-  const yearEv = d.evidence.find((e) => e.field === 'year');
-  assert.equal(yearEv?.status, 'unverified');
-  // Stage 2 / authoritative edition check: missing year without verified ISBN is rejected
-  const finalDecision = editionCompatibility(req, cand, { stage: 'final' });
-  assert.equal(finalDecision.outcome, 'reject');
-  assert.ok(finalDecision.conflicts.includes('unverified_edition_year'));
-  assert.equal(areEditionsCompatible(req, cand), false);
+  assert.ok(!d.conflicts.includes('conflicting_isbn'), d.conflicts.join(','));
 });
 
-test('PROPERTY: contradictory edition evidence prevents fulfillment', () => {
-  const req = { title: 'Dune', author: 'Frank Herbert', year: 1965, isbn: '9780441172719', language: 'en' };
-  const cand = { title: 'Dune', author: 'Frank Herbert', year: 1984, isbn: '9780060850524', language: 'fr' };
-  const d = editionCompatibility(req, cand);
+test('PROPERTY: publication year and differing/absent ISBN never block compatibility or fabricate verified ISBN', () => {
+  const req = { title: 'Dune', author: 'Frank Herbert', year: 1965, isbn: '9780441172719' };
+  const candAbsent = { title: 'Dune', author: 'Frank Herbert', year: null, isbn: null };
+  const candDifferent = { title: 'Dune', author: 'Frank Herbert', year: 2021, isbn: '9780593099322' };
+  const candExactIsbn = { title: 'Dune', author: 'Frank Herbert', year: 2021, isbn: '0441172717' }; // ISBN-10 counterpart
+
+  const dAbsent = editionCompatibility(req, candAbsent);
+  assert.equal(dAbsent.outcome, 'provisional');
+  assert.equal(dAbsent.isbnVerified, false);
+  assert.deepEqual(dAbsent.conflicts, []);
+  assert.equal(areEditionsCompatible(req, candAbsent), true);
+
+  const dDiff = editionCompatibility(req, candDifferent);
+  assert.equal(dDiff.outcome, 'provisional');
+  assert.equal(dDiff.isbnVerified, false);
+  assert.deepEqual(dDiff.conflicts, []);
+  assert.equal(areEditionsCompatible(req, candDifferent), true);
+
+  const dExact = editionCompatibility(req, candExactIsbn);
+  assert.equal(dExact.outcome, 'match');
+  assert.equal(dExact.isbnVerified, true);
+  assert.equal(dExact.editionConfidence, 'high');
+  assert.deepEqual(dExact.conflicts, []);
+});
+
+test('PROPERTY: contradictory work, format, or explicit target language prevents compatibility while year/ISBN differences never conflict', () => {
+  const req = { title: 'Dune', author: 'Frank Herbert', year: 1965, isbn: '9780441172719', format: 'epub', language: 'en' };
+  const candLangConflict = { title: 'Dune', author: 'Frank Herbert', year: 1984, isbn: '9780060850524', format: 'epub', language: 'fr' };
+  const d = editionCompatibility(req, candLangConflict);
   assert.equal(d.outcome, 'reject');
-  assert.ok(d.conflicts.includes('incompatible_year'));
-  assert.ok(d.conflicts.includes('conflicting_isbn'));
-  assert.ok(d.conflicts.includes('language_mismatch'));
+  assert.deepEqual(d.conflicts, ['language_mismatch']);
+
+  const candFormatConflict = { title: 'Dune', author: 'Frank Herbert', format: 'pdf', language: 'en' };
+  assert.ok(editionCompatibility(req, candFormatConflict).conflicts.includes('incompatible_format'));
+
+  const candAuthorConflict = { title: 'Dune', author: 'Brian Herbert', format: 'epub', language: 'en' };
+  assert.ok(editionCompatibility(req, candAuthorConflict).conflicts.includes('incompatible_author'));
 });
 
 test('PROPERTY: noise derivatives are rejected', () => {
@@ -3650,33 +3724,31 @@ test('REGRESSION: missing request year with known release year is accepted', () 
   assert.ok(!d.conflicts.includes('incompatible_year'));
 });
 
-test('REGRESSION: two-stage policy keeps unknown release year provisional in Stage 1 and rejects unverified edition in Stage 2', () => {
+test('REGRESSION: work+language policy treats ISBN as positive-only boost and never blocks on unknown or differing year/ISBN', () => {
   const req = { title: 'Fahrenheit 451', author: 'Ray Bradbury', year: 1953, isbn: '9781451673319' };
   const candUnknown = { title: 'Fahrenheit 451', author: 'Ray Bradbury', year: null, isbn: null };
-  const candWrongYear = { title: 'Fahrenheit 451', author: 'Ray Bradbury', year: 2015, isbn: null };
-  const candVerified = { title: 'Fahrenheit 451', author: 'Ray Bradbury', year: 1953, isbn: '9781451673319' };
+  const candDifferentYearIsbn = { title: 'Fahrenheit 451', author: 'Ray Bradbury', year: 2015, isbn: '9780060850524' };
+  const candExactIsbn = { title: 'Fahrenheit 451', author: 'Ray Bradbury', year: 2015, isbn: '1451673310' }; // ISBN-10 counterpart
 
-  const stage1Unknown = candidateCompatibility(req, candUnknown);
-  assert.equal(stage1Unknown.outcome, 'provisional');
-  assert.equal(stage1Unknown.editionConfidence, 'low');
-  assert.deepEqual(stage1Unknown.conflicts, []);
-  assert.ok(stage1Unknown.reasonCodes.includes('unknown_release_year'));
-  assert.ok(stage1Unknown.reasonCodes.includes('unknown_release_isbn'));
+  const dUnknown = candidateCompatibility(req, candUnknown);
+  assert.equal(dUnknown.outcome, 'provisional');
+  assert.equal(dUnknown.isbnVerified, false);
+  assert.deepEqual(dUnknown.conflicts, []);
 
-  const stage1WrongYear = candidateCompatibility(req, candWrongYear);
-  assert.equal(stage1WrongYear.outcome, 'reject');
-  assert.ok(stage1WrongYear.conflicts.includes('incompatible_year'));
+  const dDiff = candidateCompatibility(req, candDifferentYearIsbn);
+  assert.equal(dDiff.outcome, 'provisional');
+  assert.equal(dDiff.isbnVerified, false);
+  assert.deepEqual(dDiff.conflicts, []);
 
-  const stage1Verified = candidateCompatibility(req, candVerified);
-  assert.equal(stage1Verified.outcome, 'match');
-  assert.equal(stage1Verified.editionConfidence, 'high');
+  const dExact = candidateCompatibility(req, candExactIsbn);
+  assert.equal(dExact.outcome, 'match');
+  assert.equal(dExact.isbnVerified, true);
+  assert.equal(dExact.editionConfidence, 'high');
+  assert.deepEqual(dExact.conflicts, []);
 
-  const stage2Unverified = editionCompatibility(req, candUnknown, { stage: 'final' });
-  assert.equal(stage2Unverified.outcome, 'reject');
-  assert.ok(stage2Unverified.conflicts.includes('unverified_isbn'));
-  assert.ok(stage2Unverified.conflicts.includes('unverified_edition_year'));
-  assert.equal(areEditionsCompatible(req, candUnknown), false);
-  assert.equal(areEditionsCompatible(req, candVerified), true);
+  assert.equal(areEditionsCompatible(req, candUnknown), true);
+  assert.equal(areEditionsCompatible(req, candDifferentYearIsbn), true);
+  assert.equal(areEditionsCompatible(req, candExactIsbn), true);
 });
 
 test('REGRESSION: titleMatchDecision rejects anthology/compilation false positives', () => {
@@ -3699,7 +3771,7 @@ test('REGRESSION: titleMatchDecision matches leading article variants bidirectio
   assert.equal(titleMatchDecision('A Tale of Two Cities', 'Tale of Two Cities').outcome, 'match');
 });
 
-test('REGRESSION: editionCompatibility enforces English default and rejects foreign releases', () => {
+test('REGRESSION: language policy defaults to English, rejects explicit request/book mismatches, and treats candidate release language as hint', () => {
   const reqDefault = { title: '1984', author: 'George Orwell' };
   const candEn = { title: '1984', author: 'George Orwell', language: 'en' };
   const candEng = { title: '1984', author: 'George Orwell', language: 'English' };
@@ -3707,6 +3779,7 @@ test('REGRESSION: editionCompatibility enforces English default and rejects fore
   const candKo = { title: '1984', author: 'George Orwell', language: 'ko' };
   const candUnknown = { title: '1984', author: 'George Orwell', language: null };
 
+  // Authoritative comparison (two requests or explicit library book language)
   assert.notEqual(editionCompatibility(reqDefault, candEn).outcome, 'reject');
   assert.notEqual(editionCompatibility(reqDefault, candEng).outcome, 'reject');
   assert.equal(editionCompatibility(reqDefault, candPt).outcome, 'reject');
@@ -3714,30 +3787,37 @@ test('REGRESSION: editionCompatibility enforces English default and rejects fore
   assert.equal(editionCompatibility(reqDefault, candKo).outcome, 'reject');
   assert.ok(editionCompatibility(reqDefault, candKo).conflicts.includes('language_mismatch'));
   assert.notEqual(editionCompatibility(reqDefault, candUnknown).outcome, 'reject');
+
+  // Candidate discovery stage: release language metadata is a ranking hint, not authoritative truth
+  const hintEn = candidateCompatibility(reqDefault, candEn);
+  const hintPt = candidateCompatibility(reqDefault, candPt);
+  const hintUnknown = candidateCompatibility(reqDefault, candUnknown);
+  assert.equal(hintEn.languageHint, 'match');
+  assert.equal(hintUnknown.languageHint, 'unknown');
+  assert.equal(hintPt.outcome, 'provisional');
+  assert.equal(hintPt.languageHint, 'mismatch');
+  assert.ok(hintPt.reasonCodes.includes('language_hint_mismatch'));
+  assert.deepEqual(hintPt.conflicts, []);
 });
 
-test('REGRESSION: pre-upload EPUB OPF check rejects EPUB with mismatched title, author, or language', async () => {
+test('REGRESSION: pre-upload EPUB check rejects mismatched title, mismatched author, or deceptive foreign reading text, and accepts English reading text despite foreign dc:language hint', async () => {
   const bridge = new BridgeService(bridgeOpts());
   const epubPath = join(root, 'mismatch-test.epub');
 
-  const makeEpub = (title, author, lang) => {
-    const opf = `<?xml version="1.0" encoding="utf-8"?>
-<package xmlns="http://www.idpf.org/2007/opf" version="2.0">
-  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/">
-    <dc:title>${title}</dc:title>
-    <dc:creator>${author}</dc:creator>
-    <dc:language>${lang}</dc:language>
-  </metadata>
-</package>`;
-    writeFileSync(epubPath, makeSyntheticEpub(opf));
-  };
+  const spanishChapters = [
+    '<p>Era un día luminoso y frío de abril y los relojes daban las trece. Winston Smith, con la barbilla clavada en el pecho en su esfuerzo por burlar el molestísimo viento, se deslizó rápidamente por entre las puertas de cristal de las Casas de la Victoria, aunque no con la suficiente rapidez para evitar que una ráfaga polvorienta se colara con él.</p><p>El vestíbulo olía a repollo hervido y a esteras viejas. Al fondo, un cartel coloreado, demasiado grande para hallarse en un interior, estaba clavado en la pared. Representaba sólo un enorme rostro de más de un metro de anchura: el rostro de un hombre de unos cuarenta y cinco años con un gran bigote negro y facciones hermosas y endurecidas.</p>',
+    '<p>Dentro del piso una voz melosa leía una lista de cifras que tenían algo que ver con la producción de lingotes de hierro. La voz salía de una placa oblonga de metal, una especie de espejo empañado que formaba parte de la superficie de la pared situada a la derecha. Winston hizo girar un interruptor y la voz disminuyó de volumen, aunque las palabras seguían distinguiéndose.</p><p>El instrumento (la telepantalla, como la llamaban) podía ser amortiguado, pero no había manera de apagarlo del todo. Winston se dirigió hacia la ventana: era de figura menuda y frágil y la delgadez de su cuerpo quedaba realzada por el mono azul que constituía el uniforme del Partido.</p>',
+    '<p>El Ministerio de la Verdad —que en neolengua se le llamaba Miniver— era completamente diferente de cualquier otro objeto que se presentara a la vista. Era una enorme estructura piramidal de cemento armado blanco y reluciente que se elevaba, terraza tras terraza, a trescientos metros de altura. Desde donde Winston se hallaba podían leerse, adheridas sobre su blanca fachada en letras de elegante forma, las tres consignas del Partido.</p>',
+  ];
 
   const fake = apiScenarios({
     requests: [request('req-opf-1', 'Fahrenheit 451', 'Ray Bradbury')],
+    'bo.upload': { id: 4451, title: 'Fahrenheit 451', author: 'Ray Bradbury' },
+    'bo.fulfill': { id: 'req-opf-1', status: 'AVAILABLE' },
   });
 
   // 1. EPUB title mismatch
-  makeEpub('El placer de quemar', 'Ray Bradbury', 'en');
+  writeFileSync(epubPath, epubBytes({ title: 'El placer de quemar', author: 'Ray Bradbury', language: 'en' }));
   const taskTitleMismatch = createTask(bridge, {
     taskId: 'task-opf-1',
     filePath: epubPath,
@@ -3752,8 +3832,13 @@ test('REGRESSION: pre-upload EPUB OPF check rejects EPUB with mismatched title, 
   assert.equal(taskTitleMismatch.status, 'finalization_failed');
   assert.ok(taskTitleMismatch.error.includes('EPUB title mismatch'));
 
-  // 2. EPUB language mismatch
-  makeEpub('Fahrenheit 451', 'Ray Bradbury', 'es');
+  // 2. Deceptive EPUB metadata (dc:language=en) but actual Spanish reading text -> rejected!
+  writeFileSync(epubPath, epubBytes({
+    title: 'Fahrenheit 451',
+    author: 'Ray Bradbury',
+    language: 'en',
+    chapters: spanishChapters,
+  }));
   const taskLangMismatch = createTask(bridge, {
     taskId: 'task-opf-2',
     filePath: epubPath,
@@ -3767,9 +3852,10 @@ test('REGRESSION: pre-upload EPUB OPF check rejects EPUB with mismatched title, 
   assert.equal(res2.fulfilled, false);
   assert.equal(taskLangMismatch.status, 'finalization_failed');
   assert.ok(taskLangMismatch.error.includes('EPUB language mismatch'));
+  assert.ok(taskLangMismatch.verificationConflicts.includes('language_mismatch'));
 
   // 3. EPUB author mismatch
-  makeEpub('Fahrenheit 451', 'Different Author', 'en');
+  writeFileSync(epubPath, epubBytes({ title: 'Fahrenheit 451', author: 'Different Author', language: 'en' }));
   const taskAuthorMismatch = createTask(bridge, {
     taskId: 'task-opf-3',
     filePath: epubPath,
@@ -3783,12 +3869,27 @@ test('REGRESSION: pre-upload EPUB OPF check rejects EPUB with mismatched title, 
   assert.equal(res3.fulfilled, false);
   assert.equal(taskAuthorMismatch.status, 'finalization_failed');
   assert.ok(taskAuthorMismatch.error.includes('EPUB author mismatch'));
+
+  // 4. Conflicting foreign dc:language hint ('es') with genuine English reading chapters -> accepted & fulfilled!
+  writeFileSync(epubPath, epubBytes({ title: 'Fahrenheit 451', author: 'Ray Bradbury', language: 'es' }));
+  const taskHintOverridden = createTask(bridge, {
+    taskId: 'task-opf-4',
+    filePath: epubPath,
+    status: 'completed',
+    requestTitle: 'Fahrenheit 451',
+    requestAuthor: 'Ray Bradbury',
+    requestLanguage: 'en',
+    requestIds: ['req-opf-1'],
+  });
+  const res4 = await bridge.fulfillBookOrbitRequests(taskHintOverridden, fake.fetch);
+  assert.equal(res4.fulfilled, true);
+  assert.equal(taskHintOverridden.status, 'fulfilled');
 });
 
 test('REGRESSION: handleWebhook responds promptly with finalization scheduled and does not regress fulfilled state', async () => {
   const bridge = new BridgeService(bridgeOpts({ secret: 'e2e-fixture-secret' }));
   const epubPath = join(root, 'webhook-speed.epub');
-  writeFileSync(epubPath, makeSyntheticEpub(`<?xml version="1.0"?><package><metadata xmlns:dc="http://purl.org/dc/elements/1.1/"><dc:title>1984</dc:title><dc:creator>George Orwell</dc:creator><dc:language>en</dc:language></metadata></package>`));
+  writeFileSync(epubPath, epubBytes({ title: '1984', author: 'George Orwell', language: 'en' }));
 
   const task = createTask(bridge, {
     taskId: 'task-webhook-1',
@@ -3828,7 +3929,7 @@ test('REGRESSION: handleWebhook responds promptly with finalization scheduled an
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 16. Two-Stage Edition Validation & Real-World EPUB OPF Regressions (v1.7.6)
+// 16. Work + Actual Reading-Language Selection Policy & Real-World EPUB Regressions
 // ─────────────────────────────────────────────────────────────────────────────
 function zipBytesWithStreamingDataDescriptor(entries) {
   const locals = [];
@@ -3882,7 +3983,7 @@ function zipBytesWithStreamingDataDescriptor(entries) {
   return Buffer.concat([...locals, ...central, end]);
 }
 
-test('TWO-STAGE: extractEpubMetadata parses ZIP bit-3 streaming data descriptors, ignores dcterms:modified, and ignores UUID digits before real ISBN', () => {
+test('WORK+LANG: extractEpubMetadata parses ZIP bit-3 streaming data descriptors, ignores dcterms:modified, and ignores UUID digits before real ISBN', () => {
   const opf = `<?xml version="1.0" encoding="UTF-8"?>
 <package xmlns="http://www.idpf.org/2007/opf" version="3.0" unique-identifier="uid">
   <metadata xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:opf="http://www.idpf.org/2007/opf">
@@ -3910,260 +4011,440 @@ test('TWO-STAGE: extractEpubMetadata parses ZIP bit-3 streaming data descriptors
   assert.equal(meta.year, null, 'dcterms:modified packaging timestamp must not fabricate publication year');
 });
 
-test('TWO-STAGE: plugin.search discovers unknown-year releases for populated year+ISBN query, rejects conflicting years, and ranks verified matches first', async () => {
+test('WORK+LANG: plugin.search treats ISBN as positive-only boost, ignores publication year, and does not let foreign-hinted results suppress title+author fallback', async () => {
   const query = {
-    title: 'Fahrenheit 451',
-    author: 'Ray Bradbury',
-    year: 1953,
-    isbn13: '9781451673319',
+    title: '1984',
+    author: 'George Orwell',
+    year: 2026,
+    isbn13: '9791223228388',
     mediaKind: 'ebook',
     language: 'English',
   };
   const fake = apiScenarios({
-    books: [metadata('Fahrenheit 451', 'Ray Bradbury', { year: 1953, isbn: '9781451673319' })],
+    books: [metadata('1984', 'George Orwell', { year: 2026, isbn: '9791223228388' })],
     onReleases: ({ query: q }) => {
-      // Simulate CT105 reality: ?isbn=... returns 0 or unverified releases; title+author returns unknown-year releases
-      if (q.get('isbn')) return [];
+      // If ?isbn= returns only a foreign-hinted result, plugin.search must still fall back to title+author!
+      if (q.get('isbn')) {
+        return [release('1984', 'George Orwell', { source_id: 'foreign-hint-isbn', year: 2026, isbn: '9791223228388', language: 'it' })];
+      }
       return [
-        release('Fahrenheit 451', 'Ray Bradbury', { source_id: 'unknown-year-src', year: null, isbn: null }),
-        release('Fahrenheit 451', 'Ray Bradbury', { source_id: 'wrong-year-2015', year: 2015, isbn: null }),
-        release('Fahrenheit 451', 'Ray Bradbury', { source_id: 'verified-1953-src', year: 1953, isbn: '1451673310' }), // equivalent ISBN-10!
+        release('1984', 'George Orwell', { source_id: 'absent-isbn-null-year', year: null, isbn: null, language: 'en', size: '1.2 MB' }),
+        release('1984', 'George Orwell', { source_id: 'different-isbn-1950', year: 1950, isbn: '9780451524935', language: 'en', size: '1.5 MB' }),
+        release('1984', 'George Orwell', { source_id: 'exact-isbn-1984', year: 1984, isbn: '9791223228388', language: 'en', size: '1.0 MB' }),
       ];
     },
   });
   const results = await plugin.search(query, config(), hostWith(fake.fetch));
   const ids = results.map((r) => r.extra?.sourceId);
-  assert.ok(!ids.includes('wrong-year-2015'), 'conflicting known year must be rejected in Stage 1');
-  assert.ok(ids.includes('verified-1953-src'), 'verified ISBN-10/year release must be discovered');
-  assert.ok(ids.includes('unknown-year-src'), 'unknown-year candidate must remain eligible for Stage 2 inspection');
-  assert.equal(ids[0], 'verified-1953-src', 'verified edition match must rank ahead of provisional unknown-year candidate');
+  assert.ok(ids.includes('exact-isbn-1984'), 'exact ISBN release must be discovered');
+  assert.ok(ids.includes('different-isbn-1950'), 'different ISBN + different year must NEVER be dropped');
+  assert.ok(ids.includes('absent-isbn-null-year'), 'absent ISBN + null year must NEVER be dropped');
+  assert.equal(ids[0], 'exact-isbn-1984', 'exact ISBN match gets top priority among matching-hint EPUBs');
+  assert.equal(ids[ids.length - 1], 'foreign-hint-isbn', 'foreign language hint ranks behind English-hinted candidates');
+  // Verify authentic metadata is preserved without fabricating request ISBN/year
+  const absentRec = results.find((r) => r.extra?.sourceId === 'absent-isbn-null-year');
+  assert.equal(absentRec.extra.isbn, undefined);
+  assert.equal(absentRec.extra.year, undefined);
   fake.assertKnownRoutes();
 });
 
-test('TWO-STAGE E2E: request with populated publishedYear + isbn13 fulfills automatically from unknown-year release when EPUB OPF proves edition', async () => {
-  const stateFilePath = newStateFile();
-  const bridge = established(new BridgeService(bridgeOpts({ stateFilePath, secret: 'two-stage-secret' })), ['hist-1']);
-  const epubPath = join(root, 'f451-verified-from-unknown.epub');
-  // EPUB carries ISBN-10 equivalent (1451673310 === 9781451673319) and publication year 1953 inside streaming ZIP
-  const opf = `<?xml version="1.0" encoding="UTF-8"?>
-<package xmlns="http://www.idpf.org/2007/opf" version="3.0">
-  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:opf="http://www.idpf.org/2007/opf">
-    <dc:title>Fahrenheit 451</dc:title>
-    <dc:creator>Ray Bradbury</dc:creator>
-    <dc:language>eng</dc:language>
-    <dc:date>1953-10-19</dc:date>
-    <dc:identifier opf:scheme="UUID">urn:uuid:12345678-1234-1234-1234-123456789012</dc:identifier>
-    <dc:identifier opf:scheme="ISBN">1-4516-7331-0</dc:identifier>
-  </metadata>
-</package>`;
-  writeFileSync(epubPath, zipBytesWithStreamingDataDescriptor([
-    ['mimetype', 'application/epub+zip'],
-    ['META-INF/container.xml', '<?xml version="1.0"?><container xmlns="urn:oasis:names:tc:opendocument:xmlns:container" version="1.0"><rootfiles><rootfile full-path="OEBPS/content.opf" media-type="application/oebps-package+xml"/></rootfiles></container>'],
-    ['OEBPS/content.opf', opf],
-  ]));
+test('WORK+LANG E2E: Request #116 (1984, ISBN 9791223228388, year 2026) fulfills from matching English EPUB lacking ISBN/year and from different-ISBN/year EPUB without fabricating metadata', async () => {
+  const bridge = established(new BridgeService(bridgeOpts({ secret: 'req116-secret' })), ['hist-1']);
 
-  const req = request('req-108', 'Fahrenheit 451', 'Ray Bradbury', {
-    publishedYear: 1953,
-    isbn13: '9781451673319',
-  });
-  const fake = apiScenarios({
-    requests: [req],
-    books: [metadata('Fahrenheit 451', 'Ray Bradbury', { year: 1953 })],
-    releases: [release('Fahrenheit 451', 'Ray Bradbury', { source_id: 'unknown-year-f451', year: null, isbn: null })],
-    taskId: 'sm-task-unknown-108',
-    'bo.upload': { id: 7108, title: 'Fahrenheit 451', author: 'Ray Bradbury', year: 1953 },
-    'bo.fulfill': { id: 'req-108', status: 'AVAILABLE' },
-  });
-
-  await bridge.processPendingRequests({ fetchFn: fake.fetch });
-  assert.equal(bridge.state.requests['req-108'], 'sm-task-unknown-108', 'Stage 1 must queue plausible unknown-year release');
-  assert.equal(fake.called('sm.download').length, 1);
-
-  const wh = await bridge.handleWebhook({
-    version: 1,
-    phase: 'post_transfer',
-    task: { task_id: 'sm-task-unknown-108', source: 'annas', title: 'Fahrenheit 451', format: 'epub' },
-    paths: { destination: root, target: epubPath, final_paths: [epubPath] },
-  }, 'two-stage-secret', fake.fetch);
-  assert.equal(wh.ok, true);
-
-  await waitUntil(() => bridge.state.tasks['sm-task-unknown-108']?.status === 'fulfilled', 2000);
-  assert.equal(fake.called('bo.upload').length, 1);
-  assert.equal(fake.called('bo.fulfill').length, 1);
-  assert.equal(bridge.state.tasks['sm-task-unknown-108'].matchedBookId, 7108);
-
-  const diag = bridge.diagnose('req-108');
-  assert.equal(diag.stage?.stage, 'fulfilled');
-  assert.ok(Array.isArray(diag.verificationEvidence) && diag.verificationEvidence.length > 0);
-  assert.equal(diag.verificationEvidence.find((e) => e.field === 'isbn')?.status, 'verified');
-  assert.equal(diag.verificationEvidence.find((e) => e.field === 'year')?.status, 'verified');
-  assert.deepEqual(diag.verificationConflicts, []);
-  fake.assertKnownRoutes();
-});
-
-test('TWO-STAGE E2E: wrong-edition EPUB and unverifiable EPUB from unknown-year releases are rejected BEFORE upload and never fabricated as matches', async () => {
-  const bridge = established(new BridgeService(bridgeOpts({ secret: 'two-stage-reject-secret' })), ['hist-1']);
-
-  // Case A: Wrong edition (OPF has year 2015 and different ISBN)
-  const wrongEpub = join(root, 'f451-wrong-2015.epub');
-  writeFileSync(wrongEpub, epubBytes({
-    title: 'Fahrenheit 451',
-    author: 'Ray Bradbury',
-    year: 2015,
-    isbn: '9780060850524',
-    language: 'en',
-  }));
-
-  const reqWrong = request('req-wrong-ed', 'Fahrenheit 451', 'Ray Bradbury', {
-    publishedYear: 1953,
-    isbn13: '9781451673319',
-  });
-  const fakeWrong = apiScenarios({
-    requests: [reqWrong],
-    books: [metadata('Fahrenheit 451', 'Ray Bradbury')],
-    releases: [release('Fahrenheit 451', 'Ray Bradbury', { source_id: 'src-wrong-ed', year: null, isbn: null })],
-    taskId: 'task-wrong-ed',
-    'bo.upload': { id: 9991 },
-    'bo.fulfill': { status: 'AVAILABLE' },
-  });
-
-  await bridge.processPendingRequests({ fetchFn: fakeWrong.fetch });
-  assert.equal(bridge.state.requests['req-wrong-ed'], 'task-wrong-ed');
-  await bridge.handleWebhook({
-    task: { task_id: 'task-wrong-ed', source: 'annas', title: 'Fahrenheit 451', format: 'epub' },
-    paths: { target: wrongEpub, final_paths: [wrongEpub] },
-  }, 'two-stage-reject-secret', fakeWrong.fetch);
-
-  await waitUntil(() => bridge.state.tasks['task-wrong-ed']?.editionVerificationFailed === true, 2000);
-  assert.equal(fakeWrong.called('bo.upload').length, 0, 'wrong edition must NEVER be uploaded');
-  assert.equal(fakeWrong.called('bo.fulfill').length, 0, 'wrong edition must NEVER be fulfilled');
-  const diagWrong = bridge.diagnose('req-wrong-ed');
-  assert.equal(diagWrong.stage?.stage, 'review_required');
-  assert.ok(diagWrong.verificationConflicts.includes('conflicting_isbn'));
-  assert.ok(diagWrong.verificationConflicts.includes('incompatible_year'));
-
-  // Case B: Unverifiable edition (OPF has matching title/author/language and dcterms:modified, but NO publication year and NO ISBN)
-  const unverifiableEpub = join(root, 'f451-unverifiable.epub');
-  const unverifiableOpf = `<?xml version="1.0" encoding="UTF-8"?>
+  // Build streaming-ZIP English EPUB for 1984 with NO ISBN and NO publication year (only dcterms:modified)
+  const noIsbnYearEpub = join(root, '1984-no-isbn-year.epub');
+  const opfNoIsbn = `<?xml version="1.0" encoding="UTF-8"?>
 <package xmlns="http://www.idpf.org/2007/opf" version="3.0">
   <metadata xmlns:dc="http://purl.org/dc/elements/1.1/">
-    <dc:title>Fahrenheit 451</dc:title>
-    <dc:creator>Ray Bradbury</dc:creator>
+    <dc:title>1984</dc:title>
+    <dc:creator>George Orwell</dc:creator>
     <dc:language>en</dc:language>
-    <meta property="dcterms:modified">2024-01-15T00:00:00Z</meta>
+    <meta property="dcterms:modified">2025-02-01T00:00:00Z</meta>
   </metadata>
+  <manifest>
+    <item id="ch1" href="ch1.xhtml" media-type="application/xhtml+xml"/>
+    <item id="ch2" href="ch2.xhtml" media-type="application/xhtml+xml"/>
+  </manifest>
+  <spine><itemref idref="ch1"/><itemref idref="ch2"/></spine>
 </package>`;
-  writeFileSync(unverifiableEpub, zipBytes([
+  writeFileSync(noIsbnYearEpub, zipBytesWithStreamingDataDescriptor([
     ['mimetype', 'application/epub+zip'],
     ['META-INF/container.xml', '<?xml version="1.0"?><container xmlns="urn:oasis:names:tc:opendocument:xmlns:container" version="1.0"><rootfiles><rootfile full-path="OEBPS/content.opf" media-type="application/oebps-package+xml"/></rootfiles></container>'],
-    ['OEBPS/content.opf', unverifiableOpf],
+    ['OEBPS/content.opf', opfNoIsbn],
+    ['OEBPS/ch1.xhtml', `<?xml version="1.0" encoding="UTF-8"?><html xmlns="http://www.w3.org/1999/xhtml"><body>${DEFAULT_ENGLISH_CHAPTERS[0]}</body></html>`],
+    ['OEBPS/ch2.xhtml', `<?xml version="1.0" encoding="UTF-8"?><html xmlns="http://www.w3.org/1999/xhtml"><body>${DEFAULT_ENGLISH_CHAPTERS[1]}${DEFAULT_ENGLISH_CHAPTERS[2]}</body></html>`],
   ]));
 
-  const bridgeUnv = established(new BridgeService(bridgeOpts({ secret: 'two-stage-unv-secret' })), ['hist-1']);
-  const reqUnv = request('req-unverifiable', 'Fahrenheit 451', 'Ray Bradbury', {
-    publishedYear: 1953,
-    isbn13: '9781451673319',
+  const req116 = request('116', '1984', 'George Orwell', {
+    publishedYear: 2026,
+    isbn13: '9791223228388',
+    language: 'English',
   });
-  const fakeUnv = apiScenarios({
-    requests: [reqUnv],
-    books: [metadata('Fahrenheit 451', 'Ray Bradbury')],
-    releases: [release('Fahrenheit 451', 'Ray Bradbury', { source_id: 'src-unverifiable', year: null, isbn: null })],
-    taskId: 'task-unverifiable',
-    'bo.upload': { id: 9992 },
-    'bo.fulfill': { status: 'AVAILABLE' },
+  const fake116 = apiScenarios({
+    requests: [req116],
+    books: [metadata('1984', 'George Orwell', { year: 2026, isbn: '9791223228388' })],
+    releases: [release('1984', 'George Orwell', { source_id: 'orwell-no-isbn-year', year: null, isbn: null, language: null })],
+    taskId: 'sm-task-116',
+    'bo.upload': { id: 9116, title: '1984', author: 'George Orwell' },
+    'bo.fulfill': { id: '116', status: 'AVAILABLE' },
   });
 
-  await bridgeUnv.processPendingRequests({ fetchFn: fakeUnv.fetch });
-  await bridgeUnv.handleWebhook({
-    task: { task_id: 'task-unverifiable', source: 'annas', title: 'Fahrenheit 451', format: 'epub' },
-    paths: { target: unverifiableEpub, final_paths: [unverifiableEpub] },
-  }, 'two-stage-unv-secret', fakeUnv.fetch);
+  await bridge.processPendingRequests({ fetchFn: fake116.fetch });
+  assert.equal(bridge.state.requests['116'], 'sm-task-116');
+  // Verify queued download payload did NOT fabricate ISBN or year onto Shelfmark request
+  const dlPayload = expectedJson(fake116.called('sm.download')[0].options);
+  assert.equal(dlPayload.isbn ?? null, null, 'must never fabricate request ISBN onto release lacking ISBN');
+  assert.equal(dlPayload.year ?? null, null, 'must never fabricate request year onto release lacking year');
 
-  await waitUntil(() => bridgeUnv.state.tasks['task-unverifiable']?.editionVerificationFailed === true, 2000);
-  assert.equal(fakeUnv.called('bo.upload').length, 0, 'unverifiable edition must NEVER be uploaded');
-  assert.equal(fakeUnv.called('bo.fulfill').length, 0, 'unverifiable edition must NEVER be fulfilled');
-  const diagUnv = bridgeUnv.diagnose('req-unverifiable');
-  assert.equal(diagUnv.stage?.stage, 'review_required');
-  assert.ok(diagUnv.verificationConflicts.includes('unverified_isbn'));
-  assert.ok(diagUnv.verificationConflicts.includes('unverified_edition_year'));
+  await bridge.handleWebhook({
+    version: 1,
+    phase: 'post_transfer',
+    task: { task_id: 'sm-task-116', source: 'annas', title: '1984', format: 'epub' },
+    paths: { destination: root, target: noIsbnYearEpub, final_paths: [noIsbnYearEpub] },
+  }, 'req116-secret', fake116.fetch);
 
-  // Also verify year-only request against unverifiable EPUB fails closed
-  const yearOnlyVer = verifyDownloadedEdition({
-    filePath: unverifiableEpub,
-    format: 'epub',
-    requestTitle: 'Fahrenheit 451',
-    requestAuthor: 'Ray Bradbury',
-    requestLanguage: 'en',
-    requestYear: 1953,
+  await waitUntil(() => bridge.state.tasks['sm-task-116']?.status === 'fulfilled', 2000);
+  assert.equal(fake116.called('bo.upload').length, 1);
+  assert.equal(fake116.called('bo.fulfill').length, 1);
+  assert.equal(bridge.state.tasks['sm-task-116'].isbn, null, 'task must not fabricate ISBN');
+  assert.equal(bridge.state.tasks['sm-task-116'].year, null, 'task must not fabricate year');
+  const diag116 = bridge.diagnose('116');
+  assert.equal(diag116.stage?.stage, 'fulfilled');
+  assert.equal(diag116.verificationEvidence.find((e) => e.field === 'language')?.status, 'verified');
+
+  // Case B: Different ISBN (9780451524935) and different year (1950) also fulfills seamlessly!
+  const diffIsbnEpub = join(root, '1984-diff-isbn.epub');
+  writeFileSync(diffIsbnEpub, epubBytes({
+    title: 'Nineteen Eighty-Four',
+    author: 'George Orwell',
+    year: 1950,
+    isbn: '9780451524935',
+    language: 'en',
+  }));
+  const bridgeDiff = established(new BridgeService(bridgeOpts({ secret: 'diff-isbn-secret' })), ['hist-1']);
+  const reqDiff = request('117', '1984', 'George Orwell', {
+    publishedYear: 2026,
+    isbn13: '9791223228388',
   });
-  assert.equal(yearOnlyVer.ok, false);
-  assert.ok(yearOnlyVer.conflicts.includes('unverified_edition_year'));
+  const fakeDiff = apiScenarios({
+    requests: [reqDiff],
+    books: [metadata('1984', 'George Orwell', { year: 2026, isbn: '9791223228388' })],
+    releases: [release('1984', 'George Orwell', { source_id: 'orwell-1950-signet', year: 1950, isbn: '9780451524935' })],
+    taskId: 'sm-task-117',
+    'bo.upload': { id: 9117, title: '1984', author: 'George Orwell', year: 1950, isbn13: '9780451524935' },
+    'bo.fulfill': { id: '117', status: 'AVAILABLE' },
+  });
+  await bridgeDiff.processPendingRequests({ fetchFn: fakeDiff.fetch });
+  await bridgeDiff.handleWebhook({
+    task: { task_id: 'sm-task-117', source: 'annas', title: '1984', format: 'epub' },
+    paths: { target: diffIsbnEpub, final_paths: [diffIsbnEpub] },
+  }, 'diff-isbn-secret', fakeDiff.fetch);
+  await waitUntil(() => bridgeDiff.state.tasks['sm-task-117']?.status === 'fulfilled', 2000);
+  assert.equal(fakeDiff.called('bo.upload').length, 1);
+  assert.equal(fakeDiff.called('bo.fulfill').length, 1);
 });
 
-test('TWO-STAGE E2E: bounded alternative recovery cools down rejected unknown-year candidate, queues valid alternative, and reconcile never resurrects rejected task', async () => {
-  const bridge = established(new BridgeService(bridgeOpts({ secret: 'bounded-alt-secret' })), ['hist-1']);
-  const badEpub = join(root, 'alt-bad.epub');
-  const goodEpub = join(root, 'alt-good.epub');
-  writeFileSync(badEpub, epubBytes({ title: 'Animal Farm', author: 'George Orwell', year: 2003, isbn: '9780141036137', language: 'en' }));
-  writeFileSync(goodEpub, epubBytes({ title: 'Animal Farm', author: 'George Orwell', year: 1945, isbn: '9780451526342', language: 'en' }));
+test('WORK+LANG: Unicode-aware reading-text verification handles accented English, mixed scripts, deceptive English cover/TOC + foreign chapters, and explicit non-English requests', () => {
+  // 1. Accented English prose (loanwords, diacritics, curly typography) -> verified as English (zero ASCII penalty!)
+  const accentedEnglishEpub = epubBytes({
+    title: '1984',
+    author: 'George Orwell',
+    language: null,
+    year: null,
+    isbn: null,
+    chapters: [
+      `<p>At the Chestnut Tree Café, Winston reflected on the naïve façade of official optimism while sipping ersatz coffee beside a worn résumé and a faded photograph from Zürich. “Nothing was your own except the few cubic centimetres inside your skull,” he murmured vis-à-vis the telescreen’s relentless scrutiny.</p>
+       <p>Charlotte Brontë and Émile Zola would have recognized the déjà vu of life under perpetual surveillance, where every cliché of the régime wasché and recycled by clerks who dared not speak above a whisper in the soirée of the canteen.</p>`,
+      `<p>Julia slipped a crumpled note into his hand near the alcove—an audacious gesture that broke the dreary monotony of their daily routine. Although they knew the price of discovery, they met again beneath the boughs of the summer pasture, far from the posters and loudspeakers of London.</p>
+       <p>When the thrush sang from the hazel bush, its melody seemed to belong to an older world in which ordinary people could still remember what they had seen with their own eyes and write down the truth without fear.</p>`,
+    ],
+  });
+  const accentedSamples = extractEpubReadingSamples(accentedEnglishEpub);
+  const accentedLang = identifyReadingLanguage(accentedSamples, 'en');
+  assert.equal(accentedLang.status, 'verified', `accented English must verify cleanly, got ${JSON.stringify(accentedLang)}`);
+  assert.equal(accentedLang.detected, 'en');
 
-  const req = request('req-bounded-alt', 'Animal Farm', 'George Orwell', {
-    publishedYear: 1945,
-    isbn13: '9780451526342',
+  // 2. Mixed scripts: English novel containing Russian, Greek, and Korean quoted phrases/epigraphs -> verified as English!
+  const mixedEnglishEpub = epubBytes({
+    title: '1984',
+    author: 'George Orwell',
+    language: 'en',
+    chapters: [
+      `<p>Epigraph: «Война — это мир, свобода — это рабство» — and in classical Greek, γνῶθι σεαυτόν, alongside the Korean gloss 자유와 진실.</p>
+       <p>Yet the narrative itself unfolded in plain English across the rainy streets of London, where Winston walked home from the Ministry of Truth and opened the heavy cream-laid notebook he had bought in Charrington’s shop.</p>`,
+      `<p>He dipped his pen into the inkwell and wondered for whom he was writing this diary, since the future might either resemble the present and never listen to him, or grow into a different age in which his lonely warning had ceased to have any clear meaning.</p>
+       <p>Even with occasional foreign phrases like «Большой Брат» or 어둠 속의 빛 quoted in the margin, every chapter remained unmistakably written in English prose from beginning to end.</p>`,
+    ],
+  });
+  const mixedEnLang = identifyReadingLanguage(extractEpubReadingSamples(mixedEnglishEpub), 'en');
+  assert.equal(mixedEnLang.status, 'verified');
+  assert.equal(mixedEnLang.detected, 'en');
+
+  // 3. Deceptive EPUB: dc:language="en" + English cover + English TOC nav + predominantly Korean/Spanish chapters -> REJECTED!
+  const deceptiveKoreanWithEnglishCoverToc = epubBytes({
+    title: '1984',
+    author: 'George Orwell',
+    language: 'en',
+    extraManifest: '<item id="cover" href="cover.xhtml" media-type="application/xhtml+xml"/><item id="toc" href="nav.xhtml" properties="nav" media-type="application/xhtml+xml"/>',
+    extraSpineBefore: '<itemref idref="cover"/><itemref idref="toc"/>',
+    extraEntries: [
+      ['OEBPS/cover.xhtml', '<html xmlns="http://www.w3.org/1999/xhtml"><body><h1>Nineteen Eighty-Four by George Orwell</h1><p>Complete and Unabridged English Classic Edition with Introduction and Notes by the Publisher in London and New York.</p><img src="cover.jpg" alt="English edition cover art with extensive English marketing copy"/></body></html>'],
+      ['OEBPS/nav.xhtml', '<html xmlns="http://www.w3.org/1999/xhtml" xmlns:epub="http://www.idpf.org/2007/ops"><body><nav epub:type="toc"><ol><li><a href="ch1.xhtml">Part One: Chapter One — A Bright Cold Day in April</a></li><li><a href="ch2.xhtml">Part Two: Chapter Two — The Golden Country and the Thrush</a></li></ol></nav></body></html>'],
+    ],
+    chapters: [
+      `<p>사월의 맑고 쌀쌀한 날이었고 시계들이 열세 시를 치고 있었다. 윈스턴 스미스는 매서운 바람을 피하려고 턱을 가슴에 묻은 채 빅토리 맨션의 유리문을 재빨리 빠져들어갔지만, 먼지 섞인 돌풍이 함께 들이닥치는 것까지 막을 만큼 빠르지는 못했다 (George Orwell, London).</p>
+       <p>복도에서는 삶은 양배추 냄새와 낡은 깔개 냄새가 났다. 한쪽 벽에는 실내에 걸기에는 너무 큰 채색 포스터가 압정으로 고정되어 있었는데, 거기에는 마흔다섯 살쯤 되어 보이는 거대한 남자의 얼굴만이 그려져 있었다.</p>`,
+      `<p>방 안에서는 달콤한 목소리가 선철 생산량과 관련된 숫자 목록을 읽어 내려가고 있었다. 그 목소리는 오른쪽 벽면의 일부를 이루는 흐릿한 거울 같은 긴 금속판에서 흘러나왔고, 윈스턴이 스위치를 돌리자 소리는 줄어들었지만 말소리는 여전히 또렷하게 들렸다.</p>
+       <p>진리부는 시야에 들어오는 다른 어떤 건물과도 완전히 달랐다. 그것은 눈부신 흰색 콘크리트로 지어진 거대한 피라미드 형태의 건축물로, 단을 이루며 삼백 미터 높이까지 치솟아 있었다.</p>`,
+    ],
+  });
+  const deceptiveKoPath = join(root, 'deceptive-ko.epub');
+  writeFileSync(deceptiveKoPath, deceptiveKoreanWithEnglishCoverToc);
+  const koVer = verifyDownloadedEdition({
+    filePath: deceptiveKoPath,
+    format: 'epub',
+    requestTitle: '1984',
+    requestAuthor: 'George Orwell',
+    requestLanguage: 'en',
+  });
+  assert.equal(koVer.ok, false);
+  assert.equal(koVer.outcome, 'reject');
+  assert.equal(koVer.languageReviewRequired, false, 'confident wrong language must hard-reject, not review');
+  assert.ok(koVer.conflicts.includes('language_mismatch'));
+  assert.equal(koVer.languageAnalysis.detected, 'ko');
+
+  // 4. Accented French & German chapters claiming dc:language="en" -> REJECTED; Spanish chapters with requestLanguage="es" -> VERIFIED!
+  const frenchEpub = epubBytes({
+    title: '1984',
+    author: 'George Orwell',
+    language: 'en',
+    chapters: [
+      `<p>C’était une journée d’avril froide et claire, et les horloges sonnaient treize heures. Winston Smith, le menton rentré dans le cou pour échapper au vent mauvais, se glissa rapidement par les portes vitrées du bloc de la Victoire, mais pas assez vite pour empêcher un tourbillon de poussière d’entrer avec lui.</p>
+       <p>Le hall sentait le chou bouilli et les vieux paillassons. À l’une de ses extrémités, une affiche de couleur trop grande pour être déployée à l’intérieur était clouée au mur et représentait simplement un visage énorme de plus d’un mètre de large.</p>`,
+      `<p>À l’intérieur de l’appartement, une voix sucrée lisait une liste de chiffres qui avaient trait à la production de la fonte. La voix provenait d’une plaque de métal oblongue qui faisait partie de la surface du mur de droite, et Winston tourna un bouton afin que la voix diminuât sans que les mots cessassent d’être distincts.</p>`,
+    ],
+  });
+  const frCheck = identifyReadingLanguage(extractEpubReadingSamples(frenchEpub), 'en');
+  assert.equal(frCheck.status, 'mismatch');
+  assert.equal(frCheck.detected, 'fr');
+
+  const esForSpanishReq = identifyReadingLanguage(extractEpubReadingSamples(epubBytes({
+    title: '1984',
+    author: 'George Orwell',
+    language: 'en', // even if metadata wrongly says English, explicit Spanish request accepts Spanish body text!
+    chapters: [
+      `<p>Era un día luminoso y frío de abril y los relojes daban las trece. Winston Smith, con la barbilla clavada en el pecho en su esfuerzo por burlar el molestísimo viento, se deslizó rápidamente por entre las puertas de cristal de las Casas de la Victoria, aunque no con la suficiente rapidez para evitar que una ráfaga polvorienta se colara con él.</p>
+       <p>El vestíbulo olía a repollo hervido y a esteras viejas. Al fondo, un cartel coloreado estaba clavado en la pared y representaba el enorme rostro de un hombre con un gran bigote negro.</p>`,
+      `<p>Dentro del piso una voz melosa leía una lista de cifras que tenían algo que ver con la producción de lingotes de hierro, mientras Winston se acercaba a la ventana para contemplar las calles frías de Londres bajo el cielo pálido de primavera.</p>`,
+    ],
+  })), 'es');
+  assert.equal(esForSpanishReq.status, 'verified');
+  assert.equal(esForSpanishReq.detected, 'es');
+});
+
+test('WORK+LANG E2E: insufficient readable text (cover/TOC/image-scan EPUB) requires review before upload, cools down candidate, and recovers via valid English alternative', async () => {
+  const bridge = established(new BridgeService(bridgeOpts({ secret: 'review-recovery-secret' })), ['hist-1']);
+
+  // Candidate 1: Deceptive dc:language="en", rich English cover & TOC navigation, image-scan pages, and tiny body snippet
+  const scanOnlyEpub = join(root, 'scan-only-1984.epub');
+  writeFileSync(scanOnlyEpub, epubBytes({
+    title: '1984',
+    author: 'George Orwell',
+    language: 'en',
+    extraManifest: '<item id="cover" href="cover.xhtml" media-type="application/xhtml+xml"/><item id="toc" href="toc.xhtml" properties="nav" media-type="application/xhtml+xml"/>',
+    extraSpineBefore: '<itemref idref="cover"/><itemref idref="toc"/>',
+    extraEntries: [
+      ['OEBPS/cover.xhtml', '<html xmlns="http://www.w3.org/1999/xhtml"><body><h1>1984 by George Orwell</h1><p>This cover page contains dozens of English words describing the classic novel so naive extractors might think the book has readable text when it is actually scanned images.</p></body></html>'],
+      ['OEBPS/toc.xhtml', '<html xmlns="http://www.w3.org/1999/xhtml" xmlns:epub="http://www.idpf.org/2007/ops"><body><nav epub:type="toc"><ol><li><a href="ch1.xhtml">Chapter One: The Diary and the Telescreen in Victory Mansions</a></li><li><a href="ch2.xhtml">Chapter Two: Parsons and the Junior Spies</a></li></ol></nav></body></html>'],
+    ],
+    chapters: [
+      '<div><img src="page001.jpg" alt="Scanned page 1 in English"/><p>Scan p.1</p></div>',
+      '<div><img src="page002.jpg" alt="Scanned page 2 in English"/><p>Scan p.2</p></div>',
+    ],
+  }));
+
+  // Candidate 2: Genuine readable English EPUB (with different year/ISBN to confirm zero edition blocking)
+  const goodEnglishEpub = join(root, 'good-english-1984.epub');
+  writeFileSync(goodEnglishEpub, epubBytes({
+    title: '1984',
+    author: 'George Orwell',
+    year: 1961,
+    isbn: '9780451524935',
+    language: null,
+  }));
+
+  const req = request('req-scan-alt', '1984', 'George Orwell', {
+    publishedYear: 2026,
+    isbn13: '9791223228388',
   });
   const fake = apiScenarios({
     requests: [req],
-    books: [metadata('Animal Farm', 'George Orwell')],
+    books: [metadata('1984', 'George Orwell')],
     releases: [
-      release('Animal Farm', 'George Orwell', { source: 'annas', source_id: 'cand-1-wrong', year: null, isbn: null }),
-      release('Animal Farm', 'George Orwell', { source: 'annas', source_id: 'cand-2-good', year: null, isbn: null }),
+      release('1984', 'George Orwell', { source: 'annas', source_id: 'cand-1-scan', year: null, isbn: null, language: 'en' }),
+      release('1984', 'George Orwell', { source: 'annas', source_id: 'cand-2-readable-en', year: 1961, isbn: '9780451524935', language: null }),
     ],
     'sm.download': ({ options }) => {
       const p = expectedJson(options);
-      return response({ task_id: p.source_id === 'cand-1-wrong' ? 'task-cand-1' : 'task-cand-2' });
+      return response({ task_id: p.source_id === 'cand-1-scan' ? 'task-scan-1' : 'task-readable-2' });
     },
     'sm.status': () => response({
       complete: {
-        'task-cand-1': { id: 'task-cand-1', source: 'annas', source_id: 'cand-1-wrong', title: 'Animal Farm', format: 'epub', target: badEpub },
+        'task-scan-1': { id: 'task-scan-1', source: 'annas', source_id: 'cand-1-scan', title: '1984', format: 'epub', target: scanOnlyEpub },
       },
       downloading: {},
       queued: {},
       error: {},
     }),
-    'bo.upload': { id: 8845, title: 'Animal Farm', author: 'George Orwell', year: 1945 },
-    'bo.fulfill': { id: 'req-bounded-alt', status: 'AVAILABLE' },
+    'bo.upload': { id: 8116, title: '1984', author: 'George Orwell' },
+    'bo.fulfill': { id: 'req-scan-alt', status: 'AVAILABLE' },
   });
 
-  // 1. Queues first unknown-year candidate
+  // 1. Queues Candidate 1
   await bridge.processPendingRequests({ fetchFn: fake.fetch });
-  assert.equal(bridge.state.requests['req-bounded-alt'], 'task-cand-1');
+  assert.equal(bridge.state.requests['req-scan-alt'], 'task-scan-1');
 
-  // 2. Webhook for candidate 1 triggers Stage 2 rejection -> cooldown + unmap
+  // 2. Webhook for Candidate 1 detects insufficient readable text -> review_required (NOT uploaded!)
   await bridge.handleWebhook({
-    task: { task_id: 'task-cand-1', source: 'annas', title: 'Animal Farm', format: 'epub' },
-    paths: { target: badEpub, final_paths: [badEpub] },
-  }, 'bounded-alt-secret', fake.fetch);
-  await waitUntil(() => bridge.state.tasks['task-cand-1']?.editionVerificationFailed === true, 2000);
-  assert.equal(fake.called('bo.upload').length, 0);
-  assert.ok(bridge.state.failedReleases['annas:cand-1-wrong'], 'rejected candidate must be cooled down');
-  assert.equal(bridge.state.requestSourceAttempts['req-bounded-alt'], 1);
+    task: { task_id: 'task-scan-1', source: 'annas', title: '1984', format: 'epub' },
+    paths: { target: scanOnlyEpub, final_paths: [scanOnlyEpub] },
+  }, 'review-recovery-secret', fake.fetch);
 
-  // 3. Reconcile runs while task-cand-1 is still in Shelfmark complete AND queues cand-2-good!
+  await waitUntil(() => bridge.state.tasks['task-scan-1']?.verificationFailed === true, 2000);
+  assert.equal(bridge.state.tasks['task-scan-1'].status, 'review_required');
+  assert.equal(fake.called('bo.upload').length, 0, 'insufficient readable evidence must NEVER be uploaded');
+  assert.equal(fake.called('bo.fulfill').length, 0, 'insufficient readable evidence must NEVER be fulfilled');
+  const diagReview = bridge.diagnose('req-scan-alt');
+  assert.equal(diagReview.stage?.stage, 'review_required');
+  assert.ok(diagReview.verificationConflicts.includes('insufficient_language_evidence'));
+  assert.ok(bridge.state.failedReleases['annas:cand-1-scan'], 'insufficient-evidence candidate must cool down so alternative can be tried');
+  assert.equal(bridge.state.requestSourceAttempts['req-scan-alt'], 1);
+
+  // 3. Reconcile does not resurrect task-scan-1 and automatically selects Candidate 2!
   await bridge.reconcile({ fetchFn: fake.fetch });
-  assert.equal(bridge.state.tasks['task-cand-1'].editionVerificationFailed, true, 'reconcile must never resurrect rejected task');
-  assert.equal(bridge.state.requests['req-bounded-alt'], 'task-cand-2', 'second unknown-year candidate must be selected automatically');
-  assert.equal(fake.called('bo.upload').length, 0);
+  assert.equal(bridge.state.tasks['task-scan-1'].status, 'review_required');
+  assert.equal(bridge.state.requests['req-scan-alt'], 'task-readable-2');
 
-  // 4. Webhook for candidate 2 passes Stage 2 verification -> uploads once and fulfills!
+  // 4. Webhook for Candidate 2 verifies actual English body text and fulfills!
   await bridge.handleWebhook({
-    task: { task_id: 'task-cand-2', source: 'annas', title: 'Animal Farm', format: 'epub' },
-    paths: { target: goodEpub, final_paths: [goodEpub] },
-  }, 'bounded-alt-secret', fake.fetch);
-  await waitUntil(() => bridge.state.tasks['task-cand-2']?.status === 'fulfilled', 2000);
+    task: { task_id: 'task-readable-2', source: 'annas', title: '1984', format: 'epub' },
+    paths: { target: goodEnglishEpub, final_paths: [goodEnglishEpub] },
+  }, 'review-recovery-secret', fake.fetch);
+  await waitUntil(() => bridge.state.tasks['task-readable-2']?.status === 'fulfilled', 2000);
   assert.equal(fake.called('bo.upload').length, 1);
   assert.equal(fake.called('bo.fulfill').length, 1);
-  assert.equal(bridge.state.tasks['task-cand-2'].matchedBookId, 8845);
+  assert.equal(bridge.state.tasks['task-readable-2'].matchedBookId, 8116);
   fake.assertKnownRoutes();
+});
+
+function zipBytesDeflate(entries) {
+  const locals = [];
+  const central = [];
+  let offset = 0;
+  for (const [name, value] of entries) {
+    const raw = Buffer.isBuffer(value) ? value : Buffer.from(value, 'utf8');
+    const isMime = name === 'mimetype';
+    const payload = isMime ? raw : deflateRawSync(raw);
+    const method = isMime ? 0 : 8;
+    const filename = Buffer.from(name, 'utf8');
+    const sum = crc32(raw);
+    const local = Buffer.alloc(30);
+    local.writeUInt32LE(0x04034b50, 0);
+    local.writeUInt16LE(20, 4);
+    local.writeUInt16LE(0, 6);
+    local.writeUInt16LE(method, 8);
+    local.writeUInt32LE(sum, 14);
+    local.writeUInt32LE(payload.length, 18);
+    local.writeUInt32LE(raw.length, 22);
+    local.writeUInt16LE(filename.length, 26);
+    locals.push(local, filename, payload);
+
+    const directory = Buffer.alloc(46);
+    directory.writeUInt32LE(0x02014b50, 0);
+    directory.writeUInt16LE(20, 4);
+    directory.writeUInt16LE(20, 6);
+    directory.writeUInt16LE(0, 8);
+    directory.writeUInt16LE(method, 10);
+    directory.writeUInt32LE(sum, 16);
+    directory.writeUInt32LE(payload.length, 20);
+    directory.writeUInt32LE(raw.length, 24);
+    directory.writeUInt16LE(filename.length, 28);
+    directory.writeUInt32LE(offset, 42);
+    central.push(directory, filename);
+    offset += local.length + filename.length + payload.length;
+  }
+  const centralLength = central.reduce((n, b) => n + b.length, 0);
+  const end = Buffer.alloc(22);
+  end.writeUInt32LE(0x06054b50, 0);
+  end.writeUInt16LE(entries.length, 8);
+  end.writeUInt16LE(entries.length, 10);
+  end.writeUInt32LE(centralLength, 12);
+  end.writeUInt32LE(offset, 16);
+  return Buffer.concat([...locals, ...central, end]);
+}
+
+test('WORK+LANG: DEFLATE-compressed EPUB chapters and FlateDecode PDF streams verify actual reading language and reject wrong/scan-only PDFs', () => {
+  // 1. Real-world DEFLATE-compressed EPUB
+  const deflateEpubPath = join(root, 'deflate-1984.epub');
+  const opf = `<?xml version="1.0" encoding="UTF-8"?>
+<package xmlns="http://www.idpf.org/2007/opf" version="3.0">
+  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/"><dc:title>1984</dc:title><dc:creator>George Orwell</dc:creator></metadata>
+  <manifest><item id="c1" href="c1.xhtml" media-type="application/xhtml+xml"/><item id="c2" href="c2.xhtml" media-type="application/xhtml+xml"/></manifest>
+  <spine><itemref idref="c1"/><itemref idref="c2"/></spine>
+</package>`;
+  writeFileSync(deflateEpubPath, zipBytesDeflate([
+    ['mimetype', 'application/epub+zip'],
+    ['META-INF/container.xml', '<?xml version="1.0"?><container xmlns="urn:oasis:names:tc:opendocument:xmlns:container" version="1.0"><rootfiles><rootfile full-path="OEBPS/content.opf" media-type="application/oebps-package+xml"/></rootfiles></container>'],
+    ['OEBPS/content.opf', opf],
+    ['OEBPS/c1.xhtml', `<html><body>${DEFAULT_ENGLISH_CHAPTERS[0]}</body></html>`],
+    ['OEBPS/c2.xhtml', `<html><body>${DEFAULT_ENGLISH_CHAPTERS[1]}</body></html>`],
+  ]));
+  const deflateVer = verifyDownloadedEdition({
+    filePath: deflateEpubPath,
+    format: 'epub',
+    requestTitle: '1984',
+    requestAuthor: 'George Orwell',
+    requestLanguage: 'en',
+  });
+  assert.equal(deflateVer.ok, true, `DEFLATE EPUB must verify cleanly: ${deflateVer.error}`);
+  assert.equal(deflateVer.languageAnalysis.detected, 'en');
+
+  // 2. FlateDecode English PDF vs Spanish PDF vs Scan-Only PDF
+  const makeFlatePdf = (pageTexts) => {
+    const parts = [Buffer.from('%PDF-1.7\n')];
+    pageTexts.forEach((txt, i) => {
+      const content = `BT /F1 12 Tf 72 720 Td (${txt.replace(/[()\\]/g, '')}) Tj ET`;
+      const compressed = deflateSync(Buffer.from(content, 'utf8'));
+      parts.push(Buffer.from(`${i + 1} 0 obj << /Length ${compressed.length} /Filter /FlateDecode >>\nstream\n`));
+      parts.push(compressed);
+      parts.push(Buffer.from('\nendstream\nendobj\n'));
+    });
+    parts.push(Buffer.from('%%EOF\n'));
+    return Buffer.concat(parts);
+  };
+
+  const enPdfPath = join(root, 'english-1984.pdf');
+  writeFileSync(enPdfPath, makeFlatePdf([
+    'It was a bright cold day in April and the clocks were striking thirteen while Winston Smith walked swiftly through the glass doors of Victory Mansions into the hallway.',
+    'Inside the flat a fruity voice was reading out a list of figures which had something to do with the production of pig iron while Winston looked through the window at London.',
+  ]));
+  const enPdfVer = verifyDownloadedEdition({ filePath: enPdfPath, format: 'pdf', requestTitle: '1984', requestAuthor: 'George Orwell', requestLanguage: 'en' });
+  assert.equal(enPdfVer.ok, true);
+
+  const esPdfPath = join(root, 'spanish-1984.pdf');
+  writeFileSync(esPdfPath, makeFlatePdf([
+    'Era un dia luminoso y frio de abril y los relojes daban las trece mientras Winston Smith se deslizaba por entre las puertas de cristal de las Casas de la Victoria en Londres.',
+    'Dentro del piso una voz melosa leia una lista de cifras que tenian algo que ver con la produccion de hierro mientras el viento helado recorria las calles bajo el cielo gris.',
+  ]));
+  const esPdfVer = verifyDownloadedEdition({ filePath: esPdfPath, format: 'pdf', requestTitle: '1984', requestAuthor: 'George Orwell', requestLanguage: 'en' });
+  assert.equal(esPdfVer.ok, false);
+  assert.equal(esPdfVer.outcome, 'reject');
+  assert.ok(esPdfVer.conflicts.includes('language_mismatch'));
+
+  const scanPdfVer = verifyDownloadedEdition({ filePath: FILES.validPdf, format: 'pdf', requestTitle: '1984', requestAuthor: 'George Orwell', requestLanguage: 'en' });
+  assert.equal(scanPdfVer.ok, false);
+  assert.equal(scanPdfVer.outcome, 'review');
+  assert.ok(scanPdfVer.conflicts.includes('insufficient_language_evidence'));
 });
 
 

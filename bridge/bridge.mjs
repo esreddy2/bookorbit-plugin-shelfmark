@@ -279,6 +279,850 @@ export function extractEpubMetadataFromFile(filePath) {
   }
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// EPUB Spine Reading-Text Extraction & Unicode-Aware Language Identification
+// ─────────────────────────────────────────────────────────────────────────────
+
+const HTML_NAMED_ENTITIES = {
+  nbsp: ' ', amp: '&', lt: '<', gt: '>', quot: '"', apos: "'",
+  mdash: '—', ndash: '–', lsquo: '‘', rsquo: '’', ldquo: '“', rdquo: '”',
+   sbquo: '‚', bdquo: '„', laquo: '«', raquo: '»', hellip: '…', shy: '',
+  iexcl: '¡', iquest: '¿',
+  aacute: 'á', eacute: 'é', iacute: 'í', oacute: 'ó', uacute: 'ú', yacute: 'ý',
+  Aacute: 'Á', Eacute: 'É', Iacute: 'Í', Oacute: 'Ó', Uacute: 'Ú', Yacute: 'Ý',
+  agrave: 'à', egrave: 'è', igrave: 'ì', ograve: 'ò', ugrave: 'ù',
+  Agrave: 'À', Egrave: 'È', Igrave: 'Ì', Ograve: 'Ò', Ugrave: 'Ù',
+  acirc: 'â', ecirc: 'ê', icirc: 'î', ocirc: 'ô', ucirc: 'û',
+  Acirc: 'Â', Ecirc: 'Ê', Icirc: 'Î', Ocirc: 'Ô', Ucirc: 'Û',
+  atilde: 'ã', ntilde: 'ñ', otilde: 'õ',
+  Atilde: 'Ã', Ntilde: 'Ñ', Otilde: 'Õ',
+  auml: 'ä', euml: 'ë', iuml: 'ï', ouml: 'ö', uuml: 'ü', yuml: 'ÿ',
+  Auml: 'Ä', Euml: 'Ë', Iuml: 'Ï', Ouml: 'Ö', Uuml: 'Ü', Yuml: 'Ÿ',
+  aring: 'å', Aring: 'Å', aelig: 'æ', AElig: 'Æ', oslash: 'ø', Oslash: 'Ø',
+  oelig: 'œ', OElig: 'Œ', ccedil: 'ç', Ccedil: 'Ç', szlig: 'ß', eth: 'ð', thorn: 'þ',
+};
+
+function decodeHtmlEntities(str) {
+  if (!str) return '';
+  return String(str).replace(/&(?:#x([0-9a-fA-F]{1,6})|#(\d{1,7})|([a-zA-Z]{2,10}));/g, (full, hex, dec, named) => {
+    if (hex) {
+      const code = parseInt(hex, 16);
+      return Number.isFinite(code) && code > 0 && code <= 0x10ffff ? String.fromCodePoint(code) : full;
+    }
+    if (dec) {
+      const code = parseInt(dec, 10);
+      return Number.isFinite(code) && code > 0 && code <= 0x10ffff ? String.fromCodePoint(code) : full;
+    }
+    if (named && Object.prototype.hasOwnProperty.call(HTML_NAMED_ENTITIES, named)) {
+      return HTML_NAMED_ENTITIES[named];
+    }
+    return full;
+  });
+}
+
+function decodeTextBuffer(buf) {
+  if (!buf || buf.length === 0) return '';
+  if (buf.length >= 2 && buf[0] === 0xff && buf[1] === 0xfe) {
+    return buf.subarray(2).toString('utf16le');
+  }
+  if (buf.length >= 2 && buf[0] === 0xfe && buf[1] === 0xff) {
+    const swapped = Buffer.allocUnsafe(buf.length - 2);
+    for (let i = 2; i + 1 < buf.length; i += 2) {
+      swapped[i - 2] = buf[i + 1];
+      swapped[i - 1] = buf[i];
+    }
+    return swapped.toString('utf16le');
+  }
+  if (buf.length >= 3 && buf[0] === 0xef && buf[1] === 0xbb && buf[2] === 0xbf) {
+    return buf.subarray(3).toString('utf8');
+  }
+  return buf.toString('utf8');
+}
+
+function normalizeZipPath(p) {
+  const raw = String(p || '').replace(/\\/g, '/').split('#')[0].split('?')[0];
+  let decoded = raw;
+  try { decoded = decodeURIComponent(raw); } catch {}
+  const parts = [];
+  for (const seg of decoded.split('/')) {
+    if (!seg || seg === '.') continue;
+    if (seg === '..') { parts.pop(); continue; }
+    parts.push(seg);
+  }
+  return parts.join('/');
+}
+
+function resolveRelativeZipPath(baseDir, href) {
+  const cleanHref = String(href || '').replace(/\\/g, '/').split('#')[0].split('?')[0];
+  if (!cleanHref) return '';
+  if (cleanHref.startsWith('/')) return normalizeZipPath(cleanHref);
+  return normalizeZipPath(baseDir ? `${baseDir}/${cleanHref}` : cleanHref);
+}
+
+function extractXmlAttr(tagAttrs, attrName) {
+  if (!tagAttrs) return '';
+  const re = new RegExp(`(?:^|\\s)${attrName}\\s*=\\s*(?:"([^"]*)"|'([^']*)')`, 'i');
+  const m = tagAttrs.match(re);
+  return m ? decodeHtmlEntities(m[1] ?? m[2] ?? '').trim() : '';
+}
+
+function readZipArchiveEntries(buffer) {
+  const entries = new Map();
+  if (!buffer || !Buffer.isBuffer(buffer) || buffer.length < 30) return entries;
+
+  const makeLazyEntry = (name, method, dataStart, dataEnd) => {
+    const norm = normalizeZipPath(name);
+    if (!norm || dataStart < 0 || dataEnd > buffer.length || dataEnd < dataStart) return;
+    let cached = undefined;
+    entries.set(norm, {
+      name: norm,
+      readText() {
+        if (cached !== undefined) return cached;
+        try {
+          let raw = null;
+          if (method === 0) {
+            raw = buffer.subarray(dataStart, dataEnd);
+          } else if (method === 8) {
+            raw = zlib.inflateRawSync(buffer.subarray(dataStart, dataEnd));
+          }
+          cached = raw ? decodeTextBuffer(raw) : null;
+        } catch {
+          cached = null;
+        }
+        return cached;
+      },
+    });
+  };
+
+  // 1. Prefer ZIP Central Directory (handles bit-3 streaming data descriptors accurately)
+  const maxCommentSearch = Math.max(0, buffer.length - 65558);
+  let eocdOffset = -1;
+  for (let i = buffer.length - 22; i >= maxCommentSearch; i--) {
+    if (buffer.readUInt32LE(i) === 0x06054b50) {
+      eocdOffset = i;
+      break;
+    }
+  }
+  if (eocdOffset !== -1) {
+    const cdEntries = buffer.readUInt16LE(eocdOffset + 10);
+    const cdOffset = buffer.readUInt32LE(eocdOffset + 16);
+    let pos = cdOffset;
+    for (let i = 0; i < cdEntries && pos + 46 <= buffer.length; i++) {
+      if (buffer.readUInt32LE(pos) !== 0x02014b50) break;
+      const method = buffer.readUInt16LE(pos + 10);
+      const compressedSize = buffer.readUInt32LE(pos + 20);
+      const nameLen = buffer.readUInt16LE(pos + 28);
+      const extraLen = buffer.readUInt16LE(pos + 30);
+      const commentLen = buffer.readUInt16LE(pos + 32);
+      const localOffset = buffer.readUInt32LE(pos + 42);
+      const name = buffer.toString('utf8', pos + 46, pos + 46 + nameLen);
+      pos += 46 + nameLen + extraLen + commentLen;
+
+      if (localOffset + 30 <= buffer.length && buffer.readUInt32LE(localOffset) === 0x04034b50) {
+        const localNameLen = buffer.readUInt16LE(localOffset + 26);
+        const localExtraLen = buffer.readUInt16LE(localOffset + 28);
+        const dataStart = localOffset + 30 + localNameLen + localExtraLen;
+        const dataEnd = dataStart + compressedSize;
+        makeLazyEntry(name, method, dataStart, dataEnd);
+      }
+    }
+    if (entries.size > 0) return entries;
+  }
+
+  // 2. Fallback: local file headers for synthetic local-header-only buffers
+  let offset = 0;
+  while (offset <= buffer.length - 30) {
+    if (buffer.readUInt32LE(offset) !== 0x04034b50) break;
+    const method = buffer.readUInt16LE(offset + 8);
+    const compressedSize = buffer.readUInt32LE(offset + 18);
+    const nameLen = buffer.readUInt16LE(offset + 26);
+    const extraLen = buffer.readUInt16LE(offset + 28);
+    const name = buffer.toString('utf8', offset + 30, offset + 30 + nameLen);
+    const dataStart = offset + 30 + nameLen + extraLen;
+    const dataEnd = dataStart + compressedSize;
+    if (dataEnd > buffer.length) break;
+    makeLazyEntry(name, method, dataStart, dataEnd);
+    if (compressedSize === 0 && dataEnd === offset) break;
+    offset = dataEnd;
+  }
+  return entries;
+}
+
+const NON_READING_FILE_STEM_RE = /^(?:cover(?:[-_]?page)?|title(?:[-_]?page)?|half[-_]?title|toc|nav(?:igation)?|contents|copyright(?:[-_]?page)?|colophon|imprint|front[-_]?matter|back[-_]?matter|about[-_]?the[-_]?author|also[-_]?by|acknowledge?ments?|dedication|ads?|promo|license|pg[-_]?(?:header|footer)|footnotes?|endnotes?|glossary|index|bibliography)(?:[-_]?\d+)?$/i;
+
+const BOILERPLATE_LINE_RE = /(?:project gutenberg|all rights reserved|library of congress cataloging|printed in the united states|isbn[\s:-]*[0-9x-]{10,}|https?:\/\/|www\.[a-z0-9.-]+\.[a-z]{2,}|this ebook is for the use of anyone|terms of use|creative commons)/i;
+
+const STRUCTURAL_HEADING_RE = /^(?:chapter|part|book|section|volume|act|scene|prologue|epilogue|cap[ií]tulo|chapitre|kapitel|parte|livre|teil)\s*(?:[ivxlcdm]+|\d+|one|two|three|four|five|six|seven|eight|nine|ten)?[.:\-—\s]*$/i;
+
+function cleanXhtmlToParagraphs(xhtml) {
+  if (!xhtml || typeof xhtml !== 'string') return [];
+  let s = xhtml;
+  // Remove comments, head, scripts, styles, svg, math, nav blocks, and images
+  s = s.replace(/<!--[\s\S]*?-->/g, ' ');
+  s = s.replace(/<head\b[^>]*>[\s\S]*?<\/head>/gi, ' ');
+  s = s.replace(/<script\b[^>]*>[\s\S]*?<\/script>/gi, ' ');
+  s = s.replace(/<style\b[^>]*>[\s\S]*?<\/style>/gi, ' ');
+  s = s.replace(/<svg\b[^>]*>[\s\S]*?<\/svg>/gi, ' ');
+  s = s.replace(/<math\b[^>]*>[\s\S]*?<\/math>/gi, ' ');
+  s = s.replace(/<noscript\b[^>]*>[\s\S]*?<\/noscript>/gi, ' ');
+  // Strip <nav> blocks (including nested TOCs / landmarks) iteratively without catastrophic backtracking
+  for (let i = 0; i < 6 && /<nav\b/i.test(s); i++) {
+    const next = s.replace(/<nav\b[^>]*>(?:(?!<nav\b)[\s\S])*?<\/nav>/gi, ' ');
+    if (next === s) break;
+    s = next;
+  }
+  // Strip explicit cover / toc / copyright / landmarks sections when marked via epub:type or role
+  s = s.replace(/<(section|div|aside|header|footer)\b[^>]*(?:epub:type|role)\s*=\s*["'][^"']*\b(?:toc|landmarks|page-list|cover|titlepage|copyright-page|colophon|imprint)\b[^"']*["'][^>]*>[\s\S]*?<\/\1>/gi, ' ');
+  // Strip self-closing/inline image tags completely so alt attributes never masquerade as reading prose
+  s = s.replace(/<img\b[^>]*>/gi, ' ');
+
+  // Convert block-level boundaries to newlines, strip remaining tags, decode entities
+  s = s.replace(/<\/?(?:p|div|section|article|blockquote|li|h[1-6]|tr|br|hr)\b[^>]*>/gi, '\n');
+  s = s.replace(/<[^>]+>/g, ' ');
+  s = decodeHtmlEntities(s);
+
+  const paragraphs = [];
+  for (const rawLine of s.split(/\r?\n+/)) {
+    const line = rawLine.replace(/\s+/g, ' ').trim();
+    if (!line) continue;
+    if (BOILERPLATE_LINE_RE.test(line)) continue;
+    if (STRUCTURAL_HEADING_RE.test(line)) continue;
+    // Drop TOC dot-leader or page-number lines
+    if (/\.{3,}\s*\d+$/.test(line)) continue;
+    const letters = line.match(/\p{L}/gu);
+    const letterCount = letters ? letters.length : 0;
+    if (letterCount < 4) continue;
+    const digits = line.match(/\p{N}/gu);
+    const digitCount = digits ? digits.length : 0;
+    if (digitCount > letterCount) continue;
+    paragraphs.push(line);
+  }
+  return paragraphs;
+}
+
+function countEffectiveWordsInText(text) {
+  if (!text) return 0;
+  const wordTokens = text.match(/\p{L}+(?:['’\-]\p{L}+)*/gu) || [];
+  const cjkChars = text.match(/[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}]/gu) || [];
+  return wordTokens.length + Math.floor(cjkChars.length / 2);
+}
+
+function buildDistributedPassagesFromDocs(docs, maxPassages = 16) {
+  // Partition reading paragraphs across spine documents into substantive passages (~70-180 words)
+  const rawPassages = [];
+  for (const doc of docs) {
+    let curLines = [];
+    let curWords = 0;
+    for (const para of doc.paragraphs) {
+      const w = countEffectiveWordsInText(para);
+      if (w === 0) continue;
+      // Split unusually huge single paragraphs (>260 words) into sentence chunks
+      if (w > 260 && curWords === 0) {
+        const sentences = para.split(/(?<=[.!?。！？])\s+/u);
+        for (const sent of sentences) {
+          const sw = countEffectiveWordsInText(sent);
+          if (sw === 0) continue;
+          curLines.push(sent);
+          curWords += sw;
+          if (curWords >= 100) {
+            rawPassages.push({ source: doc.path, text: curLines.join(' '), words: curWords });
+            curLines = [];
+            curWords = 0;
+          }
+        }
+        continue;
+      }
+      curLines.push(para);
+      curWords += w;
+      if (curWords >= 90) {
+        rawPassages.push({ source: doc.path, text: curLines.join(' '), words: curWords });
+        curLines = [];
+        curWords = 0;
+      }
+    }
+    if (curWords > 0) {
+      if (rawPassages.length > 0 && curWords < 25 && rawPassages[rawPassages.length - 1].source === doc.path) {
+        rawPassages[rawPassages.length - 1].text += ' ' + curLines.join(' ');
+        rawPassages[rawPassages.length - 1].words += curWords;
+      } else {
+        rawPassages.push({ source: doc.path, text: curLines.join(' '), words: curWords });
+      }
+    }
+  }
+
+  // If a compact book produced only 1 passage with >= 36 words, split into two balanced halves
+  // so language identification always evaluates multiple non-identical passages.
+  if (rawPassages.length === 1 && rawPassages[0].words >= 36) {
+    const tokens = rawPassages[0].text.split(/\s+/);
+    if (tokens.length >= 10) {
+      const mid = Math.floor(tokens.length / 2);
+      const firstHalf = tokens.slice(0, mid).join(' ');
+      const secondHalf = tokens.slice(mid).join(' ');
+      return [
+        { source: rawPassages[0].source, text: firstHalf, words: countEffectiveWordsInText(firstHalf) },
+        { source: rawPassages[0].source, text: secondHalf, words: countEffectiveWordsInText(secondHalf) },
+      ];
+    }
+    const chars = [...rawPassages[0].text];
+    if (chars.length >= 80) {
+      const mid = Math.floor(chars.length / 2);
+      const firstHalf = chars.slice(0, mid).join('');
+      const secondHalf = chars.slice(mid).join('');
+      return [
+        { source: rawPassages[0].source, text: firstHalf, words: countEffectiveWordsInText(firstHalf) },
+        { source: rawPassages[0].source, text: secondHalf, words: countEffectiveWordsInText(secondHalf) },
+      ];
+    }
+  }
+
+  if (rawPassages.length <= maxPassages) {
+    return rawPassages;
+  }
+
+  // Evenly sample across the entire interior/body of the book
+  const sampled = [];
+  const used = new Set();
+  for (let k = 0; k < maxPassages; k++) {
+    const idx = Math.min(rawPassages.length - 1, Math.floor(((k + 0.5) * rawPassages.length) / maxPassages));
+    if (!used.has(idx)) {
+      used.add(idx);
+      sampled.push(rawPassages[idx]);
+    }
+  }
+  return sampled;
+}
+
+/**
+ * Extracts multi-passage actual reading text samples across an EPUB buffer,
+ * following OPF spine order and excluding cover pages, navigation/TOC, copyright,
+ * scripts, styles, and image tags.
+ */
+export function extractEpubReadingSamples(buffer) {
+  const entries = readZipArchiveEntries(buffer);
+  if (entries.size === 0) {
+    return { ok: false, passages: [], spineCount: 0, sampledDocs: 0, totalWords: 0 };
+  }
+
+  // Locate OPF via META-INF/container.xml or fallback *.opf
+  let opfPath = '';
+  const containerEntry = entries.get('META-INF/container.xml') ||
+    [...entries.values()].find((e) => e.name.toLowerCase() === 'meta-inf/container.xml');
+  if (containerEntry) {
+    const containerXml = containerEntry.readText() || '';
+    const rfMatch = containerXml.match(/<rootfile\b[^>]*full-path\s*=\s*["']([^"']+)["']/i);
+    if (rfMatch && rfMatch[1]) {
+      opfPath = normalizeZipPath(rfMatch[1]);
+    }
+  }
+  let opfEntry = opfPath ? entries.get(opfPath) : null;
+  if (!opfEntry) {
+    opfEntry = [...entries.values()].find((e) => e.name.toLowerCase().endsWith('.opf')) || null;
+    if (opfEntry) opfPath = opfEntry.name;
+  }
+
+  const opfDir = opfPath.includes('/') ? opfPath.slice(0, opfPath.lastIndexOf('/')) : '';
+  const opfXml = opfEntry ? (opfEntry.readText() || '') : '';
+
+  const excludedPaths = new Set();
+  const manifest = new Map();
+  const spinePaths = [];
+
+  if (opfXml) {
+    // Parse <guide> references to exclude cover / toc / title-page / copyright / colophon
+    for (const gm of opfXml.matchAll(/<reference\b([^>]*)\/?>/gi)) {
+      const attrs = gm[1] || '';
+      const gType = extractXmlAttr(attrs, 'type').toLowerCase();
+      const gHref = extractXmlAttr(attrs, 'href');
+      if (gHref && /^(?:cover|title-page|titlepage|toc|copyright-page|copyright|colophon|acknowledgements?|dedication|glossary|index|bibliography)/i.test(gType)) {
+        excludedPaths.add(resolveRelativeZipPath(opfDir, gHref));
+      }
+    }
+
+    // Parse <manifest> items
+    for (const im of opfXml.matchAll(/<item\b([^>]*)\/?>/gi)) {
+      const attrs = im[1] || '';
+      const id = extractXmlAttr(attrs, 'id');
+      const href = extractXmlAttr(attrs, 'href');
+      const mediaType = extractXmlAttr(attrs, 'media-type').toLowerCase();
+      const props = extractXmlAttr(attrs, 'properties').toLowerCase();
+      if (!id || !href) continue;
+      const resolved = resolveRelativeZipPath(opfDir, href);
+      manifest.set(id, { id, href, resolved, mediaType, props });
+      if (/\b(?:nav|cover-image)\b/.test(props)) {
+        excludedPaths.add(resolved);
+      }
+    }
+
+    // Parse <spine> reading order
+    for (const sm of opfXml.matchAll(/<itemref\b([^>]*)\/?>/gi)) {
+      const attrs = sm[1] || '';
+      const idref = extractXmlAttr(attrs, 'idref');
+      const linear = extractXmlAttr(attrs, 'linear').toLowerCase();
+      if (!idref || linear === 'no') continue;
+      const item = manifest.get(idref);
+      if (!item) continue;
+      const isHtml = !item.mediaType ||
+        item.mediaType.includes('xhtml') ||
+        item.mediaType.includes('html') ||
+        /\.(?:xhtml|html|htm|xml)$/i.test(item.resolved);
+      if (!isHtml) continue;
+      if (excludedPaths.has(item.resolved)) continue;
+      const stem = path.basename(item.resolved).replace(/\.[^.]+$/, '');
+      if (NON_READING_FILE_STEM_RE.test(item.id) || NON_READING_FILE_STEM_RE.test(stem)) continue;
+      if (!spinePaths.includes(item.resolved)) {
+        spinePaths.push(item.resolved);
+      }
+    }
+  }
+
+  // Fallback if OPF lacked <spine> items: inspect HTML/XHTML archive entries in order
+  if (spinePaths.length === 0) {
+    for (const entry of entries.values()) {
+      if (!/\.(?:xhtml|html|htm)$/i.test(entry.name)) continue;
+      if (excludedPaths.has(entry.name)) continue;
+      const stem = path.basename(entry.name).replace(/\.[^.]+$/, '');
+      if (NON_READING_FILE_STEM_RE.test(stem)) continue;
+      spinePaths.push(entry.name);
+    }
+  }
+
+  // Evenly select up to 24 spine documents if the EPUB has hundreds of tiny chapter files
+  let docsToRead = spinePaths;
+  if (spinePaths.length > 24) {
+    docsToRead = [];
+    const seenIdx = new Set();
+    for (let k = 0; k < 24; k++) {
+      const idx = Math.min(spinePaths.length - 1, Math.floor(((k + 0.5) * spinePaths.length) / 24));
+      if (!seenIdx.has(idx)) {
+        seenIdx.add(idx);
+        docsToRead.push(spinePaths[idx]);
+      }
+    }
+  }
+
+  const parsedDocs = [];
+  for (const docPath of docsToRead) {
+    const entry = entries.get(docPath) ||
+      [...entries.values()].find((e) => e.name.toLowerCase() === docPath.toLowerCase());
+    if (!entry) continue;
+    const rawHtml = entry.readText();
+    if (!rawHtml) continue;
+    const paragraphs = cleanXhtmlToParagraphs(rawHtml);
+    if (paragraphs.length > 0) {
+      parsedDocs.push({ path: docPath, paragraphs });
+    }
+  }
+
+  const passages = buildDistributedPassagesFromDocs(parsedDocs, 16);
+  const totalWords = passages.reduce((sum, p) => sum + p.words, 0);
+  return {
+    ok: true,
+    passages,
+    spineCount: spinePaths.length,
+    sampledDocs: parsedDocs.length,
+    totalWords,
+  };
+}
+
+export function extractEpubReadingSamplesFromFile(filePath) {
+  try {
+    if (!filePath || !fs.existsSync(filePath)) {
+      return { ok: false, passages: [], spineCount: 0, sampledDocs: 0, totalWords: 0 };
+    }
+    const buf = fs.readFileSync(filePath);
+    return extractEpubReadingSamples(buf);
+  } catch {
+    return { ok: false, passages: [], spineCount: 0, sampledDocs: 0, totalWords: 0 };
+  }
+}
+
+/**
+ * Extracts readable text passages from PDF content streams (uncompressed and /FlateDecode).
+ */
+export function extractPdfReadingSamples(buffer) {
+  if (!buffer || !Buffer.isBuffer(buffer) || buffer.length < 16) {
+    return { ok: false, passages: [], totalWords: 0 };
+  }
+  const paragraphs = [];
+  const latin1 = buffer.toString('latin1');
+  let searchPos = 0;
+  let streamCount = 0;
+  while (searchPos < latin1.length && streamCount < 60) {
+    const sIdx = latin1.indexOf('stream', searchPos);
+    if (sIdx === -1) break;
+    // Confirm 'stream' is followed by \n or \r\n
+    let dataStart = -1;
+    if (latin1[sIdx + 6] === '\n') dataStart = sIdx + 7;
+    else if (latin1[sIdx + 6] === '\r' && latin1[sIdx + 7] === '\n') dataStart = sIdx + 8;
+    if (dataStart === -1) {
+      searchPos = sIdx + 6;
+      continue;
+    }
+    const eIdx = latin1.indexOf('endstream', dataStart);
+    if (eIdx === -1) break;
+    searchPos = eIdx + 9;
+    streamCount++;
+
+    const dictSlice = latin1.slice(Math.max(0, sIdx - 250), sIdx);
+    const rawSlice = buffer.subarray(dataStart, eIdx).subarray(0, 512 * 1024);
+    let content = '';
+    try {
+      if (/\/FlateDecode\b/.test(dictSlice)) {
+        // Trim trailing CR/LF before inflating if needed
+        let endTrim = rawSlice.length;
+        while (endTrim > 0 && (rawSlice[endTrim - 1] === 0x0a || rawSlice[endTrim - 1] === 0x0d)) endTrim--;
+        const inflated = zlib.inflateSync(rawSlice.subarray(0, endTrim));
+        content = inflated.toString('utf8');
+      } else if (!/\/(?:DCTDecode|JPXDecode|JBIG2Decode|CCITTFaxDecode)\b/.test(dictSlice)) {
+        content = rawSlice.toString('utf8');
+      }
+    } catch {
+      continue;
+    }
+    if (!content || !content.includes('BT')) continue;
+    const chunks = [];
+    for (const btMatch of content.matchAll(/\bBT\b([\s\S]*?)\bET\b/g)) {
+      const block = btMatch[1] || '';
+      for (const lit of block.matchAll(/\((?:\\.|[^\\()])*\)/g)) {
+        const inner = lit[0].slice(1, -1)
+          .replace(/\\([nrtbf()\\])/g, (_, c) => (c === 'n' || c === 'r' ? ' ' : c))
+          .replace(/\\([0-7]{3})/g, (_, oct) => String.fromCharCode(parseInt(oct, 8)));
+        chunks.push(inner);
+      }
+    }
+    const joined = chunks.join(' ').replace(/\s+/g, ' ').trim();
+    if (countEffectiveWordsInText(joined) >= 6) {
+      paragraphs.push(joined);
+    }
+  }
+  const passages = buildDistributedPassagesFromDocs([{ path: 'pdf', paragraphs }], 16);
+  const totalWords = passages.reduce((sum, p) => sum + p.words, 0);
+  return { ok: true, passages, totalWords };
+}
+
+// Closed-class function-word lexicons for Unicode-aware Latin & Cyrillic language identification.
+// Note: Diacritics or non-ASCII ratios are NEVER used against English, so accented loanwords,
+// names, curly typography, and brief foreign phrases in English prose are handled cleanly.
+const LANGUAGE_STOPWORDS = {
+  en: new Set([
+    'the', 'and', 'that', 'with', 'from', 'have', 'this', 'they', 'were', 'would',
+    'which', 'their', 'there', 'been', 'through', 'into', 'before', 'after', 'about', 'could',
+    'when', 'what', 'while', 'under', 'between', 'without', 'because', 'against', 'himself', 'herself',
+    'nothing', 'something', 'though', 'should', 'where', 'those', 'these', 'other', 'every', 'again',
+    'never', 'always', 'still', 'upon', 'only', 'over', 'some', 'such', 'than', 'them',
+    'then', 'very', 'was', 'had', 'his', 'her', 'she', 'you', 'your', 'not', 'but', 'for', 'are', 'who',
+  ]),
+  es: new Set([
+    'el', 'la', 'los', 'las', 'del', 'al', 'una', 'unos', 'unas', 'que',
+    'por', 'para', 'con', 'como', 'más', 'pero', 'sus', 'les', 'está', 'estaba',
+    'había', 'fueron', 'hacia', 'desde', 'hasta', 'entre', 'sobre', 'también', 'cuando', 'donde',
+    'quien', 'todo', 'todos', 'esta', 'este', 'estos', 'estas', 'tiene', 'tenía', 'puede',
+    'mismo', 'tiempo', 'después', 'siempre', 'nunca', 'aunque', 'sino', 'porque', 'durante', 'contra',
+    'era', 'eran', 'fue', 'muy', 'sin', 'ella', 'ellos', 'ellas', 'nosotros', 'usted',
+  ]),
+  pt: new Set([
+    'os', 'as', 'um', 'uma', 'uns', 'umas', 'dos', 'das', 'nos', 'nas',
+    'pelo', 'pela', 'pelos', 'pelas', 'não', 'nao', 'são', 'sao', 'está', 'estava',
+    'tinha', 'foram', 'muito', 'mais', 'mas', 'como', 'para', 'com', 'seu', 'sua',
+    'seus', 'suas', 'dele', 'dela', 'isso', 'isto', 'aquele', 'aquela', 'quando', 'onde',
+    'também', 'tambem', 'ainda', 'depois', 'então', 'entao', 'mesmo', 'sobre', 'entre', 'até',
+    'você', 'voce', 'eles', 'elas', 'porque', 'sem', 'pelos', 'num', 'numa',
+  ]),
+  fr: new Set([
+    'le', 'la', 'les', 'des', 'du', 'au', 'aux', 'une', 'dans', 'pour',
+    'pas', 'plus', 'par', 'sur', 'avec', 'tout', 'tous', 'mais', 'donc', 'comme',
+    'était', 'etait', 'avait', 'sont', 'être', 'etre', 'avoir', 'cette', 'cet', 'ces',
+    'leurs', 'leur', 'même', 'meme', 'aussi', 'bien', 'sans', 'sous', 'après', 'apres',
+    'avant', 'encore', 'toujours', 'jamais', 'depuis', 'pendant', 'contre', 'chez', 'très', 'tres',
+    'dont', 'quand', 'qui', 'elle', 'ils', 'elles', 'nous', 'vous', 'était', 'fait',
+  ]),
+  de: new Set([
+    'der', 'die', 'das', 'den', 'dem', 'des', 'ein', 'eine', 'einer', 'einem',
+    'einen', 'eines', 'und', 'nicht', 'mit', 'sich', 'auf', 'für', 'fur', 'ist',
+    'war', 'sind', 'waren', 'hatte', 'haben', 'wird', 'wurde', 'werden', 'auch', 'als',
+    'nach', 'wie', 'über', 'uber', 'aus', 'bei', 'nur', 'noch', 'dann', 'wenn',
+    'aber', 'oder', 'doch', 'schon', 'durch', 'gegen', 'unter', 'zwischen', 'während', 'ohne',
+    'seine', 'seiner', 'seinem', 'ihre', 'ihrer', 'einem', 'dieser', 'diese', 'dieses',
+  ]),
+  it: new Set([
+    'il', 'lo', 'gli', 'della', 'dello', 'delle', 'degli', 'dei', 'nel', 'nella',
+    'nello', 'nelle', 'negli', 'nei', 'sul', 'sulla', 'che', 'non', 'per', 'con',
+    'una', 'uno', 'sono', 'era', 'erano', 'aveva', 'hanno', 'stato', 'più', 'piu',
+    'come', 'anche', 'questo', 'questa', 'questi', 'queste', 'quello', 'quella', 'suo', 'sua',
+    'suoi', 'sue', 'loro', 'dopo', 'prima', 'ancora', 'sempre', 'molto', 'tutto', 'tutti',
+    'perché', 'perche', 'quando', 'dove', 'senza', 'contro', 'dalla', 'dalle',
+  ]),
+  nl: new Set([
+    'de', 'het', 'een', 'van', 'dat', 'zijn', 'voor', 'met', 'niet', 'aan',
+    'ook', 'als', 'dan', 'maar', 'bij', 'nog', 'uit', 'naar', 'haar', 'hun',
+    'hem', 'werd', 'werden', 'hadden', 'heeft', 'hebben', 'zou', 'zouden', 'deze', 'dit',
+    'geen', 'veel', 'meer', 'door', 'tegen', 'onder', 'tussen', 'zonder', 'omdat', 'wanneer',
+  ]),
+  pl: new Set([
+    'nie', 'się', 'sie', 'jest', 'jak', 'ale', 'czy', 'już', 'juz', 'tylko',
+    'jego', 'jej', 'ich', 'był', 'byl', 'była', 'byla', 'było', 'bylo', 'byli',
+    'będzie', 'bedzie', 'przez', 'przy', 'przed', 'między', 'miedzy', 'bardzo', 'kiedy', 'gdzie',
+    'który', 'ktory', 'która', 'ktora', 'które', 'ktore', 'tego', 'tej', 'tym', 'tych', 'więc', 'jeszcze',
+  ]),
+  lt: new Set([
+    'kad', 'jis', 'jie', 'jos', 'tai', 'bet', 'jau', 'tik', 'buvo', 'yra',
+    'bus', 'kaip', 'kai', 'kur', 'kas', 'jog', 'nes', 'tačiau', 'taciau', 'todėl',
+    'todel', 'apie', 'prie', 'tarp', 'už', 'iš', 'ją', 'jų', 'jam', 'jai',
+    'save', 'savo', 'šis', 'ši', 'labai', 'dabar', 'dar', 'nebuvo', 'kuris', 'kuri',
+  ]),
+  sv: new Set([
+    'och', 'det', 'att', 'som', 'en', 'på', 'är', 'för', 'med', 'till',
+    'den', 'har', 'inte', 'om', 'ett', 'han', 'hon', 'men', 'var', 'jag',
+    'sig', 'från', 'vi', 'så', 'kan', 'man', 'när', 'hade', 'skulle', 'också',
+  ]),
+  id: new Set([
+    'yang', 'dan', 'itu', 'dengan', 'untuk', 'tidak', 'ini', 'dari', 'dalam', 'akan',
+    'pada', 'juga', 'saya', 'karena', 'tersebut', 'bisa', 'ada', 'mereka', 'lebih', 'sudah',
+    'atau', 'saat', 'oleh', 'sebagai', 'hanya', 'namun', 'ketika', 'bahwa', 'belum', 'kita',
+  ]),
+  tr: new Set([
+    'bir', 've', 'bu', 'için', 'icin', 'ile', 'olan', 'gibi', 'daha', 'çok',
+    'cok', 'ama', 'fakat', 'sonra', 'kadar', 'olarak', 'onun', 'bunu', 'öyle', 'oyle',
+    'kendi', 'ancak', 'değil', 'degil', 'her', 'hiç', 'hic', 'zaman', 'nasıl', 'nasil',
+  ]),
+  ru: new Set([
+    'и', 'в', 'не', 'на', 'что', 'он', 'она', 'они', 'как', 'это',
+    'по', 'но', 'из', 'за', 'то', 'же', 'от', 'было', 'был', 'была',
+    'для', 'его', 'ее', 'их', 'когда', 'только', 'уже', 'если', 'все', 'так',
+    'при', 'еще', 'ещё', 'нет', 'даже', 'через', 'между', 'после', 'чтобы', 'себя',
+  ]),
+  uk: new Set([
+    'і', 'та', 'що', 'не', 'на', 'він', 'вона', 'вони', 'як', 'це',
+    'від', 'але', 'за', 'до', 'був', 'була', 'було', 'для', 'його', 'її',
+    'їх', 'коли', 'тільки', 'вже', 'якщо', 'все', 'так', 'при', 'ще', 'між', 'після', 'щоб',
+  ]),
+};
+
+function scorePassageLanguages(text) {
+  const scores = {};
+  const letters = text.match(/\p{L}/gu) || [];
+  const totalLetters = letters.length;
+  if (totalLetters === 0) return { scores, topLang: null, topScore: 0, secondScore: 0, effectiveWords: 0, totalLetters: 0 };
+
+  const hangulCount = (text.match(/\p{Script=Hangul}/gu) || []).length;
+  const kanaCount = (text.match(/[\p{Script=Hiragana}\p{Script=Katakana}]/gu) || []).length;
+  const hanCount = (text.match(/\p{Script=Han}/gu) || []).length;
+  const cyrillicCount = (text.match(/\p{Script=Cyrillic}/gu) || []).length;
+  const arabicCount = (text.match(/\p{Script=Arabic}/gu) || []).length;
+  const hebrewCount = (text.match(/\p{Script=Hebrew}/gu) || []).length;
+  const greekCount = (text.match(/\p{Script=Greek}/gu) || []).length;
+  const devanagariCount = (text.match(/\p{Script=Devanagari}/gu) || []).length;
+  const thaiCount = (text.match(/\p{Script=Thai}/gu) || []).length;
+
+  const rawWords = text.match(/\p{L}+(?:['’]\p{L}+)*/gu) || [];
+  const effectiveWords = rawWords.length + Math.floor((hanCount + kanaCount) / 2);
+  const denom = Math.max(1, effectiveWords);
+
+  // Script-distinct non-Latin language scoring on comparable density scale (~0.0 - 0.50)
+  if (hangulCount > 0) scores.ko = 0.48 * (hangulCount / totalLetters);
+  if (kanaCount > 0) scores.ja = 0.48 * ((kanaCount + hanCount) / totalLetters);
+  if (hanCount > 0 && kanaCount === 0) scores.zh = 0.48 * (hanCount / totalLetters);
+  if (arabicCount > 0) scores.ar = 0.48 * (arabicCount / totalLetters);
+  if (hebrewCount > 0) scores.he = 0.48 * (hebrewCount / totalLetters);
+  if (greekCount > 0) scores.el = 0.48 * (greekCount / totalLetters);
+  if (devanagariCount > 0) scores.hi = 0.48 * (devanagariCount / totalLetters);
+  if (thaiCount > 0) scores.th = 0.48 * (thaiCount / totalLetters);
+
+  // Word-level closed-class lexicon scoring (preserves Unicode letters & case-folds cleanly)
+  for (const [lang, lex] of Object.entries(LANGUAGE_STOPWORDS)) {
+    let hits = 0;
+    for (const rawTok of rawWords) {
+      const lower = rawTok.toLowerCase();
+      if (lex.has(lower)) {
+        hits += 1;
+        continue;
+      }
+      // Handle apostrophe clitics and contractions (e.g. French l'homme / d'un, English wasn't / they'd)
+      const aposIdx = Math.max(lower.indexOf("'"), lower.indexOf('’'));
+      if (aposIdx > 0) {
+        const prefix = lower.slice(0, aposIdx);
+        const suffix = lower.slice(aposIdx + 1);
+        if (lang === 'fr' && ['l', 'd', 'qu', 'n', 'j', 's', 'c', 'm', 't'].includes(prefix) && suffix.length >= 2) {
+          hits += 0.85;
+        } else if (lang === 'it' && ['l', 'dell', 'nell', 'all', 'sull', 'un', 'quest'].includes(prefix) && suffix.length >= 2) {
+          hits += 0.75;
+        } else if (lang === 'en' && (['t', 've', 're', 'll', 'd', 's', 'm'].includes(suffix) && lex.has(prefix.replace(/n$/, '')))) {
+          hits += 0.85;
+        } else if (lex.has(suffix)) {
+          hits += 0.5;
+        }
+      }
+    }
+    if (lang === 'ru' && cyrillicCount > 0) {
+      const ruLetters = (text.match(/[ыъэЫЪЭ]/g) || []).length;
+      hits += ruLetters * 0.4;
+      scores.ru = Math.max(scores.ru || 0, Math.min(0.55, hits / denom) || (0.28 * (cyrillicCount / totalLetters)));
+    } else if (lang === 'uk' && cyrillicCount > 0) {
+      const ukLetters = (text.match(/[іїєґІЇЄҐ]/g) || []).length;
+      hits += ukLetters * 0.5;
+      if (hits > 0) scores.uk = Math.min(0.55, hits / denom);
+    } else if (hits > 0) {
+      scores[lang] = hits / denom;
+    }
+  }
+
+  let topLang = null;
+  let topScore = 0;
+  let secondScore = 0;
+  for (const [lang, sc] of Object.entries(scores)) {
+    if (sc > topScore) {
+      secondScore = topScore;
+      topScore = sc;
+      topLang = lang;
+    } else if (sc > secondScore) {
+      secondScore = sc;
+    }
+  }
+
+  return { scores, topLang, topScore, secondScore, effectiveWords, totalLetters };
+}
+
+/**
+ * Identifies the actual reading language across sampled book passages.
+ * Returns:
+ *   - status: 'verified'     (actual reading text across passages matches requestedLang)
+ *   - status: 'mismatch'     (actual reading text across passages is confidently another language)
+ *   - status: 'insufficient' (insufficient or ambiguous readable prose -> requires manual review)
+ */
+export function identifyReadingLanguage(sampleBundle, requestedLang = 'en') {
+  const targetLang = ID.normalizeLanguageCode(requestedLang) || 'en';
+  const passages = Array.isArray(sampleBundle?.passages) ? sampleBundle.passages : [];
+  let totalWords = 0;
+  let totalLetters = 0;
+  let totalCjkChars = 0;
+
+  for (const p of passages) {
+    const txt = String(p?.text || '');
+    totalLetters += (txt.match(/\p{L}/gu) || []).length;
+    totalCjkChars += (txt.match(/[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}]/gu) || []).length;
+    totalWords += countEffectiveWordsInText(txt);
+  }
+
+  const baseStats = {
+    passageCount: passages.length,
+    effectiveWords: totalWords,
+    totalLetters,
+    passageWinners: {},
+  };
+
+  // Require multiple passages and substantive readable prose (prevents cover/TOC/stub false positives)
+  const enoughLetters = totalLetters >= 140 || totalCjkChars >= 80;
+  if (passages.length < 2 || totalWords < 35 || !enoughLetters) {
+    return {
+      status: 'insufficient',
+      detected: null,
+      expected: targetLang,
+      confidence: 'low',
+      reason: 'insufficient_language_evidence',
+      stats: baseStats,
+    };
+  }
+
+  const aggregateWeighted = {};
+  let totalWeight = 0;
+  let confidentPassages = 0;
+
+  for (const p of passages) {
+    const res = scorePassageLanguages(String(p?.text || ''));
+    const weight = Math.max(1, res.effectiveWords);
+    totalWeight += weight;
+    for (const [lang, sc] of Object.entries(res.scores)) {
+      aggregateWeighted[lang] = (aggregateWeighted[lang] || 0) + sc * weight;
+    }
+    if (res.topLang && res.topScore >= 0.10 && res.topScore >= res.secondScore * 1.2) {
+      baseStats.passageWinners[res.topLang] = (baseStats.passageWinners[res.topLang] || 0) + 1;
+      confidentPassages++;
+    }
+  }
+
+  const avgScores = {};
+  let bestLang = null;
+  let bestScore = 0;
+  let runnerUpLang = null;
+  let runnerUpScore = 0;
+  for (const [lang, sum] of Object.entries(aggregateWeighted)) {
+    const avg = sum / Math.max(1, totalWeight);
+    avgScores[lang] = Number(avg.toFixed(4));
+    if (avg > bestScore) {
+      runnerUpScore = bestScore;
+      runnerUpLang = bestLang;
+      bestScore = avg;
+      bestLang = lang;
+    } else if (avg > runnerUpScore) {
+      runnerUpScore = avg;
+      runnerUpLang = lang;
+    }
+  }
+  baseStats.scores = avgScores;
+  baseStats.runnerUp = runnerUpLang;
+
+  // Unrecognizable / OCR-garbled / non-prose text with negligible linguistic signal -> review required
+  if (!bestLang || bestScore < 0.10 || confidentPassages === 0) {
+    return {
+      status: 'insufficient',
+      detected: null,
+      expected: targetLang,
+      confidence: 'low',
+      reason: 'insufficient_language_evidence',
+      stats: baseStats,
+    };
+  }
+
+  const targetScore = avgScores[targetLang] || 0;
+  const targetWins = baseStats.passageWinners[targetLang] || 0;
+  const bestWins = baseStats.passageWinners[bestLang] || 0;
+  const passageCount = passages.length;
+
+  // Confidently matches requested language across the book (tolerating isolated foreign quotes/epigraphs)
+  if (
+    bestLang === targetLang &&
+    targetWins / passageCount >= 0.65 &&
+    bestScore >= 0.12 &&
+    (runnerUpScore === 0 || bestScore / runnerUpScore >= 1.45)
+  ) {
+    return {
+      status: 'verified',
+      detected: targetLang,
+      expected: targetLang,
+      confidence: bestScore >= 0.20 ? 'high' : 'medium',
+      reason: null,
+      stats: baseStats,
+    };
+  }
+
+  // Confidently wrong language across the book
+  if (
+    bestLang !== targetLang &&
+    bestWins / passageCount >= 0.55 &&
+    bestScore >= 0.12 &&
+    (targetScore === 0 || bestScore / targetScore >= 1.45)
+  ) {
+    return {
+      status: 'mismatch',
+      detected: bestLang,
+      expected: targetLang,
+      confidence: bestScore >= 0.20 ? 'high' : 'medium',
+      reason: 'language_mismatch',
+      stats: baseStats,
+    };
+  }
+
+  // Borderline / split bilingual / inconclusive text -> require human review rather than guessing
+  return {
+    status: 'insufficient',
+    detected: bestLang,
+    expected: targetLang,
+    confidence: 'low',
+    reason: 'insufficient_language_evidence',
+    stats: baseStats,
+  };
+}
+
 const SENSITIVE_KEYS = /^(token|secret|password|passwd|pwd|api[_-]?key|authorization|auth|cookie|credential|credentials|private[_-]?key|refresh[_-]?token|access[_-]?token|jwt|session[_-]?id|client[_-]?secret|apikey)$/i;
 
 /** Deep, key-aware redaction shared by logs and diagnostics. */
@@ -570,10 +1414,16 @@ export function getEditionIncompatibilityReason(req, rel) {
 }
 
 /**
- * Stage 2 authoritative post-download edition & identity verification.
+ * Post-download work & actual reading-language verification.
  * Evaluates a downloaded task artifact against the original request specification
- * before importing into BookOrbit or fulfilling the request.
- * Missing required edition evidence (year/ISBN) never fabricates a match.
+ * before importing into BookOrbit or fulfilling the request:
+ *   - Enforces strong title & author matching (rejecting unrelated books, summaries, anthologies, abridgments).
+ *   - Treats release and EPUB <dc:language> metadata as hints, not authoritative truth;
+ *     always inspects actual reading text across the book via Unicode-aware language identification.
+ *   - Rejects confidently wrong-language content ('finalization_failed') and routes insufficient
+ *     readable evidence to 'review_required' ('language_review_required').
+ *   - Treats ISBN as positive informational evidence only (different or absent ISBN never blocks).
+ *   - Never uses publication year to block or penalize, and never fabricates ISBN/year metadata.
  */
 export function verifyDownloadedEdition(task, reqSpec = {}) {
   const rid = reqSpec.requestId ?? null;
@@ -599,11 +1449,7 @@ export function verifyDownloadedEdition(task, reqSpec = {}) {
     task?.requestLanguage ??
     'en'
   ).trim();
-  const reqYear = parsePositiveInt(
-    reqSpec.year ??
-    (rid && task?.requestYears ? task.requestYears[rid] : undefined) ??
-    task?.requestYear
-  );
+  const normExpectedLang = ID.normalizeLanguageCode(expectedLanguage) || 'en';
   const reqIsbn = normalizeIsbnBridge(
     reqSpec.isbn ??
     (rid && task?.requestIsbns ? task.requestIsbns[rid] : undefined) ??
@@ -612,16 +1458,16 @@ export function verifyDownloadedEdition(task, reqSpec = {}) {
   );
   const validReqIsbn = (reqIsbn.length === 10 || reqIsbn.length === 13) ? reqIsbn : '';
 
-  const isEpub = Boolean(
-    String(task?.format || '').toLowerCase() === 'epub' ||
-    String(task?.filePath || '').toLowerCase().endsWith('.epub')
-  );
+  const fmtLower = String(task?.format || '').toLowerCase();
+  const pathLower = String(task?.filePath || '').toLowerCase();
+  const isEpub = Boolean(fmtLower === 'epub' || pathLower.endsWith('.epub'));
+  const isPdf = Boolean(!isEpub && (fmtLower === 'pdf' || pathLower.endsWith('.pdf')));
+
   const evidence = [];
   const conflicts = [];
   let error = null;
-  let isbnFailure = false;
-  let workOrLanguageFailure = false;
   let opf = null;
+  let languageAnalysis = null;
 
   if (isEpub && task?.filePath) {
     opf = extractEpubMetadataFromFile(task.filePath);
@@ -631,27 +1477,27 @@ export function verifyDownloadedEdition(task, reqSpec = {}) {
       error = 'EPUB metadata could not be extracted from downloaded container';
       return {
         ok: false,
-        outcome: 'reject',
-        errorType: validReqIsbn ? 'isbn_verification_failed' : 'edition_verification_failed',
+        outcome: 'review',
+        errorType: 'review_required',
         primaryConflict: 'unverified_epub_metadata',
         conflicts,
         evidence,
         error,
-        isbnFailure: Boolean(validReqIsbn),
+        isbnFailure: false,
         workOrLanguageFailure: false,
+        languageReviewRequired: true,
         opf: null,
+        languageAnalysis: null,
       };
     }
 
     // 1. Work title verification
     if (!opf.title && expectedTitle) {
       conflicts.push('missing_title');
-      workOrLanguageFailure = true;
       evidence.push({ field: 'title', level: 'work', status: 'missing', expected: expectedTitle, observed: null });
       error = error || `EPUB title mismatch: expected "${expectedTitle}", got missing title`;
     } else if (opf.title && expectedTitle && !ID.isTitleMatch(opf.title, expectedTitle)) {
       conflicts.push('incompatible_title');
-      workOrLanguageFailure = true;
       evidence.push({ field: 'title', level: 'work', status: 'contradictory', expected: expectedTitle, observed: opf.title });
       error = error || `EPUB title mismatch: expected "${expectedTitle}", got "${opf.title}"`;
     } else if (opf.title) {
@@ -662,10 +1508,9 @@ export function verifyDownloadedEdition(task, reqSpec = {}) {
     const opfAuthors = Array.isArray(opf.authors) && opf.authors.length ? opf.authors : (opf.author ? [opf.author] : []);
     if (opfAuthors.length > 0 && expectedAuthor && !ID.isAuthorMatch(opfAuthors, expectedAuthor)) {
       conflicts.push('incompatible_author');
-      workOrLanguageFailure = true;
       evidence.push({ field: 'author', level: 'work', status: 'contradictory', expected: expectedAuthor, observed: opf.author });
       error = error || `EPUB author mismatch: expected "${expectedAuthor}", got "${opf.author}"`;
-    } else if (opfAuthors.length === 0 && expectedAuthor && (reqYear || validReqIsbn)) {
+    } else if (opfAuthors.length === 0 && expectedAuthor) {
       conflicts.push('missing_author');
       evidence.push({ field: 'author', level: 'work', status: 'unverified', expected: expectedAuthor, observed: null });
       error = error || `EPUB author metadata missing: could not verify "${expectedAuthor}"`;
@@ -673,135 +1518,149 @@ export function verifyDownloadedEdition(task, reqSpec = {}) {
       evidence.push({ field: 'author', level: 'work', status: 'verified', expected: expectedAuthor, observed: opf.author });
     }
 
-    // 3. Expression language verification
-    const normEpubLang = ID.normalizeLanguageCode(opf.language);
-    const normExpectedLang = ID.normalizeLanguageCode(expectedLanguage) || 'en';
-    if (normEpubLang && normExpectedLang && normEpubLang !== normExpectedLang) {
+    // 3. Expression language verification via actual reading text across the EPUB spine
+    const opfLangHint = ID.normalizeLanguageCode(opf.language);
+    const releaseLangHint = ID.normalizeLanguageCode(task?.language);
+    const samples = extractEpubReadingSamplesFromFile(task.filePath);
+    languageAnalysis = identifyReadingLanguage(samples, normExpectedLang);
+
+    if (languageAnalysis.status === 'verified') {
+      evidence.push({
+        field: 'language',
+        level: 'expression',
+        status: 'verified',
+        expected: normExpectedLang,
+        observed: languageAnalysis.detected,
+        metadataHint: opfLangHint || releaseLangHint || null,
+        passageCount: languageAnalysis.stats?.passageCount || 0,
+        readableWords: languageAnalysis.stats?.effectiveWords || 0,
+      });
+    } else if (languageAnalysis.status === 'mismatch') {
       conflicts.push('language_mismatch');
-      workOrLanguageFailure = true;
-      evidence.push({ field: 'language', level: 'expression', status: 'contradictory', expected: normExpectedLang, observed: normEpubLang });
-      error = error || `EPUB language mismatch: expected "${normExpectedLang}", got "${opf.language}" (${normEpubLang})`;
+      evidence.push({
+        field: 'language',
+        level: 'expression',
+        status: 'contradictory',
+        expected: normExpectedLang,
+        observed: languageAnalysis.detected,
+        metadataHint: opfLangHint || releaseLangHint || null,
+        passageCount: languageAnalysis.stats?.passageCount || 0,
+        readableWords: languageAnalysis.stats?.effectiveWords || 0,
+      });
+      error = error || `EPUB language mismatch: expected "${normExpectedLang}", detected "${languageAnalysis.detected}" in actual reading text (metadata hint: "${opf.language || task?.language || 'absent'}")`;
     } else {
-      evidence.push({ field: 'language', level: 'expression', status: normEpubLang ? 'verified' : 'unverified', expected: normExpectedLang, observed: normEpubLang || null });
+      conflicts.push('insufficient_language_evidence');
+      evidence.push({
+        field: 'language',
+        level: 'expression',
+        status: 'insufficient_evidence',
+        expected: normExpectedLang,
+        observed: languageAnalysis.detected || null,
+        metadataHint: opfLangHint || releaseLangHint || null,
+        passageCount: languageAnalysis.stats?.passageCount || 0,
+        readableWords: languageAnalysis.stats?.effectiveWords || 0,
+      });
+      error = error || `Insufficient readable text evidence in EPUB to verify language "${normExpectedLang}" (${languageAnalysis.stats?.effectiveWords || 0} readable words across ${languageAnalysis.stats?.passageCount || 0} passages; metadata hint "${opf.language || task?.language || 'absent'}" is not authoritative)`;
     }
 
-    // 4. Edition ISBN verification
+    // 4. Positive-only ISBN observation (exact/counterpart match recorded as positive evidence; different/absent ISBN never blocks)
     const opfIsbns = Array.isArray(opf.isbns) ? opf.isbns : (opf.isbn ? [normalizeIsbnBridge(opf.isbn)].filter(Boolean) : []);
-    let isbnVerified = false;
     if (validReqIsbn) {
       const matchedIsbn = opfIsbns.find((fi) =>
         ID.sameIsbn(validReqIsbn, fi) ||
         areVerifiedIsbnCounterpartsBridge(validReqIsbn, fi, task?.trustedIsbns, task?.bookMetadata, task?.extra?.bookMetadata)
       );
       if (matchedIsbn) {
-        isbnVerified = true;
         evidence.push({ field: 'isbn', level: 'edition', status: 'verified', expected: validReqIsbn, observed: matchedIsbn });
       } else if (opfIsbns.length > 0) {
-        conflicts.push('conflicting_isbn');
-        isbnFailure = true;
-        evidence.push({ field: 'isbn', level: 'edition', status: 'contradictory', expected: validReqIsbn, observed: opfIsbns[0] });
-        error = error || `Release ISBN ${opfIsbns[0]} does not match requested ISBN ${validReqIsbn}`;
+        evidence.push({ field: 'isbn', level: 'edition', status: 'informational', expected: validReqIsbn, observed: opfIsbns[0] });
       } else {
-        conflicts.push('unverified_isbn');
-        isbnFailure = true;
-        evidence.push({ field: 'isbn', level: 'edition', status: 'unverified', expected: validReqIsbn, observed: null });
-        error = error || 'Release ISBN could not be verified in downloaded file';
+        evidence.push({ field: 'isbn', level: 'edition', status: 'absent', expected: validReqIsbn, observed: null });
       }
     } else if (opfIsbns.length > 0) {
-      evidence.push({ field: 'isbn', level: 'edition', status: 'observed', expected: null, observed: opfIsbns[0] });
+      evidence.push({ field: 'isbn', level: 'edition', status: 'informational', expected: null, observed: opfIsbns[0] });
     }
 
-    // 5. Edition publication year verification
+    // 5. Passive year observation only (never blocks or penalizes)
     const opfYears = Array.isArray(opf.years) ? opf.years : (opf.year ? [opf.year] : []);
-    const taskClaimedYear = parsePositiveInt(task?.year);
-    if (reqYear) {
-      if (opfYears.length > 0) {
-        if (opfYears.includes(reqYear)) {
-          evidence.push({ field: 'year', level: 'edition', status: 'verified', expected: reqYear, observed: reqYear });
-        } else {
-          conflicts.push('incompatible_year');
-          evidence.push({ field: 'year', level: 'edition', status: 'contradictory', expected: reqYear, observed: opf.year });
-          error = error || `EPUB publication year mismatch: expected ${reqYear}, got ${opf.year}`;
-        }
-      } else if (isbnVerified) {
-        // Requested year satisfied by verified OPF ISBN/counterpart with no conflicting OPF year
-        evidence.push({ field: 'year', level: 'edition', status: 'satisfied_by_isbn', expected: reqYear, observed: null });
-      } else {
-        conflicts.push('unverified_edition_year');
-        evidence.push({ field: 'year', level: 'edition', status: 'unverified', expected: reqYear, observed: null });
-        error = error || `Release publication year (${reqYear}) could not be verified in downloaded EPUB metadata`;
-      }
-    } else if (taskClaimedYear && opfYears.length > 0 && !opfYears.includes(taskClaimedYear)) {
-      conflicts.push('incompatible_year');
-      evidence.push({ field: 'year', level: 'edition', status: 'contradictory', expected: taskClaimedYear, observed: opf.year });
-      error = error || `EPUB publication year mismatch: expected ${taskClaimedYear}, got ${opf.year}`;
-    } else if (opfYears.length > 0) {
-      evidence.push({ field: 'year', level: 'edition', status: 'observed', expected: null, observed: opf.year });
+    if (opfYears.length > 0) {
+      evidence.push({ field: 'year', level: 'edition', status: 'informational', expected: null, observed: opf.year });
     }
-  } else {
-    // Non-EPUB (e.g. PDF) or pre-imported task without local EPUB file
-    const taskIsbn = normalizeIsbnBridge(task?.isbn || '');
-    const validTaskIsbn = (taskIsbn.length === 10 || taskIsbn.length === 13) ? taskIsbn : '';
-    let isbnVerified = false;
-    if (validReqIsbn) {
-      if (validTaskIsbn && (ID.sameIsbn(validReqIsbn, validTaskIsbn) || areVerifiedIsbnCounterpartsBridge(validReqIsbn, validTaskIsbn, task?.trustedIsbns, task?.bookMetadata, task?.extra?.bookMetadata))) {
-        isbnVerified = true;
-        evidence.push({ field: 'isbn', level: 'edition', status: 'verified', expected: validReqIsbn, observed: validTaskIsbn });
-      } else if (validTaskIsbn) {
-        conflicts.push('conflicting_isbn');
-        isbnFailure = true;
-        evidence.push({ field: 'isbn', level: 'edition', status: 'contradictory', expected: validReqIsbn, observed: validTaskIsbn });
-        error = error || `Release ISBN ${validTaskIsbn} does not match requested ISBN ${validReqIsbn}`;
-      } else {
-        conflicts.push('unverified_isbn');
-        isbnFailure = true;
-        evidence.push({ field: 'isbn', level: 'edition', status: 'unverified', expected: validReqIsbn, observed: null });
-        error = error || 'Release ISBN could not be verified in downloaded file';
-      }
-    }
-    const taskYear = parsePositiveInt(task?.year);
-    if (reqYear) {
-      if (taskYear) {
-        if (taskYear === reqYear) {
-          evidence.push({ field: 'year', level: 'edition', status: 'verified', expected: reqYear, observed: taskYear });
-        } else {
-          conflicts.push('incompatible_year');
-          evidence.push({ field: 'year', level: 'edition', status: 'contradictory', expected: reqYear, observed: taskYear });
-          error = error || `Release publication year mismatch: expected ${reqYear}, got ${taskYear}`;
-        }
-      } else if (!isbnVerified) {
-        conflicts.push('unverified_edition_year');
-        evidence.push({ field: 'year', level: 'edition', status: 'unverified', expected: reqYear, observed: null });
-        error = error || `Release publication year (${reqYear}) could not be verified`;
-      }
+  } else if (isPdf && task?.filePath && fs.existsSync(task.filePath)) {
+    const pdfBuf = fs.readFileSync(task.filePath);
+    const samples = extractPdfReadingSamples(pdfBuf);
+    languageAnalysis = identifyReadingLanguage(samples, normExpectedLang);
+    const releaseLangHint = ID.normalizeLanguageCode(task?.language);
+    if (languageAnalysis.status === 'verified') {
+      evidence.push({
+        field: 'language',
+        level: 'expression',
+        status: 'verified',
+        expected: normExpectedLang,
+        observed: languageAnalysis.detected,
+        metadataHint: releaseLangHint || null,
+        passageCount: languageAnalysis.stats?.passageCount || 0,
+        readableWords: languageAnalysis.stats?.effectiveWords || 0,
+      });
+    } else if (languageAnalysis.status === 'mismatch') {
+      conflicts.push('language_mismatch');
+      evidence.push({
+        field: 'language',
+        level: 'expression',
+        status: 'contradictory',
+        expected: normExpectedLang,
+        observed: languageAnalysis.detected,
+        metadataHint: releaseLangHint || null,
+      });
+      error = error || `PDF language mismatch: expected "${normExpectedLang}", detected "${languageAnalysis.detected}" in reading text`;
+    } else {
+      conflicts.push('insufficient_language_evidence');
+      evidence.push({
+        field: 'language',
+        level: 'expression',
+        status: 'insufficient_evidence',
+        expected: normExpectedLang,
+        observed: languageAnalysis.detected || null,
+        metadataHint: releaseLangHint || null,
+      });
+      error = error || `Insufficient readable text evidence in PDF to verify language "${normExpectedLang}"`;
     }
   }
 
   const ok = conflicts.length === 0;
-  const primaryConflict = conflicts[0] || null;
+  const hardFailureSet = new Set(['incompatible_title', 'missing_title', 'incompatible_author', 'language_mismatch']);
+  const hardConflict = conflicts.find((c) => hardFailureSet.has(c)) || null;
+  const primaryConflict = hardConflict || conflicts[0] || null;
+  const workOrLanguageFailure = Boolean(hardConflict);
+  const languageReviewRequired = !ok && !workOrLanguageFailure && conflicts.includes('insufficient_language_evidence');
+
   let errorType = null;
   if (!ok) {
-    if (workOrLanguageFailure && conflicts.every((c) => ['incompatible_title', 'missing_title', 'incompatible_author', 'language_mismatch'].includes(c))) {
+    if (workOrLanguageFailure) {
       errorType = 'finalization_failed';
-    } else if (isbnFailure) {
-      errorType = 'isbn_verification_failed';
+    } else if (languageReviewRequired) {
+      errorType = 'language_review_required';
     } else {
-      errorType = 'edition_verification_failed';
+      errorType = 'review_required';
     }
   }
   return {
     ok,
-    outcome: ok ? 'match' : 'reject',
+    outcome: ok ? 'match' : (workOrLanguageFailure ? 'reject' : 'review'),
     errorType,
     primaryConflict,
     conflicts,
     evidence,
     error,
-    isbnFailure,
+    isbnFailure: false,
     workOrLanguageFailure,
+    languageReviewRequired,
     opf,
+    languageAnalysis,
   };
 }
+
+export const verifyDownloadedBook = verifyDownloadedEdition;
 
 function isHttpUrlBridge(value) {
   if (typeof value !== 'string') return false;
@@ -2009,11 +2868,23 @@ export class BridgeService {
              }
              return true;
            });
-           // Rank verified edition matches ('match') ahead of unknown-metadata ('provisional') candidates
+           // Rank candidates:
+           // 1. Non-conflicting language hint ahead of conflicting language hint
+           // 2. Exact/counterpart ISBN match boost (different ISBN and absent ISBN tie with zero penalty)
+           // 3. Positive language hint ('match' ahead of 'unknown')
+           // Publication year never affects ranking.
            eligibleReleases.sort((a, b) => {
-             const tierA = candidateCompatibility(reqForCompatibility, a).outcome === 'match' ? 0 : 1;
-             const tierB = candidateCompatibility(reqForCompatibility, b).outcome === 'match' ? 0 : 1;
-             return tierA - tierB;
+             const ca = candidateCompatibility(reqForCompatibility, a);
+             const cb = candidateCompatibility(reqForCompatibility, b);
+             const langConflictA = ca.languageHint === 'mismatch' ? 1 : 0;
+             const langConflictB = cb.languageHint === 'mismatch' ? 1 : 0;
+             if (langConflictA !== langConflictB) return langConflictA - langConflictB;
+             const isbnBoostA = ca.isbnVerified ? 0 : 1;
+             const isbnBoostB = cb.isbnVerified ? 0 : 1;
+             if (isbnBoostA !== isbnBoostB) return isbnBoostA - isbnBoostB;
+             const langTierA = ca.languageHint === 'match' ? 0 : (ca.languageHint === 'unknown' ? 1 : 2);
+             const langTierB = cb.languageHint === 'match' ? 0 : (cb.languageHint === 'unknown' ? 1 : 2);
+             return langTierA - langTierB;
            });
            const metadataCandidateCount = Array.isArray(searchResults) ? searchResults.length : 0;
            const releaseCandidateCount = eligibleReleases.length;
@@ -2200,15 +3071,17 @@ export class BridgeService {
     if (existingTaskId === 'uncertain') {
       const rec = this.state.uncertainQueues[releaseKey];
       if (rec) {
-        // ISBN and year compatibility check between incoming and existing uncertain record
-        const recIsbn = normalizeIsbnBridge(rec.requestIsbn || '');
+        // Work + requested-language compatibility check (ISBN and year never block sharing)
         const incomingIsbn = normalizeIsbnBridge(requestIsbn || '');
-        if (incomingIsbn && recIsbn && !ID.sameIsbn(incomingIsbn, recIsbn) && !areVerifiedIsbnCounterpartsBridge(incomingIsbn, recIsbn, rec?.trustedIsbns, rec?.bookMetadata, rec?.extra?.bookMetadata)) {
-          throw new Error(`Incompatible ISBN for uncertain queue ${releaseKey}: requested ${incomingIsbn} vs ${recIsbn}`);
+        const recLang = ID.normalizeLanguageCode(rec.requestLanguage || 'en') || 'en';
+        if (normalizedReqLang !== recLang) {
+          throw new Error(`Incompatible requested language for uncertain queue ${releaseKey}: requested ${normalizedReqLang} vs ${recLang}`);
         }
-        const recYear = parsePositiveInt(rec.requestYear || rec.release?.year);
-        if (parsedReqYear && recYear && parsedReqYear !== recYear) {
-          throw new Error(`Incompatible edition year for uncertain queue ${releaseKey}: requested ${parsedReqYear} vs ${recYear}`);
+        if (requestTitle && rec.requestTitle && !ID.isTitleMatch(requestTitle, rec.requestTitle)) {
+          throw new Error(`Incompatible work title for uncertain queue ${releaseKey}: requested "${requestTitle}" vs "${rec.requestTitle}"`);
+        }
+        if (requestAuthor && rec.requestAuthor && !ID.isAuthorMatch(requestAuthor, rec.requestAuthor)) {
+          throw new Error(`Incompatible author for uncertain queue ${releaseKey}: requested "${requestAuthor}" vs "${rec.requestAuthor}"`);
         }
         if (!Array.isArray(rec.requestIds)) rec.requestIds = rec.requestId ? [rec.requestId] : [];
         if (requestId && !rec.requestIds.includes(requestId)) rec.requestIds.push(requestId);
@@ -2250,52 +3123,21 @@ export class BridgeService {
     }
 
     const verifyExistingTaskAdoption = (existing, idForErr, sameReleaseKey = false) => {
-      if (existing.isbnVerificationFailed || existing.editionVerificationFailed) {
-        throw new Error(`Incompatible edition for existing task ${idForErr}: task failed edition verification`);
+      if (existing.verificationFailed || existing.isbnVerificationFailed || existing.editionVerificationFailed) {
+        throw new Error(`Incompatible task ${idForErr}: task failed post-download verification`);
       }
-      if (sameReleaseKey) {
-        if (candidateCompatibility(existing, release).outcome === 'reject') {
-          throw new Error(`Incompatible edition for existing task ${idForErr}: requested "${release.title}" (${release.year || 'unknown year'}) vs task "${existing.title}" (${existing.year || 'unknown year'})`);
-        }
-      } else if (!areEditionsCompatible(existing, release)) {
-        throw new Error(`Incompatible edition for existing task ${idForErr}: requested "${release.title}" (${release.year || 'unknown year'}) vs task "${existing.title}" (${existing.year || 'unknown year'})`);
-      }
-
-      const existingFileMeta = (existing.filePath && String(existing.filePath).toLowerCase().endsWith('.epub'))
-        ? extractEpubMetadataFromFile(existing.filePath)
-        : null;
-      const existingTaskIsbn = normalizeIsbnBridge((existing.requestIsbns && existing.requestIsbns[requestId]) || existing.requestIsbn || '');
-      const incomingTaskIsbn = normalizeIsbnBridge(requestIsbn || '');
-      const existingFileIsbn = normalizeIsbnBridge(existingFileMeta?.isbn || '');
-      const existingEvidenceIsbn = existingTaskIsbn || normalizeIsbnBridge(existing.isbn) || existingFileIsbn;
-      let isbnAdoptedMatch = false;
-      if (incomingTaskIsbn) {
-        if (existingEvidenceIsbn) {
-          if (!ID.sameIsbn(existingEvidenceIsbn, incomingTaskIsbn) &&
-              !areVerifiedIsbnCounterpartsBridge(existingEvidenceIsbn, incomingTaskIsbn, existing?.trustedIsbns, existing?.bookMetadata, existing?.extra?.bookMetadata, release?.trustedIsbns, release?.extra?.bookMetadata)) {
-            throw new Error(`Incompatible ISBN for existing task ${idForErr}: requested ${incomingTaskIsbn} vs task ${existingEvidenceIsbn}`);
-          }
-          isbnAdoptedMatch = true;
-        } else {
-          // No verified ISBN evidence on the existing task; reject adoption for ISBN-specific request.
-          throw new Error(`Incompatible ISBN for existing task ${idForErr}: no verified ISBN evidence`);
+      if (!sameReleaseKey) {
+        const incomingSrcId = String(release?.sourceId ?? release?.source_id ?? release?.extra?.sourceId ?? '').trim();
+        if (existing.sourceId && incomingSrcId && String(existing.sourceId) !== incomingSrcId) {
+          throw new Error(`Conflicting source identity for existing task ${idForErr}: incoming ${incomingSrcId} vs task ${existing.sourceId}`);
         }
       }
-
-      const existingEvidenceYear = parsePositiveInt(
-        (existing.requestYears && existing.requestYears[requestId]) ||
-        existing.requestYear ||
-        existing.year ||
-        existingFileMeta?.year
-      );
-      if (parsedReqYear) {
-        if (existingEvidenceYear) {
-          if (existingEvidenceYear !== parsedReqYear) {
-            throw new Error(`Incompatible edition for existing task ${idForErr}: requested year ${parsedReqYear} vs task year ${existingEvidenceYear}`);
-          }
-        } else if (!isbnAdoptedMatch) {
-          throw new Error(`Incompatible edition for existing task ${idForErr}: no verified year evidence for ${parsedReqYear}`);
-        }
+      if (candidateCompatibility(existing, release).outcome === 'reject') {
+        throw new Error(`Incompatible work for existing task ${idForErr}: requested "${release.title}" vs task "${existing.title}"`);
+      }
+      const existingReqLang = ID.normalizeLanguageCode(existing.requestLanguage || existing.language || 'en') || 'en';
+      if (existingReqLang !== normalizedReqLang) {
+        throw new Error(`Incompatible requested language for existing task ${idForErr}: requested ${normalizedReqLang} vs task ${existingReqLang}`);
       }
     };
 
@@ -2757,12 +3599,10 @@ export class BridgeService {
           const tTitle = (t.title || '').trim().toLowerCase();
           const fmtMatch = !format || (t.format || '').toLowerCase() === format.toLowerCase();
           const titleMatch = tTitle === candTitle || rawBase === tTitle || rawBase.startsWith(tTitle + '_') || rawBase.startsWith(tTitle + ' ');
-          // Require additional identity evidence when available to avoid wrong-task attachment.
+          // Require additional work identity evidence when available to avoid wrong-task attachment.
           let extraMatch = true;
           if (title && t.title && ID.normalizeString(t.title) !== ID.normalizeString(title)) extraMatch = false;
           if (payload.author && t.author && !ID.isAuthorMatch(t.author, payload.author)) extraMatch = false;
-          if (payload.year && t.year && String(t.year) !== String(payload.year)) extraMatch = false;
-          if (payload.isbn && t.isbn && !ID.sameIsbn(t.isbn, payload.isbn)) extraMatch = false;
           if (fmtMatch && titleMatch && extraMatch) {
             matchingTasks.push(t);
           }
@@ -3001,15 +3841,12 @@ export class BridgeService {
         return 'incompatible';
       }
 
-      // Fail closed when no durable edition identity can be established.
-      const taskYear = parsePositiveInt(task?.year || task?.publishedYear || task?.publicationYear);
-      const bookYear = parsePositiveInt(book?.year || book?.publishedYear || book?.publicationYear);
-      const taskIsbn = String(task?.isbn13 || task?.isbn || task?.extra?.isbn || '').replace(/[^0-9X]/gi, '');
-      const bookIsbn = String(book?.isbn13 || book?.isbn || '').replace(/[^0-9X]/gi, '');
+      // Fail closed when no durable work/book identity can be established (title or year alone is insufficient).
+      const taskIsbn = ID.normalizeIsbn(task?.isbn13 || task?.isbn || task?.extra?.isbn || '');
+      const bookIsbn = ID.normalizeIsbn(book?.isbn13 || book?.isbn || '');
       const identityEstablished = Boolean(
         (expectedAuthor && book.author) ||
-        (taskYear && bookYear) ||
-        (taskIsbn && bookIsbn)
+        (taskIsbn && bookIsbn && ID.sameIsbn(taskIsbn, bookIsbn))
       );
       if (!identityEstablished) {
         return 'unknown';
@@ -3146,16 +3983,8 @@ export class BridgeService {
       // Both explicit title and author are required: missing metadata is not identity.
       if (!String(book.title || '').trim() || !expectedAuthor || !book.author) continue;
       if (!areEditionsCompatible({ ...task, author: expectedAuthor }, book)) continue;
-      const observedYear = parsePositiveInt(book.year);
-      const observedIsbn = String(book.isbn || '').replace(/[^0-9X]/gi, '');
-      const editionVerified = Boolean(
-        (expectedIsbn && observedIsbn && expectedIsbn === observedIsbn) ||
-        (expectedYear && observedYear && expectedYear === observedYear) ||
-        (!expectedIsbn && !expectedYear && areEditionsCompatible({ ...task, author: expectedAuthor }, book))
-      );
       const newlyImported = baselineKnown && !beforeIds.has(id);
       if (mode === 'uncertain' && baselineKnown && !newlyImported) continue;
-      if (!newlyImported && !editionVerified) continue;
       matched.set(id, book);
     }
     if (matched.size === 1) return [...matched.values()][0];
@@ -3172,6 +4001,13 @@ export class BridgeService {
           if (hashMatch) return hashMatch;
         }
       } catch {}
+      if (expectedIsbn) {
+        const isbnMatches = candidates.filter((b) => {
+          const obs = ID.normalizeIsbn(b.isbn || '');
+          return obs && ID.sameIsbn(expectedIsbn, obs);
+        });
+        if (isbnMatches.length === 1) return isbnMatches[0];
+      }
       if (mode === 'conflict') {
         const baseName = path.basename(task.filePath || '');
         const destMatch = candidates.find((b) => {
@@ -3682,18 +4518,16 @@ export class BridgeService {
 
       if (verifiedActiveIds.length === 0 && firstFailedVer) {
         task.error = firstFailedVer.error;
+        task.verificationFailed = true;
         task.editionVerificationFailed = true;
-        if (firstFailedVer.isbnFailure) {
-          task.isbnVerificationFailed = true;
-        }
         if (firstFailedVer.errorType === 'finalization_failed') {
           task.status = 'finalization_failed';
           delete task.errorSource;
         } else {
-          task.status = 'failed';
-          task.errorSource = firstFailedVer.isbnFailure
-            ? 'companion_isbn_verification'
-            : 'companion_edition_verification';
+          task.status = 'review_required';
+          task.errorSource = firstFailedVer.languageReviewRequired
+            ? 'companion_language_review'
+            : 'companion_verification_review';
         }
         if (task.releaseKey && this.state.releases[task.releaseKey] === (task.taskId || task.id)) {
           delete this.state.releases[task.releaseKey];
