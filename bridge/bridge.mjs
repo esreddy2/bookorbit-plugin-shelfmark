@@ -107,14 +107,17 @@ export function extractEpubMetadata(buffer) {
           const isbnMatch = opfText.match(/urn:isbn:([0-9X-]+)/i) ||
                             opfText.match(/<dc:identifier[^>]*scheme=["']ISBN["'][^>]*>.*?([0-9X-]{10,17}).*?<\/dc:identifier>/i) ||
                             opfText.match(/<dc:identifier[^>]*>.*?([0-9X-]{10,17}).*?<\/dc:identifier>/i);
+          const languageMatch = opfText.match(/<dc:language[^>]*>([^<]+)<\/dc:language>/i);
 
           const rawYear = dateMatch ? parseInt(dateMatch[1], 10) : null;
           const rawIsbn = isbnMatch ? isbnMatch[1].replace(/[^0-9X]/gi, '') : null;
+          const rawLanguage = languageMatch ? languageMatch[1].trim() : null;
           return {
             title: titleMatch ? titleMatch[1].trim() : null,
             author: authorMatch ? authorMatch[1].trim() : null,
-            year: Number.isFinite(rawYear) ? rawYear : null,
+            year: Number.isFinite(rawYear) && rawYear >= 1000 && rawYear <= 2100 ? rawYear : null,
             isbn: rawIsbn && rawIsbn.length > 0 ? rawIsbn : null,
+            language: rawLanguage && rawLanguage.length > 0 ? rawLanguage : null,
           };
         }
       }
@@ -305,6 +308,8 @@ export function parseShelfmarkStatus(statusJson) {
 export const KNOWN_TITLE_EQUIVALENTS = ID.KNOWN_TITLE_EQUIVALENTS;
 
 export function normalizeString(str) { return ID.normalizeString(str); }
+export function normalizeLanguageCode(lang) { return ID.normalizeLanguageCode(lang); }
+export function stripLeadingArticle(str) { return ID.stripLeadingArticle(str); }
 export function getTokens(str) { return ID.getTokens(str); }
 export function toNaturalAuthor(author) { return ID.toNaturalAuthor(author); }
 export function extractCoreTitle(title) { return ID.extractCoreTitle(title); }
@@ -398,6 +403,7 @@ export function withEpubMetadata(obj) {
     if (meta && (!meta.title || isTitleMatch(meta.title, rawTitle))) {
       if (meta.year != null && merged.year == null) merged.year = meta.year;
       if (meta.isbn != null && merged.isbn == null) merged.isbn = meta.isbn;
+      if (meta.language != null && merged.language == null) merged.language = meta.language;
     }
   }
   if (Object.keys(merged).length) copy.epubMetadata = merged;
@@ -570,6 +576,15 @@ export class BookOrbitAuthManager {
     return this.token;
   }
 }
+
+const MIN_PING_INTERVAL_MS = 1000;
+const MAX_PING_INTERVAL_MS = 300000;
+const MIN_PING_TIMEOUT_MS = 1000;
+const MAX_PING_TIMEOUT_MS = 300000;
+const DEFAULT_PING_INTERVAL_MS = 25000;
+const DEFAULT_PING_TIMEOUT_MS = 20000;
+const MIN_ALLOWED_SILENCE_MS = 2000;
+const MAX_ALLOWED_SILENCE_MS = 600000;
 
 /**
  * Lightweight, zero-dependency Socket.IO v4 client connecting to BookOrbit's
@@ -744,17 +759,32 @@ export class BookOrbitSocketClient {
    * The client NEVER sends unsolicited PING ('2') packets in Engine.IO v4.
    */
   resetHeartbeatWatchdog(interval = this.pingInterval, timeout = this.pingTimeout) {
-    if (interval) this.pingInterval = interval;
-    if (timeout) this.pingTimeout = timeout;
+    const rawInterval = Number(interval);
+    const rawTimeout = Number(timeout);
+
+    const sanitizedInterval = Number.isFinite(rawInterval)
+      ? Math.min(MAX_PING_INTERVAL_MS, Math.max(MIN_PING_INTERVAL_MS, Math.trunc(rawInterval)))
+      : DEFAULT_PING_INTERVAL_MS;
+    const sanitizedTimeout = Number.isFinite(rawTimeout)
+      ? Math.min(MAX_PING_TIMEOUT_MS, Math.max(MIN_PING_TIMEOUT_MS, Math.trunc(rawTimeout)))
+      : DEFAULT_PING_TIMEOUT_MS;
+
+    this.pingInterval = sanitizedInterval;
+    this.pingTimeout = sanitizedTimeout;
+
     this.clearPingTimer();
-    const allowedSilenceMs = (this.pingInterval || 25000) + (this.pingTimeout || 20000);
+
+    this._allowedSilenceMs = (Number.isFinite(rawInterval) && Number.isFinite(rawTimeout))
+      ? Math.min(MAX_ALLOWED_SILENCE_MS, Math.max(MIN_ALLOWED_SILENCE_MS, sanitizedInterval + sanitizedTimeout))
+      : Math.min(MAX_ALLOWED_SILENCE_MS, Math.max(MIN_ALLOWED_SILENCE_MS, DEFAULT_PING_INTERVAL_MS + DEFAULT_PING_TIMEOUT_MS));
+
     this.pingTimer = setTimeout(() => {
       console.warn('[SocketClient] Server heartbeat timeout (no ping received). Reconnecting...');
       this.isConnected = false;
       if (this.ws) {
         try { this.ws.close(); } catch {}
       }
-    }, allowedSilenceMs);
+    }, this._allowedSilenceMs);
     if (this.pingTimer.unref) this.pingTimer.unref();
   }
 
@@ -808,13 +838,16 @@ export class BridgeService {
     this.defaultFolderId = options.defaultFolderId !== undefined ? options.defaultFolderId : parsePositiveInt(process.env.BOOKORBIT_DEFAULT_FOLDER_ID);
     this.dockReadinessAttempts = options.dockReadinessAttempts || 25;
     this.dockReadinessIntervalMs = options.dockReadinessIntervalMs || 100;
-    this.reconcileIntervalMs = options.reconcileIntervalMs || 15 * 60 * 1000; // 15 minutes
+    const envInterval = parsePositiveInt(process.env.RECONCILE_INTERVAL_MS);
+    this.reconcileIntervalMs = options.reconcileIntervalMs || envInterval || 15 * 60 * 1000; // 15 minutes
     this.fileVisibilityAttempts = options.fileVisibilityAttempts ?? 10;
     this.fileVisibilityDelayMs = options.fileVisibilityDelayMs ?? 200;
     this.fileVisibilityBackoff = options.fileVisibilityBackoff ?? 1.5;
     this.releaseFailureCooldownMs = options.releaseFailureCooldownMs ?? (60 * 60 * 1000); // 1 hour cooldown
     this.maxSourceAttempts = options.maxSourceAttempts ?? 3; // Maximum bounded attempts per request
     this._fulfillLocks = new Map();
+    this._workLock = Promise.resolve();
+    this._finalizationPromises = new Map();
 
     // Path translation & containment
     this.shelfmarkPathPrefix = options.shelfmarkPathPrefix || process.env.SHELFMARK_PATH_PREFIX || '';
@@ -1440,6 +1473,7 @@ export class BridgeService {
           // 2. Only process approved ebook requests; ignore settled (available, cancelled, rejected)
           if (req.status !== 'approved') continue;
           if (req.mediaKind && req.mediaKind !== 'ebook') continue;
+          if (!req.language && !req.lang) req.language = 'English';
 
           // 3. Skip if already tracked (never blindly requeue on Socket.IO broadcasts)
           if (this.state.requests[reqId]) {
@@ -1471,6 +1505,7 @@ export class BridgeService {
             year: req.year || req.publicationYear || req.publishedYear || undefined,
             isbn13: req.isbn13 || (Array.isArray(req.isbn13s) ? req.isbn13s[0] : undefined),
             mediaKind: 'ebook',
+            language: req.language || req.lang || 'English',
           };
 
           const config = {
@@ -1569,7 +1604,8 @@ export class BridgeService {
            let ineligibilityReason = null;
            const candidateRejectionReasonCounts = {};
            const eligibleReleases = searchResults.filter((rel) => {
-             const reason = getEditionIncompatibilityReason(req, rel);
+             const reqForCompatibility = { ...req, language: req.language || req.lang || 'English' };
+          const reason = getEditionIncompatibilityReason(reqForCompatibility, rel);
              if (reason) {
                candidateRejectionReasonCounts[reason] = (candidateRejectionReasonCounts[reason] || 0) + 1;
                if (!ineligibilityReason) ineligibilityReason = reason;
@@ -1655,6 +1691,11 @@ export class BridgeService {
                 release: candidateRelease,
                 libraryId: req.targetLibraryId || this.defaultLibraryId,
                 folderId: req.targetFolderId || this.defaultFolderId,
+                requestTitle: req.title,
+                requestAuthor: req.author || (Array.isArray(req.authors) ? req.authors[0] : null),
+                requestAuthors: Array.isArray(req.authors) ? req.authors : (req.author ? [req.author] : []),
+                requestYear: parsePositiveInt(req.publishedYear || req.year),
+                requestLanguage: req.language || req.lang || 'English',
                 requestIsbn: req.isbn13 || req.isbn || (Array.isArray(req.isbn13s) ? req.isbn13s[0] : undefined),
                 fetchFn,
               });
@@ -1726,7 +1767,7 @@ export class BridgeService {
    * Queues a release exactly once. If already queued or completed, adopts existing task.
    * If Shelfmark returns an uncertain response without a task ID, tracks in uncertain_queue state.
    */
-  async queueRelease({ requestId, userId, release, libraryId, folderId, shelfmarkUrl, apiKey, requestIsbn, fetchFn = globalThis.fetch }) {
+  async queueRelease({ requestId, userId, release, libraryId, folderId, requestTitle, requestAuthor, requestAuthors, requestYear, requestLanguage, shelfmarkUrl, apiKey, requestIsbn, fetchFn = globalThis.fetch }) {
     if (this.isQueueingRelease) throw new Error('Queue operation already in progress');
     this.isQueueingRelease = true;
     try {
@@ -1797,6 +1838,30 @@ export class BridgeService {
         existing.userIds.push(userId);
       }
       existing.updatedAt = new Date().toISOString();
+      if (requestTitle && !existing.requestTitle) existing.requestTitle = requestTitle;
+      if (requestTitle) {
+        existing.requestTitles = existing.requestTitles || {};
+        if (!existing.requestTitles[requestId]) existing.requestTitles[requestId] = requestTitle;
+      }
+      if (requestAuthor && !existing.requestAuthor) existing.requestAuthor = requestAuthor;
+      if (requestAuthor) {
+        existing.requestAuthorsMap = existing.requestAuthorsMap || {};
+        if (!existing.requestAuthorsMap[requestId]) existing.requestAuthorsMap[requestId] = requestAuthor;
+      }
+      if (requestYear && !existing.requestYear) existing.requestYear = requestYear;
+      if (requestLanguage && !existing.requestLanguage) existing.requestLanguage = ID.normalizeLanguageCode(requestLanguage) || 'en';
+      if (requestTitle && !existing.requestTitle) existing.requestTitle = requestTitle;
+      if (requestTitle) {
+        existing.requestTitles = existing.requestTitles || {};
+        if (!existing.requestTitles[requestId]) existing.requestTitles[requestId] = requestTitle;
+      }
+      if (requestAuthor && !existing.requestAuthor) existing.requestAuthor = requestAuthor;
+      if (requestAuthor) {
+        existing.requestAuthorsMap = existing.requestAuthorsMap || {};
+        if (!existing.requestAuthorsMap[requestId]) existing.requestAuthorsMap[requestId] = requestAuthor;
+      }
+      if (requestYear && !existing.requestYear) existing.requestYear = requestYear;
+      if (requestLanguage && !existing.requestLanguage) existing.requestLanguage = ID.normalizeLanguageCode(requestLanguage) || 'en';
       if (requestIsbn && !existing.requestIsbn) existing.requestIsbn = requestIsbn;
       if (requestIsbn) {
         existing.requestIsbns = existing.requestIsbns || {};
@@ -2060,6 +2125,18 @@ export class BridgeService {
           throw new Error(`Incompatible ISBN for existing task ${taskId}: no verified ISBN evidence`);
         }
       }
+      if (requestTitle && !existing.requestTitle) existing.requestTitle = requestTitle;
+      if (requestTitle) {
+        existing.requestTitles = existing.requestTitles || {};
+        if (!existing.requestTitles[requestId]) existing.requestTitles[requestId] = requestTitle;
+      }
+      if (requestAuthor && !existing.requestAuthor) existing.requestAuthor = requestAuthor;
+      if (requestAuthor) {
+        existing.requestAuthorsMap = existing.requestAuthorsMap || {};
+        if (!existing.requestAuthorsMap[requestId]) existing.requestAuthorsMap[requestId] = requestAuthor;
+      }
+      if (requestYear && !existing.requestYear) existing.requestYear = requestYear;
+      if (requestLanguage && !existing.requestLanguage) existing.requestLanguage = ID.normalizeLanguageCode(requestLanguage) || 'en';
       if (requestIsbn && !existing.requestIsbn) existing.requestIsbn = requestIsbn;
       if (requestIsbn) {
         existing.requestIsbns = existing.requestIsbns || {};
@@ -2124,11 +2201,18 @@ export class BridgeService {
       author: downloadPayload.author || release.author,
       year: parsePositiveInt(release.year || release.publicationYear || downloadPayload.year) || null,
       isbn: release.isbn13 || release.isbn || downloadPayload.isbn || null,
+      requestTitle: requestTitle || null,
+      requestAuthor: requestAuthor || (Array.isArray(requestAuthors) ? requestAuthors[0] : null) || null,
+      requestAuthors: Array.isArray(requestAuthors) ? requestAuthors : (requestAuthor ? [requestAuthor] : []),
+      requestYear: parsePositiveInt(requestYear) || null,
       requestIsbn: requestIsbn || null,
       requestIsbns: requestIsbn ? { [requestId]: requestIsbn } : {},
+      requestTitles: requestId && requestTitle ? { [requestId]: requestTitle } : {},
+      requestAuthorsMap: requestId && (requestAuthor || (Array.isArray(requestAuthors) && requestAuthors[0])) ? { [requestId]: requestAuthor || requestAuthors[0] } : {},
       trustedIsbns: gatherTrustedIsbnsBridge(release?.extra?.bookMetadata, release?.extra, release),
       bookMetadata: release?.extra?.bookMetadata || null,
-      language: release.language || downloadPayload.language || null,
+      language: ID.normalizeLanguageCode(release.language || downloadPayload.language) || null,
+      requestLanguage: ID.normalizeLanguageCode(requestLanguage) || 'en',
       format: (downloadPayload.format || release.format || 'epub').toLowerCase(),
       source: downloadPayload.source,
       sourceId: downloadPayload.source_id,
@@ -2168,6 +2252,12 @@ export class BridgeService {
   /**
    * Processes post-download webhook notifications from Shelfmark's CUSTOM_SCRIPT hook.
    */
+  runExclusive(fn) {
+    const next = this._workLock.then(() => fn(), () => fn());
+    this._workLock = next.then(() => {}, () => {});
+    return next;
+  }
+
   async handleWebhook(payload, authHeader, fetchFn = globalThis.fetch) {
     const incomingSecret = (authHeader || '').replace(/^Bearer\s+/i, '').trim();
     if (!timingSafeCompare(incomingSecret, this.secret)) {
@@ -2182,8 +2272,14 @@ export class BridgeService {
     const pathsObj = payload.paths || {};
 
     const taskId = taskObj.task_id ?? taskObj.taskId ?? taskObj.id ?? payload.task_id ?? payload.taskId ?? payload.id;
-    const rawTarget = pathsObj.target || pathsObj.target_path || pathsObj.final_path || (Array.isArray(pathsObj.final_paths) && pathsObj.final_paths[0]) || payload.target_path || payload.download_path || payload.file_path || payload.final_path;
-    const allFinalPaths = Array.isArray(pathsObj.final_paths) ? pathsObj.final_paths : (Array.isArray(pathsObj.final_paths_list) ? pathsObj.final_paths_list : (pathsObj.final_path ? [pathsObj.final_path] : (rawTarget ? [rawTarget] : [])));
+    const rawTarget = pathsObj.target || pathsObj.target_path || pathsObj.final_path ||
+      (Array.isArray(pathsObj.final_paths) && pathsObj.final_paths[0]) ||
+      (Array.isArray(payload.final_paths) && payload.final_paths[0]) ||
+      payload.target_path || payload.download_path || payload.file_path || payload.final_path;
+    const allFinalPaths = Array.isArray(pathsObj.final_paths) ? pathsObj.final_paths :
+      (Array.isArray(payload.final_paths) ? payload.final_paths :
+      (Array.isArray(pathsObj.final_paths_list) ? pathsObj.final_paths_list :
+      (pathsObj.final_path ? [pathsObj.final_path] : (rawTarget ? [rawTarget] : []))));
     const title = taskObj.title || payload.title;
     const format = taskObj.format || payload.format || (rawTarget ? path.extname(rawTarget).replace('.', '') : 'epub');
 
@@ -2217,6 +2313,39 @@ export class BridgeService {
         task = matchingTasks[0];
       } else if (matchingTasks.length > 1) {
         console.warn(`[Bridge] Ambiguous task match for "${candTitle}": multiple candidate tasks found. Refusing to guess.`);
+      }
+    }
+
+    if (!task && (taskObj.requestIds || taskObj.requestId || payload.requestIds || payload.requestId)) {
+      const rids = Array.isArray(taskObj.requestIds) ? taskObj.requestIds :
+        (taskObj.requestId ? [taskObj.requestId] :
+        (Array.isArray(payload.requestIds) ? payload.requestIds : (payload.requestId ? [payload.requestId] : [])));
+      const now = new Date().toISOString();
+      task = {
+        taskId: taskId || `task-${Date.now()}`,
+        id: taskId || `task-${Date.now()}`,
+        title: taskObj.title || title || 'Unknown',
+        author: taskObj.author || payload.author || 'Unknown',
+        format: format || 'epub',
+        status: 'queued',
+        requestTitle: taskObj.requestTitle || title || null,
+        requestAuthor: taskObj.requestAuthor || taskObj.author || payload.author || null,
+        requestAuthors: taskObj.requestAuthors || (taskObj.author ? [taskObj.author] : []),
+        requestLanguage: ID.normalizeLanguageCode(taskObj.requestLanguage || payload.requestLanguage) || 'en',
+        requestIds: rids,
+        userIds: taskObj.userIds || [],
+        requestFulfillments: {},
+        fulfilledRequestIds: [],
+        unfulfilledRequestIds: [...rids],
+        createdAt: now,
+        updatedAt: now,
+      };
+      if (taskId) {
+        this.state.tasks[taskId] = task;
+        for (const rid of rids) {
+          this.state.requests[rid] = taskId;
+        }
+        this.saveState();
       }
     }
 
@@ -2278,16 +2407,29 @@ export class BridgeService {
 
     task.filePath = verification.safePath;
     task.sizeBytes = verification.sizeBytes;
-    task.status = 'completed';
+    if (task.status !== 'fulfilled' && task.status !== 'imported') {
+      task.status = 'completed';
+    }
     task.error = null;
     task.errorSource = null;
     task.updatedAt = new Date().toISOString();
     this.saveState();
 
-    // Import & fulfill BookOrbit requests
-    let fulfillResult = null;
-    if (this.bookorbitUrl) {
-      fulfillResult = await this.fulfillBookOrbitRequests(task, fetchFn);
+    // Schedule BookOrbit import/fulfillment in the background so the webhook
+    // responds within Shelfmark's timeout. Finalization is deduplicated per task.
+    let finalization = null;
+    if (this.bookorbitUrl && task.status !== 'fulfilled') {
+      const key = String(task.taskId || task.id || '');
+      let promise = this._finalizationPromises.get(key);
+      if (!promise) {
+        promise = this.runExclusive(() => this.fulfillBookOrbitRequests(task, fetchFn))
+          .catch((err) => {
+            console.warn(`[Bridge] Background finalization failed for ${key}: ${sanitizeLog(err?.message || err)}`);
+          })
+          .finally(() => this._finalizationPromises.delete(key));
+        this._finalizationPromises.set(key, promise);
+      }
+      finalization = promise;
     }
 
     return {
@@ -2296,9 +2438,10 @@ export class BridgeService {
       taskId: task.taskId,
       filePath: task.filePath,
       requestIds: task.requestIds,
-      bookId: fulfillResult?.bookId || null,
-      fulfilled: fulfillResult?.fulfilled || false,
-      error: fulfillResult?.error || null,
+      bookId: task.matchedBookId || null,
+      fulfilled: task.status === 'fulfilled',
+      finalization: task.status === 'fulfilled' ? 'already_fulfilled' : 'scheduled',
+      error: null,
     };
   }
 
@@ -2548,15 +2691,39 @@ export class BridgeService {
       const observedIsbn = String(book.isbn || '').replace(/[^0-9X]/gi, '');
       const editionVerified = Boolean(
         (expectedIsbn && observedIsbn && expectedIsbn === observedIsbn) ||
-        (expectedYear && observedYear && expectedYear === observedYear)
+        (expectedYear && observedYear && expectedYear === observedYear) ||
+        (!expectedIsbn && !expectedYear && areEditionsCompatible({ ...task, author: expectedAuthor }, book))
       );
       const newlyImported = baselineKnown && !beforeIds.has(id);
       if (mode === 'uncertain' && baselineKnown && !newlyImported) continue;
       if (!newlyImported && !editionVerified) continue;
       matched.set(id, book);
     }
-    // Never pick the first of multiple plausible editions. Require unique identity.
-    return matched.size === 1 ? [...matched.values()][0] : null;
+    if (matched.size === 1) return [...matched.values()][0];
+    if (matched.size > 1) {
+      const candidates = [...matched.values()];
+      if (task?.matchedBookId && matched.has(task.matchedBookId)) {
+        return matched.get(task.matchedBookId);
+      }
+      try {
+        if (task?.filePath && fs.existsSync(task.filePath)) {
+          const fileBuf = fs.readFileSync(task.filePath);
+          const hash = crypto.createHash('md5').update(fileBuf).digest('hex');
+          const hashMatch = candidates.find((b) => Array.isArray(b.files) && b.files.some((f) => f.fileHash === hash));
+          if (hashMatch) return hashMatch;
+        }
+      } catch {}
+      if (mode === 'conflict') {
+        const baseName = path.basename(task.filePath || '');
+        const destMatch = candidates.find((b) => {
+          const files = Array.isArray(b.files) ? b.files : [];
+          return files.some((f) => f.filename === baseName || f.filename === `${b.title}.${b.format}`);
+        });
+        if (destMatch) return destMatch;
+        return candidates[candidates.length - 1];
+      }
+    }
+    return null;
   }
   /**
    * Uploads file directly into BookOrbit Library:
@@ -3024,6 +3191,49 @@ export class BridgeService {
         return { fulfilled: false, error: task.error };
       }
 
+      // Verify the downloaded EPUB's actual metadata against the requested edition before upload.
+      if (String(task.filePath).toLowerCase().endsWith('.epub')) {
+        const epubMeta = extractEpubMetadataFromFile(task.filePath);
+        if (epubMeta) {
+          const expectedTitle = task.requestTitle || task.bookTitle || task.title || '';
+          const expectedAuthor = task.requestAuthor || task.bookAuthor || task.author || '';
+          const expectedLanguage = task.requestLanguage || 'en';
+
+          if (epubMeta.title && expectedTitle && !ID.isTitleMatch(epubMeta.title, expectedTitle)) {
+            task.status = 'finalization_failed';
+            task.error = `EPUB title mismatch: expected "${expectedTitle}", got "${epubMeta.title}"`;
+            this.recordTaskFailureAttempts(task, 'finalization_failed');
+            this.saveState();
+            if ((task.requestIds || []).some((rid) => (this.state.requestSourceAttempts[rid] || 0) < this.maxSourceAttempts)) {
+              this.triggerProcessPendingRequests(100);
+            }
+            return { fulfilled: false, error: task.error };
+          }
+          if (epubMeta.author && expectedAuthor && !ID.isAuthorMatch(epubMeta.author, expectedAuthor)) {
+            task.status = 'finalization_failed';
+            task.error = `EPUB author mismatch: expected "${expectedAuthor}", got "${epubMeta.author}"`;
+            this.recordTaskFailureAttempts(task, 'finalization_failed');
+            this.saveState();
+            if ((task.requestIds || []).some((rid) => (this.state.requestSourceAttempts[rid] || 0) < this.maxSourceAttempts)) {
+              this.triggerProcessPendingRequests(100);
+            }
+            return { fulfilled: false, error: task.error };
+          }
+          const normEpubLang = ID.normalizeLanguageCode(epubMeta.language);
+          const normExpectedLang = ID.normalizeLanguageCode(expectedLanguage);
+          if (normEpubLang && normExpectedLang && normEpubLang !== normExpectedLang) {
+            task.status = 'finalization_failed';
+            task.error = `EPUB language mismatch: expected "${normExpectedLang}", got "${epubMeta.language}" (${normEpubLang})`;
+            this.recordTaskFailureAttempts(task, 'finalization_failed');
+            this.saveState();
+            if ((task.requestIds || []).some((rid) => (this.state.requestSourceAttempts[rid] || 0) < this.maxSourceAttempts)) {
+              this.triggerProcessPendingRequests(100);
+            }
+            return { fulfilled: false, error: task.error };
+          }
+        }
+      }
+
       // Reconcile uncertain upload state: check authoritative BookOrbit library before re-uploading
       if (task.status === 'uncertain_upload' || task.uncertainUpload) {
         const resolved = await this.findAuthoritativeBookOrbitBook(task, targetLibraryId, headers, fetchFn, 'uncertain');
@@ -3048,7 +3258,7 @@ export class BridgeService {
         } else {
           // Try direct library upload first if library and folder are configured
           let directResult = { notFound: true };
-          if (targetLibraryId && targetFolderId) {
+          if (targetLibraryId) {
             // Capture a read-only baseline before any potentially non-idempotent POST.
             if (task.uploadBaselineChecked !== true) {
               const before = await this.listAuthoritativeBookOrbitBooks(task, targetLibraryId, headers, fetchFn);
@@ -3600,7 +3810,17 @@ export class BridgeService {
             updatedCount++;
 
             if (this.bookorbitUrl) {
-              await this.fulfillBookOrbitRequests(task, fetchFn);
+              const key = String(task.taskId || task.id || '');
+              let promise = this._finalizationPromises.get(key);
+              if (!promise) {
+                promise = this.runExclusive(() => this.fulfillBookOrbitRequests(task, fetchFn))
+                  .catch((err) => {
+                    console.warn(`[Bridge] Reconciliation finalization failed for ${key}: ${sanitizeLog(err?.message || err)}`);
+                  })
+                  .finally(() => this._finalizationPromises.delete(key));
+                this._finalizationPromises.set(key, promise);
+              }
+              await promise;
             }
           } else {
             // Completed by Shelfmark, but file is not yet visible / verifiable
@@ -3825,6 +4045,7 @@ export class BridgeService {
          report.task = {
            id: t.id || t.taskId || t.task_id || null,
            status: t.status || t.state || null,
+           error: t.error || null,
            format: t.format || null,
            source: t.source || null,
            sourceId: t.source_id || t.sourceId || null,
@@ -3832,6 +4053,8 @@ export class BridgeService {
            isbn: t.isbn || t.isbn13 || null,
            title: t.title || t.book_title || null,
            author: t.author || null,
+           matchedBookId: t.matchedBookId || null,
+           fulfilled: !!(t.requestFulfillments && t.requestFulfillments[requestId] && t.requestFulfillments[requestId].fulfilled),
            verificationEvidence: t.verificationEvidence || t.verification?.evidence || null,
            verificationConflicts: t.verificationConflicts || t.verification?.conflicts || null,
          };
@@ -4011,6 +4234,63 @@ export class BridgeService {
             }
             res.writeHead(200, { 'Content-Type': 'application/json' });
             res.end(JSON.stringify(this.diagnose(rid)));
+          } catch (e) {
+            res.writeHead(500, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ ok: false, error: sanitizeLog(e.message) }));
+          }
+        });
+        return;
+      }
+
+      // Companion-proxied BookOrbit book detail: GET /api/book/:id
+      if (req.method === 'GET' && url.pathname.startsWith('/api/book/')) {
+        if (!checkAuth()) {
+          res.writeHead(401, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: 'Unauthorized' }));
+          return;
+        }
+        const bookId = decodeURIComponent(url.pathname.slice('/api/book/'.length));
+        await runLocked(async () => {
+          try {
+            const headers = await this.getAuthHeaders();
+            const fetchFn = this.authManager.fetchFn || globalThis.fetch;
+            const r = await fetchFn(`${this.bookorbitUrl}/api/v1/books/${encodeURIComponent(bookId)}`, { headers });
+            const text = await r.text();
+            let body; try { body = JSON.parse(text); } catch { body = text; }
+            res.writeHead(r.status || 200, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify(body));
+          } catch (e) {
+            res.writeHead(500, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ ok: false, error: sanitizeLog(e.message) }));
+          }
+        });
+        return;
+      }
+
+      // Companion-extracted EPUB metadata: GET /api/epub-metadata/:fileId
+      if (req.method === 'GET' && url.pathname.startsWith('/api/epub-metadata/')) {
+        if (!checkAuth()) {
+          res.writeHead(401, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: 'Unauthorized' }));
+          return;
+        }
+        const fileId = decodeURIComponent(url.pathname.slice('/api/epub-metadata/'.length));
+        await runLocked(async () => {
+          try {
+            const headers = await this.getAuthHeaders();
+            const fetchFn = this.authManager.fetchFn || globalThis.fetch;
+            const r = await fetchFn(`${this.bookorbitUrl}/api/v1/books/files/${encodeURIComponent(fileId)}/download`, { headers });
+            if (!r.ok) {
+              const text = await r.text();
+              res.writeHead(r.status || 500, { 'Content-Type': 'application/json' });
+              res.end(JSON.stringify({ ok: false, error: sanitizeLog(text.slice(0, 200)) }));
+              return;
+            }
+            const ab = await r.arrayBuffer();
+            const buf = Buffer.from(ab);
+            const meta = extractEpubMetadata(buf);
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ ok: true, metadata: meta }));
           } catch (e) {
             res.writeHead(500, { 'Content-Type': 'application/json' });
             res.end(JSON.stringify({ ok: false, error: sanitizeLog(e.message) }));

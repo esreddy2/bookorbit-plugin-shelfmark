@@ -1,0 +1,101 @@
+# Isolated (disposable) E2E stack for BookOrbit v3.5.0 + Shelfmark v1.5.1 + companion
+name: e2e
+
+services:
+  postgres:
+    image: pgvector/pgvector:pg18
+    environment:
+      POSTGRES_USER: bookorbit
+      POSTGRES_PASSWORD: bookorbit
+      POSTGRES_DB: bookorbit
+      PGDATA: /var/lib/postgresql/data/pgdata
+    volumes:
+      - e2e_pgdata:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U bookorbit -d bookorbit"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  bookorbit:
+    image: ghcr.io/bookorbit/bookorbit:3.5.0
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgres://bookorbit:bookorbit@postgres:5432/bookorbit
+      POSTGRES_HOST: postgres
+      POSTGRES_USER: bookorbit
+      POSTGRES_PASSWORD: bookorbit
+      POSTGRES_DB: bookorbit
+      PORT: "3000"
+      APP_DATA_PATH: /data
+      JWT_SECRET: e2e-jwt-secret-change-me
+      SETUP_BOOTSTRAP_TOKEN: e2e-bootstrap-token
+      APP_URL: http://bookorbit:3000
+      CLIENT_URL: http://bookorbit:3000
+      NODE_ENV: production
+      PUID: "1000"
+      PGID: "1000"
+      TZ: UTC
+    ports:
+      - "127.0.0.1:13031:3000"
+    volumes:
+      - e2e_bo_data:/data
+      - ../e2e/plugins/indexers/shelfmark:/data/plugins/indexers/shelfmark
+    restart: unless-stopped
+
+  shelfmark:
+    image: ghcr.io/calibrain/shelfmark:v1.5.1
+    environment:
+      PUID: "1000"
+      PGID: "1000"
+      CUSTOM_SCRIPT: /scripts/shelfmark-hook.sh
+      CUSTOM_SCRIPT_JSON_PAYLOAD: "true"
+      BRIDGE_WEBHOOK_URL: http://companion:8090/webhook/shelfmark
+      BRIDGE_SECRET: bookorbit-shelfmark-secret
+      RECONCILE_INTERVAL_MS: "10000"
+      BRIDGE_HOST: companion
+      BRIDGE_PORT: "8090"
+      SHELFMARK_TASK_ID: ""
+    ports:
+      - "127.0.0.1:18085:8084"
+    volumes:
+      - ../e2e/shelfmark-config:/config
+      - ../e2e/shelfmark-books:/books
+      - ../scripts/shelfmark-hook.sh:/scripts/shelfmark-hook.sh:ro
+    restart: unless-stopped
+
+  companion:
+    image: node:22-alpine
+    working_dir: /data/bridge-state
+    command: ["sh", "-c", "mkdir -p /data/bridge-state && cd /data/bridge-state && node /app/bridge/bridge.mjs"]
+    environment:
+      BOOKORBIT_URL: http://bookorbit:3000
+      BOOKORBIT_USERNAME: admin
+      BOOKORBIT_PASSWORD: E2ePass123
+      SHELFMARK_URL: http://shelfmark:8084
+      SHELFMARK_API_KEY: "e2e-shelfmark-key"
+      BRIDGE_HOST: "0.0.0.0"
+      BRIDGE_PORT: "8090"
+      BRIDGE_SECRET: bookorbit-shelfmark-secret
+      RECONCILE_INTERVAL_MS: "10000"
+      BOOKORBIT_DEFAULT_LIBRARY_ID: "1"
+      PREFER_FORMAT: epub
+      SHELFMARK_PATH_PREFIX: ""
+      LOCAL_PATH_PREFIX: ""
+    ports:
+      - "127.0.0.1:8090:8090"
+    volumes:
+      - ../:/app:ro
+      - ../e2e/shelfmark-books:/books
+      - e2e_bridge_state:/data/bridge-state
+    depends_on:
+      - bookorbit
+      - shelfmark
+    restart: unless-stopped
+
+volumes:
+  e2e_pgdata:
+  e2e_bo_data:
+  e2e_bridge_state:

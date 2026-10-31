@@ -28,15 +28,150 @@ export function normalizeString(str) {
     .trim();
 }
 
+export function normalizeLanguageCode(lang) {
+  if (!lang) return null;
+  const s = String(lang).trim().toLowerCase();
+  if (!s) return null;
+  const base = s.split(/[-_]/)[0].trim();
+  const codeMap = {
+    english: 'en', en: 'en', eng: 'en',
+    spanish: 'es', es: 'es', spa: 'es',
+    portuguese: 'pt', pt: 'pt', por: 'pt',
+    french: 'fr', fr: 'fr', fra: 'fr', fre: 'fr',
+    german: 'de', de: 'de', deu: 'de', ger: 'de',
+    italian: 'it', it: 'it', ita: 'it',
+    russian: 'ru', ru: 'ru', rus: 'ru',
+    chinese: 'zh', zh: 'zh', zho: 'zh', chi: 'zh',
+    japanese: 'ja', ja: 'ja', jpn: 'ja',
+    korean: 'ko', ko: 'ko', kor: 'ko',
+    lithuanian: 'lt', lt: 'lt', lit: 'lt',
+    dutch: 'nl', nl: 'nl', nld: 'nl', dut: 'nl',
+    polish: 'pl', pl: 'pl', pol: 'pl',
+    swedish: 'sv', sv: 'sv', swe: 'sv',
+    norwegian: 'no', no: 'no', nor: 'no', nob: 'nb', nno: 'nn',
+    danish: 'da', da: 'da', dan: 'da',
+    finnish: 'fi', fi: 'fi', fin: 'fi',
+    arabic: 'ar', ar: 'ar', ara: 'ar',
+    hindi: 'hi', hi: 'hi', hin: 'hi',
+    greek: 'el', el: 'el', ell: 'el', gre: 'el',
+    czech: 'cs', cs: 'cs', ces: 'cs', cze: 'cs',
+    hungarian: 'hu', hu: 'hu', hun: 'hu',
+    turkish: 'tr', tr: 'tr', tur: 'tr',
+    ukrainian: 'uk', uk: 'uk', ukr: 'uk',
+    latin: 'la', la: 'la', lat: 'la',
+  };
+  if (codeMap[s]) return codeMap[s];
+  if (codeMap[base]) return codeMap[base];
+  if (/^[a-z]{2}$/.test(base)) return base;
+  return null;
+}
+
+export function stripLeadingArticle(str) {
+  if (!str) return '';
+  return String(str).replace(/^(?:the|a|an)\s+/i, '').trim();
+}
 export function getTokens(str) {
   return normalizeString(str).split(' ').filter((t) => t.length > 0);
+}
+
+function stripYearRanges(str) {
+  let out = '';
+  let ws = '';
+  const n = str.length;
+  let i = 0;
+  while (i < n) {
+    const ch = str[i];
+    if (/\s/.test(ch)) { ws += ch; i++; continue; }
+    const m = matchYearRangeAt(str, i, ws.length > 0);
+    if (m > 0) {
+      out += ' ';
+      ws = '';
+      i += m;
+      continue;
+    }
+    out += ws + ch;
+    ws = '';
+    i++;
+  }
+  out += ws;
+  return out;
+}
+
+function matchYearRangeAt(str, i, hasLeadingWs) {
+  const n = str.length;
+  let pos = i;
+  if (pos >= n) return 0;
+  if (str[pos] === '(') pos++;
+  const prevForBoundary = (str[i] === '(')
+    ? '('
+    : (hasLeadingWs ? ' ' : (pos > 0 ? str[pos - 1] : null));
+  if (pos < n && !boundary(prevForBoundary, str[pos])) return 0;
+  if (pos + 4 > n) return 0;
+  for (let t = 0; t < 4; t++) if (!/\d/.test(str[pos + t])) return 0;
+  pos += 4;
+  while (pos < n && /\s/.test(str[pos])) pos++;
+  if (pos >= n || !/[-–—]/.test(str[pos])) return 0;
+  pos++;
+  while (pos < n && /\s/.test(str[pos])) pos++;
+  let chosenPos = pos;
+  let found = false;
+  for (let k = 4; k >= 0; k--) {
+    if (pos + k > n) continue;
+    let allD = true;
+    for (let t = 0; t < k; t++) if (!/\d/.test(str[pos + t])) { allD = false; break; }
+    if (!allD) continue;
+    const after = pos + k;
+    const prev = k > 0 ? str[pos + k - 1] : (pos > 0 ? str[pos - 1] : null);
+    const prevForB = (k === 0 && hasLeadingWs && str[i] !== '(') ? ' ' : prev;
+    const curr = after < n ? str[after] : null;
+    if (boundary(prevForB, curr)) { chosenPos = after; found = true; break; }
+  }
+  if (!found) return 0;
+  pos = chosenPos;
+  if (pos < n && str[pos] === ')') pos++;
+  return pos - i;
+}
+
+function stripParentheticals(str) {
+  let out = '';
+  let ws = '';
+  const n = str.length;
+  let i = 0;
+  while (i < n) {
+    const ch = str[i];
+    if (/\s/.test(ch)) { ws += ch; i++; continue; }
+    if (ch === '(') {
+      const j = str.indexOf(')', i + 1);
+      if (j !== -1) {
+        out += ' ';
+        ws = '';
+        i = j + 1;
+        continue;
+      }
+      out += ws + str.slice(i);
+      ws = '';
+      i = n;
+      continue;
+    }
+    out += ws + ch;
+    ws = '';
+    i++;
+  }
+  out += ws;
+  return out;
+}
+
+function boundary(prev, curr) {
+  const pw = prev == null ? false : /[A-Za-z0-9_]/.test(prev);
+  const cw = curr == null ? false : /[A-Za-z0-9_]/.test(curr);
+  return pw !== cw;
 }
 
 export function toNaturalAuthor(author) {
   if (!author) return '';
   let s = String(author).trim();
-  s = s.replace(/\s*\(?\b\d{4}\s*[-–—]\s*\d{0,4}\b\)?/g, ' ').trim();
-  s = s.replace(/\s*\([^)]*\)/g, ' ').trim();
+  s = stripYearRanges(s).trim();
+  s = stripParentheticals(s).trim();
   s = s.replace(/[,.;]+$/, '').trim();
   if (s.includes(',')) {
     const parts = s.split(',').map((p) => p.trim()).filter(Boolean);
@@ -50,10 +185,41 @@ export function toNaturalAuthor(author) {
   return s.replace(/\s+/g, ' ').trim();
 }
 
+function stripBracketedGroups(str, open, close) {
+  let out = '';
+  let ws = '';
+  let i = 0;
+  const n = str.length;
+  while (i < n) {
+    const ch = str[i];
+    if (/\s/.test(ch)) { ws += ch; i++; continue; }
+    if (ch === open) {
+      const j = str.indexOf(close, i + 1);
+      if (j !== -1) {
+        i = j + 1;
+        while (i < n && /\s/.test(str[i])) i++;
+        out += ' ';
+        ws = '';
+        continue;
+      }
+      out += ws + str.slice(i);
+      ws = '';
+      i = n;
+      continue;
+    }
+    out += ws + ch;
+    ws = '';
+    i++;
+  }
+  out += ws;
+  return out;
+}
+
 export function extractCoreTitle(title) {
   if (!title) return '';
   let s = String(title).trim();
-  s = s.replace(/\s*\[[^\]]*\]\s*/g, ' ').replace(/\s*\([^)]*\)\s*/g, ' ').trim();
+  s = stripBracketedGroups(s, '[', ']');
+  s = stripBracketedGroups(s, '(', ')');
   s = s.replace(/\s+download\b/gi, '').trim();
   const byMatch = s.split(/\s+by\s+/i);
   if (byMatch.length > 1 && byMatch[0].trim().length >= 2) {
@@ -77,7 +243,9 @@ export function isNoiseDerivative(candidateTitle, requestedTitle) {
     'simplified retelling', 'retelling', 'abridged', 'graded reader', 'oxford bookworms',
     'penguin active reading', 'penguin readers', 'macmillan readers', 'graphic novel',
     'comic book', 'illustrated novel', 'complete works', 'box set', 'boxed set',
-    'omnibus', 'anthology',
+    'omnibus', 'anthology', 'historias de', 'relatos de', 'cuentos de',
+    'obras completas', 'coleccion de', 'and other stories', 'and other writings',
+    'selected works', 'selected writings', 'short stories', 'complete collection',
   ];
   for (const marker of noiseMarkers) {
     if (normCand.includes(marker) && !normReq.includes(marker)) return true;
@@ -315,6 +483,12 @@ export function titleMatchDecision(candidateTitle, requestedTitle) {
     evidence.push({ field: 'title', value: normCand, level: 'work', status: 'verified' });
     return { outcome: 'match', workConfidence: 'high', editionConfidence: 'medium', evidence, conflicts, reasonCodes };
   }
+  const normCandNoArt = stripLeadingArticle(normCand);
+  const normReqNoArt = stripLeadingArticle(normReq);
+  if (normCandNoArt && normReqNoArt && normCandNoArt === normReqNoArt) {
+    evidence.push({ field: 'title', value: normCand, level: 'work', status: 'verified' });
+    return { outcome: 'match', workConfidence: 'high', editionConfidence: 'medium', evidence, conflicts, reasonCodes };
+  }
   if (safePrefix(candidateTitle, requestedTitle) || safePrefix(requestedTitle, candidateTitle)) {
     evidence.push({ field: 'title', value: normCand, level: 'work', status: 'verified' });
     return { outcome: 'match', workConfidence: 'high', editionConfidence: 'medium', evidence, conflicts, reasonCodes };
@@ -354,6 +528,12 @@ export function titleMatchDecision(candidateTitle, requestedTitle) {
     evidence.push({ field: 'title', value: coreCand, level: 'work', status: 'verified' });
     return { outcome: 'match', workConfidence: 'high', editionConfidence: 'medium', evidence, conflicts, reasonCodes };
   }
+  const coreCandNoArt = stripLeadingArticle(coreCand);
+  const coreReqNoArt = stripLeadingArticle(coreReq);
+  if (coreCandNoArt && coreReqNoArt && (coreCandNoArt === coreReqNoArt || coreCandNoArt === normReqNoArt || normCandNoArt === coreReqNoArt)) {
+    evidence.push({ field: 'title', value: coreCand, level: 'work', status: 'verified' });
+    return { outcome: 'match', workConfidence: 'high', editionConfidence: 'medium', evidence, conflicts, reasonCodes };
+  }
   const candTokens = getTokens(candidateTitle);
   const reqTokens = getTokens(requestedTitle);
   if (reqTokens.length === 0) {
@@ -363,10 +543,21 @@ export function titleMatchDecision(candidateTitle, requestedTitle) {
     reasonCodes.push('single_token_title_conservative');
     return { outcome: 'unknown', workConfidence: 'low', editionConfidence: 'none', evidence, conflicts, reasonCodes };
   }
-  const matchingTokens = reqTokens.filter((t) => candTokens.includes(t));
-  if (matchingTokens.length === reqTokens.length && reqTokens.length > 1) {
-    evidence.push({ field: 'title', value: normCand, level: 'work', status: 'verified' });
-    return { outcome: 'match', workConfidence: 'high', editionConfidence: 'medium', evidence, conflicts, reasonCodes };
+  const artCandTokens = candTokens.filter((t) => !['the', 'a', 'an'].includes(t));
+  const artReqTokens = reqTokens.filter((t) => !['the', 'a', 'an'].includes(t));
+  if (artReqTokens.length > 0 && artCandTokens.length === artReqTokens.length) {
+    if (artReqTokens.every((t) => artCandTokens.includes(t))) {
+      evidence.push({ field: 'title', value: normCand, level: 'work', status: 'verified' });
+      return { outcome: 'match', workConfidence: 'high', editionConfidence: 'medium', evidence, conflicts, reasonCodes };
+    }
+  }
+  if (artReqTokens.length > 1 && artCandTokens.length === artReqTokens.length + 1) {
+    const isPrefix = safePrefix(normCand, normReq) || safePrefix(normReq, normCand);
+    const hasConnectors = /\b(?:and|with|\&|historias|stories|collection)\b/i.test(candidateTitle);
+    if (isPrefix && !hasConnectors && artReqTokens.every((t) => artCandTokens.includes(t))) {
+      evidence.push({ field: 'title', value: normCand, level: 'work', status: 'verified' });
+      return { outcome: 'match', workConfidence: 'high', editionConfidence: 'medium', evidence, conflicts, reasonCodes };
+    }
   }
   conflicts.push('title_mismatch');
   return { outcome: 'reject', workConfidence: 'none', editionConfidence: 'none', evidence, conflicts, reasonCodes };
@@ -495,8 +686,8 @@ export function editionCompatibility(a, b) {
   let formatOk = true;
   if (fmtA && fmtB && fmtA !== fmtB) { formatOk = false; conflicts.push('incompatible_format'); }
   // language
-  const langA = normalizeString(a.language || '');
-  const langB = normalizeString(b.language || '');
+  const langA = normalizeLanguageCode(a.language || '') || 'en';
+  const langB = normalizeLanguageCode(b.language || '');
   let langOk = true;
   if (langA && langB && langA !== langB) { langOk = false; conflicts.push('language_mismatch'); }
 
@@ -537,7 +728,7 @@ export function editionCompatibility(a, b) {
   if (yearA && yearB) {
     if (yearA !== yearB) { yearOk = false; conflicts.push('incompatible_year'); }
     else { yearVerified = true; }
-  } else if ((yearA && !yearB) || (!yearA && yearB)) {
+  } else if (yearA && !yearB) {
     if (!isbnVerified) {
       // Known requested year with unknown release year must not be treated as verified.
       yearOk = false;
@@ -569,12 +760,14 @@ export function editionCompatibility(a, b) {
 }
 
 function parsePositiveIntLocal(val) {
-  if (typeof val === 'number') return Number.isInteger(val) && val > 0 ? val : null;
-  if (typeof val === 'string' && /^\d+$/.test(val.trim())) {
-    const p = parseInt(val.trim(), 10);
-    return p > 0 ? p : null;
+  let p = null;
+  if (typeof val === 'number') p = Number.isInteger(val) && val > 0 ? val : null;
+  else if (typeof val === 'string' && /^\d+$/.test(val.trim())) {
+    const parsed = parseInt(val.trim(), 10);
+    p = parsed > 0 ? parsed : null;
   }
-  return null;
+  if (p !== null && (p < 1000 || p > 2100)) return null;
+  return p;
 }
 
 export function areEditionsCompatible(a, b) {

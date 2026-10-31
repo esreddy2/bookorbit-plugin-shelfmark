@@ -10,3 +10,10 @@ fixtures/bridge_test_*
 API_INTEGRATION_AUDIT.md
 
 API_INTEGRATION_RESPONSE.md
+
+# E2E probe evidence (generated)
+e2e/results/
+e2e/shelfmark-books/
+e2e/shelfmark-config/
+e2e/e2e/
+e2e/plugins/

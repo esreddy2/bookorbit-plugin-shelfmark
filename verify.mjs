@@ -58,7 +58,10 @@ import {
   isbn13To10,
   normalizeString,
   toNaturalAuthor,
+  extractCoreTitle,
   isNoiseDerivative,
+  normalizeLanguageCode,
+  stripLeadingArticle,
   extractEpubMetadata,
   extractEpubMetadataFromFile,
   MAGIC_BYTES,
@@ -66,7 +69,7 @@ import {
 } from './bridge/bridge.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
-const EXPECTED_VERSION = '1.7.4';
+const EXPECTED_VERSION = '1.7.5';
 const RELEASE_MODE = process.argv.includes('--release');
 const TEST_TIMEOUT_MS = 10_000;
 const tests = [];
@@ -386,7 +389,7 @@ test('DECLARATION: BookOrbit API v1, Shelfmark indexer and ebook-only', () => {
   assert.equal(plugin.type, 'shelfmark');
   assert.deepEqual(plugin.mediaKinds, ['ebook']);
 });
-test('DECLARATION: native indexer advertises v1.7.4, never a previous version', () => {
+test('DECLARATION: native indexer advertises v1.7.5, never a previous version', () => {
   assert.equal(plugin.version, EXPECTED_VERSION);
 });
 test('DECLARATION: exposes search, test, and resolveFile entry points', () => {
@@ -412,7 +415,7 @@ test('RELEASE CONTRACT: package version, plugin version and release target agree
   assert.equal(plugin.version, EXPECTED_VERSION);
 });
 if (RELEASE_MODE) {
-  test('RELEASE: signed manifest has declared format and v1.7.4 version', () => {
+  test('RELEASE: signed manifest has declared format and v1.7.5 version', () => {
     const manifest = JSON.parse(readFileSync(join(HERE, 'updates', 'shelfmark.json'), 'utf8'));
     assert.equal(manifest.schemaVersion, 1);
     assert.equal(manifest.type, 'shelfmark');
@@ -1084,7 +1087,7 @@ test('NATIVE: OceanofPDF queue POST contains the real source page URL', async ()
   await plugin.resolveFile(selected, config(), hostWith(fake.fetch));
   assert.equal(fake.called('sm.download').length, 1, 'must queue new task');
   const body = expectedJson(fake.called('sm.download')[0].options);
-  assert.ok([body.download_url, body.info_url, body.source_url, body.extra?.source_url].includes(oceanPage),
+  assert.ok([body.download_url, body.info_url, body.source_url, body.extra?.source_url].some((value) => value === oceanPage),
     'book page URL was omitted, which causes OceanofPDF to fail');
   fake.assertKnownRoutes();
 });
@@ -1376,7 +1379,7 @@ test('QUEUE: OceanofPDF URL reaches Shelfmark unchanged from companion queue', a
   assert.equal(fake.called('sm.download').length, 1);
   const payload = expectedJson(fake.called('sm.download')[0].options);
   assert.ok([payload.download_url, payload.info_url, payload.source_url, payload.extra?.source_url]
-    .includes(oceanPage));
+    .some((value) => value === oceanPage));
   fake.assertKnownRoutes();
 });
 for (const candidateUrl of [null, '', 'file:///etc/passwd', 'http://localhost/admin',
@@ -1401,7 +1404,7 @@ test('QUEUE: a release selected with a full serialized GUID retains source URL a
   await queueFixture(fake, bridge, selected);
   const body = expectedJson(fake.called('sm.download')[0].options);
   assert.equal(body.source_id, 'oceanofpdf:guid-case');
-  assert.ok([body.source_url, body.download_url, body.info_url].includes(oceanPage));
+  assert.ok([body.source_url, body.download_url, body.info_url].some((value) => value === oceanPage));
 });
 test('QUEUE: no fabricated task IDs after Shelfmark returns a real namespaced task ID', async () => {
   const bridge = new BridgeService(bridgeOpts());
@@ -1474,6 +1477,7 @@ test('EDITION: OPF date, ISBN, author and language extracted from a real EPUB ZI
   assert.match(String(result.author), /Mary/i);
   assert.equal(result.year, 1818);
   assert.equal(result.isbn, '9780141439471');
+  assert.equal(result.language, 'en');
 });
 test('EDITION: reading EPUB metadata from Buffer agrees with reading from file', () => {
   const file = extractEpubMetadataFromFile(FILES.validEpub);
@@ -1511,6 +1515,23 @@ test('EDITION: direct upload collision must not convert 1818 request into 2015 b
   assert.equal(result.fulfilled, false);
   assert.equal(fulfils, 0);
   assert.equal(task.matchedBookId == null, true);
+});
+
+test('FULFILL: direct upload proceeds when libraryId is present but folderId is absent', async () => {
+  const bridge = new BridgeService(bridgeOpts({ defaultLibraryId: 1, defaultFolderId: null }));
+  const task = createTask(bridge, { title: 'A Tale of Two Cities', author: 'Charles Dickens',
+    year: 1859, filePath: FILES.taleEpub, libraryId: 1, folderId: null,
+    requestIds: ['no-folder'] });
+  let uploads = 0;
+  const fake = apiScenarios({
+    requests: [request('no-folder', 'A Tale of Two Cities', 'Charles Dickens', { targetFolderId: null })],
+    'bo.upload': (entry) => { uploads++; return response({ id: 901 }); },
+    'bo.fulfill': () => response({ status: 'AVAILABLE' }),
+  });
+  const result = await bridge.fulfillBookOrbitRequests(task, fake.fetch);
+  assert.equal(result.fulfilled, true);
+  assert.equal(uploads, 1);
+  assert.equal(task.matchedBookId, 901);
 });
 
 
@@ -1953,7 +1974,7 @@ test('FULFILL: successful request fulfillment remains successful after repeated 
 test('FULFILL: two requesters share one import but each receives their own fulfillment', async () => {
   const { task, fake, result } = await directFulfillScenario({
     taskOptions: { requestIds: ['alice-1984', 'bob-1984'], userIds: ['alice', 'bob'],
-      title: '1984', author: 'George Orwell' },
+      title: 'A Tale of Two Cities', author: 'Charles Dickens' },
   });
   assert.equal(fake.called('bo.upload').length, 1);
   assert.equal(fake.called('bo.fulfill').length, 2);
@@ -2556,7 +2577,7 @@ test('WEBHOOK: unknown task ID cannot authorize an unrelated file import', async
 });
 test('WEBHOOK: nested Shelfmark v1.5.1 JSON identifies exactly the queued task and completed file', async () => {
   const bridge = new BridgeService(bridgeOpts({ secret: 'webhook-fixture' }));
-  const task = createTask(bridge, { status: 'queued', filePath: null, requestIds: ['hook-success'] });
+  const task = createTask(bridge, { status: 'queued', filePath: null, requestIds: ['hook-success'], title: 'Frankenstein', author: 'Mary Shelley' });
   const fake = apiScenarios({ requests: [request('hook-success', task.title, task.author)],
     'bo.upload': { id: 1777 }, 'bo.fulfill': { status: 'AVAILABLE' } });
   const result = await bridge.handleWebhook({
@@ -2566,6 +2587,7 @@ test('WEBHOOK: nested Shelfmark v1.5.1 JSON identifies exactly the queued task a
     paths: { destination: root, target: FILES.validEpub, final_paths: [FILES.validEpub] },
   }, 'webhook-fixture', fake.fetch);
   assert.equal(result.ok, true);
+  await waitUntil(() => task.status === 'fulfilled' || task.status === 'partially_fulfilled', 2000);
   assert.equal(task.status, 'fulfilled');
   assert.equal(task.matchedBookId, 1777);
   assert.equal(fake.called('bo.upload').length, 1);
@@ -2574,12 +2596,13 @@ test('WEBHOOK: nested Shelfmark v1.5.1 JSON identifies exactly the queued task a
 });
 test('WEBHOOK: delivery can arrive twice without a second upload or fulfillment', async () => {
   const bridge = new BridgeService(bridgeOpts({ secret: 'webhook-fixture' }));
-  const task = createTask(bridge, { status: 'queued', filePath: null, requestIds: ['hook-repeat'] });
+  const task = createTask(bridge, { status: 'queued', filePath: null, requestIds: ['hook-repeat'], title: 'Frankenstein', author: 'Mary Shelley' });
   const fake = apiScenarios({ requests: [request('hook-repeat', task.title, task.author)],
     'bo.upload': { id: 1778 }, 'bo.fulfill': { status: 'AVAILABLE' } });
   const body = { task: { task_id: task.taskId, format: 'epub' },
     paths: { target: FILES.validEpub, final_paths: [FILES.validEpub] } };
   await bridge.handleWebhook(body, 'webhook-fixture', fake.fetch);
+  await waitUntil(() => task.matchedBookId === 1778, 2000);
   await bridge.handleWebhook(body, 'webhook-fixture', fake.fetch);
   assert.equal(fake.called('bo.upload').length, 1);
   assert.equal(fake.called('bo.fulfill').length, 1);
@@ -2600,7 +2623,7 @@ test('WEBHOOK: file not yet visible remains recoverable instead of failing the S
 // ─────────────────────────────────────────────────────────────────────────────
 test('RECONCILE: completed keyed Shelfmark task is recognized without any old polling bridge', async () => {
   const bridge = new BridgeService(bridgeOpts());
-  const task = createTask(bridge, { status: 'queued', filePath: null, requestIds: ['recon-complete'] });
+  const task = createTask(bridge, { status: 'queued', filePath: null, requestIds: ['recon-complete'], title: 'Frankenstein', author: 'Mary Shelley' });
   const fake = apiScenarios({ 'sm.status': response({ complete: {
     [task.taskId]: { id: task.taskId, title: task.title, format: 'epub', target: FILES.validEpub },
   }, downloading: {}, queued: {}, error: {} }),
@@ -3149,7 +3172,9 @@ test('E2E: a fresh approved book reaches Available via one queue and one direct 
     output: { mode: 'folder' },
   }, 'e2e-fixture-secret', fake.fetch);
   assert.equal(outcome.ok, true);
+  await waitUntil(() => restarted.state.tasks['e2e-f451-shelfmark-task'].matchedBookId === 2001, 2000);
   assert.equal(restarted.state.tasks['e2e-f451-shelfmark-task'].matchedBookId, 2001);
+  await waitUntil(() => restarted.state.tasks['e2e-f451-shelfmark-task'].status === 'fulfilled', 2000);
   assert.equal(restarted.state.tasks['e2e-f451-shelfmark-task'].status, 'fulfilled');
   assert.equal(fake.called('bo.upload').length, 1);
   assert.equal(fake.called('bo.fulfill').length, 1);
@@ -3251,7 +3276,7 @@ test('PRODUCTION: a real OceanofPDF page URL survives native search → companio
   const body = expectedJson(fake.called('sm.download')[0].options);
   assert.equal(body.source_id, 'oceanofpdf:regression-1984');
   assert.ok([body.source_url, body.download_url, body.info_url, body.extra?.source_url]
-    .includes(oceanPage), 'the book page was lost between search and download queue');
+    .some((value) => value === oceanPage), 'the book page was lost between search and download queue');
   fake.assertKnownRoutes();
 });
 test('REGRESSION: plugin host.fail returning undefined cannot create an invalid thrown value', async () => {
@@ -3511,6 +3536,265 @@ test('STATEFUL: duplicate webhook events do not duplicate upload or fulfillment'
   assert.equal(fake.called('bo.fulfill').length, fulfillsBefore, 'duplicate webhook must not re-fulfill');
   fake.assertKnownRoutes();
 });
+
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 14. Security hardening (CodeQL alert regressions)
+// ─────────────────────────────────────────────────────────────────────────────
+test('SECURITY: toNaturalAuthor strips year ranges and parentheticals', () => {
+  assert.equal(toNaturalAuthor('George Orwell (1949-1950)'), 'George Orwell');
+  assert.equal(toNaturalAuthor('Smith, John (1900)'), 'John Smith');
+  assert.equal(toNaturalAuthor('1984 - 1990'), '');
+});
+
+test('SECURITY: toNaturalAuthor is linear on adversarial input', () => {
+  const start = performance.now();
+  const out = toNaturalAuthor(' '.repeat(100000) + '(');
+  const elapsed = performance.now() - start;
+  assert.ok(elapsed < 100, `toNaturalAuthor took ${elapsed}ms on adversarial input`);
+  assert.equal(typeof out, 'string');
+});
+
+test('SECURITY: extractCoreTitle strips brackets and parens', () => {
+  assert.equal(extractCoreTitle('Foo [bar] (baz) - extra'), 'Foo');
+});
+
+test('SECURITY: extractCoreTitle is linear on adversarial input', () => {
+  const start = performance.now();
+  const out = extractCoreTitle('['.repeat(100000));
+  const elapsed = performance.now() - start;
+  assert.ok(elapsed < 100, `extractCoreTitle took ${elapsed}ms on adversarial input`);
+  assert.equal(typeof out, 'string');
+});
+
+test('SECURITY: BookOrbitSocketClient clamps unbounded heartbeat timers', () => {
+  const client = new BookOrbitSocketClient({ url: 'http://127.0.0.1:3000', token: fakeJwt(3600) });
+  client.ws = { readyState: 1, send() {}, close() {} };
+  client.handlePacket('0{"sid":"sec-fixture","pingInterval":1e12,"pingTimeout":1e12}');
+  assert.ok(client._allowedSilenceMs <= 600000, 'timer must be clamped to MAX_ALLOWED_SILENCE_MS');
+  assert.ok(client._allowedSilenceMs >= 2000, 'timer must be bounded below');
+  client.close();
+});
+
+function makeSyntheticEpub(opfContent) {
+  const opfBuf = Buffer.from(opfContent, 'utf8');
+  const nameBuf = Buffer.from('content.opf', 'utf8');
+  const header = Buffer.alloc(30);
+  header.writeUInt32LE(0x04034b50, 0);
+  header.writeUInt16LE(20, 4);
+  header.writeUInt16LE(0, 6);
+  header.writeUInt16LE(0, 8);
+  header.writeUInt16LE(0, 10);
+  header.writeUInt16LE(0, 12);
+  header.writeUInt32LE(0, 14);
+  header.writeUInt32LE(opfBuf.length, 18);
+  header.writeUInt32LE(opfBuf.length, 22);
+  header.writeUInt16LE(nameBuf.length, 26);
+  header.writeUInt16LE(0, 28);
+  return Buffer.concat([header, nameBuf, opfBuf]);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 15. Correctness & Edition Integrity Regressions (Requirements A & B)
+// ─────────────────────────────────────────────────────────────────────────────
+test('REGRESSION: normalizeLanguageCode handles ISO 639-1, 639-2, regional tags and names', () => {
+  assert.equal(normalizeLanguageCode('en'), 'en');
+  assert.equal(normalizeLanguageCode('eng'), 'en');
+  assert.equal(normalizeLanguageCode('en-US'), 'en');
+  assert.equal(normalizeLanguageCode('en_GB'), 'en');
+  assert.equal(normalizeLanguageCode('English'), 'en');
+
+  assert.equal(normalizeLanguageCode('es'), 'es');
+  assert.equal(normalizeLanguageCode('spa'), 'es');
+  assert.equal(normalizeLanguageCode('Spanish'), 'es');
+
+  assert.equal(normalizeLanguageCode('pt'), 'pt');
+  assert.equal(normalizeLanguageCode('por'), 'pt');
+  assert.equal(normalizeLanguageCode('pt-BR'), 'pt');
+  assert.equal(normalizeLanguageCode('Portuguese'), 'pt');
+
+  assert.equal(normalizeLanguageCode('ko'), 'ko');
+  assert.equal(normalizeLanguageCode('kor'), 'ko');
+  assert.equal(normalizeLanguageCode('Korean'), 'ko');
+
+  assert.equal(normalizeLanguageCode('fra'), 'fr');
+  assert.equal(normalizeLanguageCode('deu'), 'de');
+  assert.equal(normalizeLanguageCode('ger'), 'de');
+  assert.equal(normalizeLanguageCode('ita'), 'it');
+  assert.equal(normalizeLanguageCode('rus'), 'ru');
+  assert.equal(normalizeLanguageCode('zho'), 'zh');
+  assert.equal(normalizeLanguageCode('jpn'), 'ja');
+
+  assert.equal(normalizeLanguageCode(null), null);
+  assert.equal(normalizeLanguageCode(''), null);
+  assert.equal(normalizeLanguageCode('unknown_lang_xyz'), null);
+});
+
+test('REGRESSION: missing request year with known release year is accepted', () => {
+  const req = { title: 'Fahrenheit 451', author: 'Ray Bradbury', year: null };
+  const cand = { title: 'Fahrenheit 451', author: 'Ray Bradbury', year: 1953 };
+  const d = editionCompatibility(req, cand);
+  assert.equal(d.outcome, 'provisional');
+  assert.ok(!d.conflicts.includes('unknown_release_year'));
+  assert.ok(!d.conflicts.includes('incompatible_year'));
+});
+
+test('REGRESSION: known request year with unknown release year is rejected without verified ISBN', () => {
+  const req = { title: 'Fahrenheit 451', author: 'Ray Bradbury', year: 1953 };
+  const cand = { title: 'Fahrenheit 451', author: 'Ray Bradbury', year: null };
+  const d = editionCompatibility(req, cand);
+  assert.equal(d.outcome, 'reject');
+  assert.ok(d.conflicts.includes('unknown_release_year'));
+});
+
+test('REGRESSION: titleMatchDecision rejects anthology/compilation false positives', () => {
+  const req = 'Fahrenheit 451';
+  const candAnthology = 'Ray Bradbury Library El placer de quemar: Historias de Fahrenheit 451 9788445010327; 8445010328 b f 3686696';
+  assert.equal(titleMatchDecision(candAnthology, req).outcome, 'reject');
+
+  const req2 = 'The Great Gatsby';
+  const candOmnibus = 'F. Scott Fitzgerald: The Great Gatsby, All the Sad Young Men & Other Writings 1920–26';
+  assert.equal(titleMatchDecision(candOmnibus, req2).outcome, 'reject');
+
+  const candBundle = 'The Great Gatsby and Fahrenheit 451';
+  assert.equal(titleMatchDecision(candBundle, req).outcome, 'reject');
+  assert.equal(titleMatchDecision(candBundle, req2).outcome, 'reject');
+});
+
+test('REGRESSION: titleMatchDecision matches leading article variants bidirectionally', () => {
+  assert.equal(titleMatchDecision('The Great Gatsby', 'Great Gatsby').outcome, 'match');
+  assert.equal(titleMatchDecision('Great Gatsby', 'The Great Gatsby').outcome, 'match');
+  assert.equal(titleMatchDecision('A Tale of Two Cities', 'Tale of Two Cities').outcome, 'match');
+});
+
+test('REGRESSION: editionCompatibility enforces English default and rejects foreign releases', () => {
+  const reqDefault = { title: '1984', author: 'George Orwell' };
+  const candEn = { title: '1984', author: 'George Orwell', language: 'en' };
+  const candEng = { title: '1984', author: 'George Orwell', language: 'English' };
+  const candPt = { title: '1984', author: 'George Orwell', language: 'pt' };
+  const candKo = { title: '1984', author: 'George Orwell', language: 'ko' };
+  const candUnknown = { title: '1984', author: 'George Orwell', language: null };
+
+  assert.notEqual(editionCompatibility(reqDefault, candEn).outcome, 'reject');
+  assert.notEqual(editionCompatibility(reqDefault, candEng).outcome, 'reject');
+  assert.equal(editionCompatibility(reqDefault, candPt).outcome, 'reject');
+  assert.ok(editionCompatibility(reqDefault, candPt).conflicts.includes('language_mismatch'));
+  assert.equal(editionCompatibility(reqDefault, candKo).outcome, 'reject');
+  assert.ok(editionCompatibility(reqDefault, candKo).conflicts.includes('language_mismatch'));
+  assert.notEqual(editionCompatibility(reqDefault, candUnknown).outcome, 'reject');
+});
+
+test('REGRESSION: pre-upload EPUB OPF check rejects EPUB with mismatched title, author, or language', async () => {
+  const bridge = new BridgeService(bridgeOpts());
+  const epubPath = join(root, 'mismatch-test.epub');
+
+  const makeEpub = (title, author, lang) => {
+    const opf = `<?xml version="1.0" encoding="utf-8"?>
+<package xmlns="http://www.idpf.org/2007/opf" version="2.0">
+  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/">
+    <dc:title>${title}</dc:title>
+    <dc:creator>${author}</dc:creator>
+    <dc:language>${lang}</dc:language>
+  </metadata>
+</package>`;
+    writeFileSync(epubPath, makeSyntheticEpub(opf));
+  };
+
+  const fake = apiScenarios({
+    requests: [request('req-opf-1', 'Fahrenheit 451', 'Ray Bradbury')],
+  });
+
+  // 1. EPUB title mismatch
+  makeEpub('El placer de quemar', 'Ray Bradbury', 'en');
+  const taskTitleMismatch = createTask(bridge, {
+    taskId: 'task-opf-1',
+    filePath: epubPath,
+    status: 'completed',
+    requestTitle: 'Fahrenheit 451',
+    requestAuthor: 'Ray Bradbury',
+    requestLanguage: 'en',
+    requestIds: ['req-opf-1'],
+  });
+  const res1 = await bridge.fulfillBookOrbitRequests(taskTitleMismatch, fake.fetch);
+  assert.equal(res1.fulfilled, false);
+  assert.equal(taskTitleMismatch.status, 'finalization_failed');
+  assert.ok(taskTitleMismatch.error.includes('EPUB title mismatch'));
+
+  // 2. EPUB language mismatch
+  makeEpub('Fahrenheit 451', 'Ray Bradbury', 'es');
+  const taskLangMismatch = createTask(bridge, {
+    taskId: 'task-opf-2',
+    filePath: epubPath,
+    status: 'completed',
+    requestTitle: 'Fahrenheit 451',
+    requestAuthor: 'Ray Bradbury',
+    requestLanguage: 'en',
+    requestIds: ['req-opf-1'],
+  });
+  const res2 = await bridge.fulfillBookOrbitRequests(taskLangMismatch, fake.fetch);
+  assert.equal(res2.fulfilled, false);
+  assert.equal(taskLangMismatch.status, 'finalization_failed');
+  assert.ok(taskLangMismatch.error.includes('EPUB language mismatch'));
+
+  // 3. EPUB author mismatch
+  makeEpub('Fahrenheit 451', 'Different Author', 'en');
+  const taskAuthorMismatch = createTask(bridge, {
+    taskId: 'task-opf-3',
+    filePath: epubPath,
+    status: 'completed',
+    requestTitle: 'Fahrenheit 451',
+    requestAuthor: 'Ray Bradbury',
+    requestLanguage: 'en',
+    requestIds: ['req-opf-1'],
+  });
+  const res3 = await bridge.fulfillBookOrbitRequests(taskAuthorMismatch, fake.fetch);
+  assert.equal(res3.fulfilled, false);
+  assert.equal(taskAuthorMismatch.status, 'finalization_failed');
+  assert.ok(taskAuthorMismatch.error.includes('EPUB author mismatch'));
+});
+
+test('REGRESSION: handleWebhook responds promptly with finalization scheduled and does not regress fulfilled state', async () => {
+  const bridge = new BridgeService(bridgeOpts({ secret: 'e2e-fixture-secret' }));
+  const epubPath = join(root, 'webhook-speed.epub');
+  writeFileSync(epubPath, makeSyntheticEpub(`<?xml version="1.0"?><package><metadata xmlns:dc="http://purl.org/dc/elements/1.1/"><dc:title>1984</dc:title><dc:creator>George Orwell</dc:creator><dc:language>en</dc:language></metadata></package>`));
+
+  const task = createTask(bridge, {
+    taskId: 'task-webhook-1',
+    filePath: epubPath,
+    status: 'queued',
+    requestTitle: '1984',
+    requestAuthor: 'George Orwell',
+    requestLanguage: 'en',
+    requestIds: ['req-wh-1'],
+  });
+
+  const payload = {
+    event: 'download_complete',
+    task_id: 'task-webhook-1',
+    final_paths: [epubPath],
+  };
+
+  const start = performance.now();
+  const res = await bridge.handleWebhook(payload, 'e2e-fixture-secret');
+  const elapsed = performance.now() - start;
+
+  assert.equal(res.ok, true);
+  assert.equal(res.statusCode, 200);
+  assert.equal(res.finalization, 'scheduled');
+  assert.ok(elapsed < 500, `Webhook took ${elapsed}ms; should be non-blocking and <500ms`);
+
+  task.status = 'fulfilled';
+  task.matchedBookId = 999;
+  bridge.saveState();
+
+  const dupRes = await bridge.handleWebhook(payload, 'e2e-fixture-secret');
+  assert.equal(dupRes.ok, true);
+  assert.equal(dupRes.fulfilled, true);
+  assert.equal(dupRes.finalization, 'already_fulfilled');
+  assert.equal(task.status, 'fulfilled');
+  assert.equal(task.matchedBookId, 999);
+});
+
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Test runner — keep executing after failures so one bad release is diagnosed
