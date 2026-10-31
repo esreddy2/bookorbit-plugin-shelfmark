@@ -648,13 +648,15 @@ export function isAuthorMatch(candidateAuthors, requestedAuthor) {
 
 // ---------- Edition compatibility ----------
 
-export function editionCompatibility(a, b) {
+export function editionCompatibility(a, b, options = {}) {
   const evidence = [];
   const conflicts = [];
   const reasonCodes = [];
   if (!a || !b) {
     return { outcome: 'unknown', workConfidence: 'none', editionConfidence: 'none', evidence, conflicts, reasonCodes: ['missing_input'] };
   }
+  const requireVerifiedEdition = Boolean(options?.requireVerifiedEdition || options?.strict || options?.stage === 'final');
+
   // title
   const titleA = (a.bookTitle || a.title || '').trim();
   const titleB = (b.bookTitle || b.title || '').trim();
@@ -667,8 +669,8 @@ export function editionCompatibility(a, b) {
     titleOk = false; conflicts.push('missing_title');
   }
   // author
-  const authorsA = Array.isArray(a.authors) ? a.authors : (a.author ? [a.author] : []);
-  const authorsB = Array.isArray(b.authors) ? b.authors : (b.author ? [b.author] : []);
+  const authorsA = Array.isArray(a.authors) && a.authors.length ? a.authors : (a.author ? [a.author] : []);
+  const authorsB = Array.isArray(b.authors) && b.authors.length ? b.authors : (b.author ? [b.author] : []);
   let authorOk = true;
   if (authorsA.length && authorsB.length) {
     // require at least one compatible author pair
@@ -686,62 +688,128 @@ export function editionCompatibility(a, b) {
   let formatOk = true;
   if (fmtA && fmtB && fmtA !== fmtB) { formatOk = false; conflicts.push('incompatible_format'); }
   // language
-  const langA = normalizeLanguageCode(a.language || '') || 'en';
-  const langB = normalizeLanguageCode(b.language || '');
+  const langA = normalizeLanguageCode(a.language || a.epubMetadata?.language || '') || 'en';
+  const langB = normalizeLanguageCode(b.language || b.epubMetadata?.language || '');
   let langOk = true;
   if (langA && langB && langA !== langB) { langOk = false; conflicts.push('language_mismatch'); }
 
-  // ISBN
-  const extractFirstIsbn = (x) => {
-    const vals = Array.isArray(x) ? x : [x];
-    for (const v of vals) {
-      const c = normalizeIsbn(v);
-      if (c.length === 10 || c.length === 13) return c;
+  // ISBN (collect all authentic ISBNs on each side, including OPF multi-identifier lists)
+  const collectIsbnList = (obj) => {
+    const out = [];
+    const seen = new Set();
+    const sources = [
+      obj?.isbn13,
+      obj?.isbn13s,
+      obj?.isbn,
+      obj?.extra?.isbn,
+      obj?.extra?.isbn13,
+      obj?.extra?.isbn_13,
+      obj?.epubMetadata?.isbns,
+      obj?.epubMetadata?.isbn,
+    ];
+    for (const src of sources) {
+      const vals = Array.isArray(src) ? src : [src];
+      for (const v of vals) {
+        if (v == null) continue;
+        const c = normalizeIsbn(v);
+        if ((c.length === 10 || c.length === 13) && !seen.has(c)) {
+          seen.add(c);
+          out.push(c);
+        }
+      }
     }
-    return x;
+    return out;
   };
-  const isbnAraw = extractFirstIsbn(a.isbn13 || a.isbn || a.extra?.isbn || a.extra?.isbn_13);
-  const isbnBraw = extractFirstIsbn(b.isbn13 || b.isbn || b.extra?.isbn || b.extra?.isbn_13);
-  let isbnA = normalizeIsbn(isbnAraw);
-  let isbnB = normalizeIsbn(isbnBraw);
-  // epub metadata
-  // (caller may provide epubMetadata)
-  if (a.epubMetadata?.isbn) isbnA = isbnA || normalizeIsbn(a.epubMetadata.isbn);
-  if (b.epubMetadata?.isbn) isbnB = isbnB || normalizeIsbn(b.epubMetadata.isbn);
+  const isbnsA = collectIsbnList(a);
+  const isbnsB = collectIsbnList(b);
+  const isbnA = isbnsA[0] || '';
+  const isbnB = isbnsB[0] || '';
   let isbnOk = true;
   let isbnVerified = false;
-  if (isbnA && isbnB) {
-    if (sameIsbn(isbnA, isbnB)) {
+  if (isbnsA.length > 0 && isbnsB.length > 0) {
+    let matchedIsbn = false;
+    for (const ia of isbnsA) {
+      for (const ib of isbnsB) {
+        if (sameIsbn(ia, ib) || areVerifiedCounterparts(ia, ib, a?.trustedIsbns, a?.bookMetadata, a?.extra?.bookMetadata, b?.trustedIsbns, b?.bookMetadata, b?.extra?.bookMetadata, a, b)) {
+          matchedIsbn = true;
+          break;
+        }
+      }
+      if (matchedIsbn) break;
+    }
+    if (matchedIsbn) {
       isbnVerified = true;
     } else {
-      const counterpart = areVerifiedCounterparts(isbnA, isbnB, a?.trustedIsbns, a?.bookMetadata, a?.extra?.bookMetadata, b?.trustedIsbns, b?.bookMetadata, b?.extra?.bookMetadata, a, b);
-      if (!counterpart) { isbnOk = false; conflicts.push('conflicting_isbn'); }
-      else { isbnVerified = true; } // counterpart counts as verified equivalence
+      isbnOk = false;
+      conflicts.push('conflicting_isbn');
+    }
+  } else if (isbnsA.length > 0 && isbnsB.length === 0) {
+    reasonCodes.push('unknown_release_isbn');
+    if (requireVerifiedEdition && options?.requireIsbn !== false) {
+      isbnOk = false;
+      conflicts.push('unverified_isbn');
     }
   }
 
-  // year
-  const yearA = parsePositiveIntLocal(a.year || a.publicationYear || a.publishedYear || a.epubMetadata?.year);
-  const yearB = parsePositiveIntLocal(b.year || b.publicationYear || b.publishedYear || b.epubMetadata?.year);
+  // year (collect primary year on A and all authentic publication years on B)
+  const extractYears = (obj) => {
+    const out = [];
+    const seen = new Set();
+    const candidates = [
+      obj?.year,
+      obj?.publicationYear,
+      obj?.publishedYear,
+      obj?.publishYear,
+      obj?.publish_year,
+      obj?.publication_year,
+      obj?.published_year,
+      ...(Array.isArray(obj?.epubMetadata?.years) ? obj.epubMetadata.years : []),
+      obj?.epubMetadata?.year,
+    ];
+    for (const c of candidates) {
+      const y = parsePositiveIntLocal(c);
+      if (y && !seen.has(y)) {
+        seen.add(y);
+        out.push(y);
+      }
+    }
+    return out;
+  };
+  const yearsA = extractYears(a);
+  const yearsB = extractYears(b);
+  const yearA = yearsA[0] || null;
+  const yearB = yearsB[0] || null;
   let yearOk = true;
   let yearVerified = false;
-  if (yearA && yearB) {
-    if (yearA !== yearB) { yearOk = false; conflicts.push('incompatible_year'); }
-    else { yearVerified = true; }
-  } else if (yearA && !yearB) {
-    if (!isbnVerified) {
-      // Known requested year with unknown release year must not be treated as verified.
+  if (yearA && yearsB.length > 0) {
+    if (yearsB.includes(yearA)) {
+      yearVerified = true;
+    } else {
       yearOk = false;
-      conflicts.push('unknown_release_year');
-      reasonCodes.push('unknown_release_year');
+      conflicts.push('incompatible_year');
+    }
+  } else if (yearA && yearsB.length === 0) {
+    reasonCodes.push('unknown_release_year');
+    if (!isbnVerified && requireVerifiedEdition) {
+      yearOk = false;
+      conflicts.push('unverified_edition_year');
     }
   }
 
   const allOk = titleOk && authorOk && formatOk && langOk && isbnOk && yearOk;
-  // Determine edition confidence
+  const hasUnverifiedRequestedEdition = Boolean(
+    (yearA && !yearVerified && !isbnVerified) ||
+    (isbnsA.length > 0 && !isbnVerified)
+  );
+  // Determine edition confidence:
+  //   'high'   — verified by ISBN/counterpart or publication year with zero conflicts
+  //   'medium' — no specific edition year/ISBN requested and zero conflicts
+  //   'low'    — plausible work/expression candidate, but requested year/ISBN is missing on candidate (requires post-download inspection)
+  //   'none'   — conflicting evidence or missing required evidence in final stage
   let editionConfidence = 'none';
   if (allOk) {
     if (isbnVerified || yearVerified) editionConfidence = 'high';
+    else if (hasUnverifiedRequestedEdition) editionConfidence = 'low';
     else editionConfidence = 'medium';
   }
   const outcome = allOk ? (editionConfidence === 'high' ? 'match' : 'provisional') : 'reject';
@@ -752,11 +820,25 @@ export function editionCompatibility(a, b) {
   const authorAVal = Array.isArray(a.authors) ? (a.authors[0] || a.author || '') : (a.author || '');
   evidence.push({ field: 'author', value: authorAVal, level: 'work', status: authorOk ? 'verified' : 'contradictory' });
   if (fmtA || fmtB) evidence.push({ field: 'format', value: fmtA || fmtB, level: 'edition', status: formatOk ? 'verified' : 'contradictory' });
-  if (isbnA || isbnB) evidence.push({ field: 'isbn', value: isbnA || isbnB, level: 'edition', status: (isbnA && isbnB && !isbnOk) ? 'contradictory' : (isbnVerified ? 'verified' : 'inferred') });
-  if (yearA || yearB) evidence.push({ field: 'year', value: yearA || yearB, level: 'edition', status: (yearA && yearB && yearA !== yearB) ? 'contradictory' : (yearVerified ? 'verified' : 'inferred') });
-  if (langA || langB) evidence.push({ field: 'language', value: langA || langB, level: 'expression', status: langOk ? 'verified' : 'contradictory' });
+  if (isbnA || isbnB) {
+    const isbnStatus = (isbnsA.length > 0 && isbnsB.length > 0 && !isbnOk)
+      ? 'contradictory'
+      : (isbnVerified ? 'verified' : 'unverified');
+    evidence.push({ field: 'isbn', value: isbnA || isbnB, candidateValue: isbnB || null, level: 'edition', status: isbnStatus });
+  }
+  if (yearA || yearB) {
+    const yearStatus = (yearA && yearsB.length > 0 && !yearsB.includes(yearA))
+      ? 'contradictory'
+      : (yearVerified ? 'verified' : 'unverified');
+    evidence.push({ field: 'year', value: yearA || yearB, candidateValue: yearB || null, level: 'edition', status: yearStatus });
+  }
+  if (langA || langB) evidence.push({ field: 'language', value: langA || langB, candidateValue: langB || null, level: 'expression', status: langOk ? (langB ? 'verified' : 'unverified') : 'contradictory' });
 
   return { outcome, workConfidence, editionConfidence, evidence, conflicts, reasonCodes };
+}
+
+export function candidateCompatibility(request, candidate) {
+  return editionCompatibility(request, candidate, { stage: 'candidate' });
 }
 
 function parsePositiveIntLocal(val) {
@@ -772,6 +854,19 @@ function parsePositiveIntLocal(val) {
 
 export function areEditionsCompatible(a, b) {
   const d = editionCompatibility(a, b);
+  if (d.outcome === 'reject' || d.outcome === 'unknown') return false;
+  const reqYearA = parsePositiveIntLocal(a?.year || a?.publicationYear || a?.publishedYear || a?.publishYear || a?.publish_year || a?.publication_year || a?.published_year || a?.epubMetadata?.year);
+  const reqIsbnA = normalizeIsbn(
+    (Array.isArray(a?.isbn13s) ? a.isbn13s[0] : null) ||
+    a?.isbn13 || a?.isbn || a?.extra?.isbn || a?.extra?.isbn_13 || a?.epubMetadata?.isbn || ''
+  );
+  // Authoritative compatibility: when `a` specifies a known edition year or ISBN,
+  // an unverified candidate (`provisional` without verified year or ISBN) is NOT
+  // treated as a verified match. Pre-download candidate selection uses
+  // `candidateCompatibility` / `editionCompatibility` directly.
+  if (reqYearA || (reqIsbnA.length === 10 || reqIsbnA.length === 13)) {
+    return d.outcome === 'match';
+  }
   return d.outcome === 'match' || d.outcome === 'provisional';
 }
 

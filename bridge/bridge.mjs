@@ -66,18 +66,177 @@ export const MAGIC_BYTES = {
   pdf: [0x25, 0x50, 0x44, 0x46],   // %PDF
 };
 
+function decodeXmlEntities(str) {
+  if (!str) return '';
+  return String(str)
+    .replace(/&#x([0-9a-fA-F]+);/g, (_, hex) => {
+      const code = parseInt(hex, 16);
+      return Number.isFinite(code) && code > 0 && code <= 0x10ffff ? String.fromCodePoint(code) : _;
+    })
+    .replace(/&#(\d+);/g, (_, dec) => {
+      const code = parseInt(dec, 10);
+      return Number.isFinite(code) && code > 0 && code <= 0x10ffff ? String.fromCodePoint(code) : _;
+    })
+    .replace(/&quot;/gi, '"')
+    .replace(/&apos;/gi, "'")
+    .replace(/&lt;/gi, '<')
+    .replace(/&gt;/gi, '>')
+    .replace(/&amp;/gi, '&')
+    .trim();
+}
+
+function parseOpfMetadataXml(opfText) {
+  if (!opfText || typeof opfText !== 'string') return null;
+  const titleMatch = opfText.match(/<dc:title[^>]*>([\s\S]*?)<\/dc:title>/i);
+  const creatorMatches = [...opfText.matchAll(/<dc:creator[^>]*>([\s\S]*?)<\/dc:creator>/gi)];
+  const authors = creatorMatches
+    .map((m) => decodeXmlEntities(m[1].replace(/<[^>]+>/g, '')))
+    .filter(Boolean);
+
+  // Extract authentic publication years, ignoring file modification/conversion timestamps.
+  // Never use dcterms:modified (required EPUB3 packaging timestamp) as publication year.
+  const pubYears = [];
+  const otherYears = [];
+  for (const dm of opfText.matchAll(/<dc:date([^>]*)>([\s\S]*?)<\/dc:date>/gi)) {
+    const attrs = dm[1] || '';
+    const content = dm[2] || '';
+    if (/\bevent\s*=\s*["'](?:modification|modified|conversion|creation|ops-publication)["']/i.test(attrs)) {
+      if (/\bevent\s*=\s*["'](?:modification|modified|conversion)["']/i.test(attrs)) continue;
+    }
+    const ym = content.match(/\b(\d{4})\b/) || content.match(/(\d{4})/);
+    if (!ym) continue;
+    const y = parseInt(ym[1], 10);
+    if (!Number.isFinite(y) || y < 1000 || y > 2100) continue;
+    if (/\bevent\s*=\s*["']publication["']/i.test(attrs)) {
+      if (!pubYears.includes(y)) pubYears.push(y);
+    } else {
+      if (!otherYears.includes(y)) otherYears.push(y);
+    }
+  }
+  for (const im of opfText.matchAll(/<meta[^>]*property=["']dcterms:issued["'][^>]*>([\s\S]*?)<\/meta>/gi)) {
+    const ym = (im[1] || '').match(/(\d{4})/);
+    if (ym) {
+      const y = parseInt(ym[1], 10);
+      if (Number.isFinite(y) && y >= 1000 && y <= 2100 && !otherYears.includes(y) && !pubYears.includes(y)) {
+        otherYears.push(y);
+      }
+    }
+  }
+  const years = [...pubYears, ...otherYears.filter((y) => !pubYears.includes(y))];
+
+  // Extract authentic 10/13-char ISBNs without matching UUIDs, ASINs, URLs, or timestamps.
+  const validIsbns = [];
+  const explicitIsbns = [];
+  const addCandidateIsbn = (rawToken, isExplicitScheme) => {
+    const cleaned = ID.normalizeIsbn(rawToken);
+    if (cleaned.length !== 10 && cleaned.length !== 13) return;
+    if (ID.validateIsbn(cleaned).valid) {
+      if (!validIsbns.includes(cleaned)) validIsbns.push(cleaned);
+    } else if (isExplicitScheme) {
+      if (!explicitIsbns.includes(cleaned)) explicitIsbns.push(cleaned);
+    }
+  };
+
+  for (const urnMatch of opfText.matchAll(/urn:isbn:([0-9Xx-\s]{10,20})/gi)) {
+    addCandidateIsbn(urnMatch[1], true);
+  }
+  for (const tagMatch of opfText.matchAll(/<dc:(?:identifier|source)([^>]*)>([\s\S]*?)<\/dc:(?:identifier|source)>/gi)) {
+    const attrs = tagMatch[1] || '';
+    const rawVal = decodeXmlEntities((tagMatch[2] || '').replace(/<[^>]+>/g, '')).trim();
+    if (!rawVal) continue;
+    if (/\bscheme\s*=\s*["'](?:uuid|uri|url|http|asin|mobi-asin|calibre|goodreads|google|amazon|doi|oclc|lccn)["']/i.test(attrs)) {
+      continue;
+    }
+    if (/^(?:urn:uuid:|uuid:|https?:\/\/|calibre:|asin:|mobi-asin:|goodreads:|google:|doi:)/i.test(rawVal)) {
+      continue;
+    }
+    const isExplicitIsbn = /\bscheme\s*=\s*["']isbn["']/i.test(attrs) || /^urn:isbn:/i.test(rawVal) || /^isbn\b/i.test(rawVal);
+    const strippedPrefix = rawVal.replace(/^(?:urn:isbn:|isbn\s*:?\s*)/i, '').trim();
+    const tokenMatches = strippedPrefix.match(/(?:97[89][-\s]?)?[0-9][0-9-\s]{8,15}[0-9Xx]/g) || [];
+    for (const tok of tokenMatches) {
+      // Reject hex UUID fragments by ensuring surrounding characters in strippedPrefix aren't hex letters
+      const idx = strippedPrefix.indexOf(tok);
+      const before = idx > 0 ? strippedPrefix[idx - 1] : '';
+      const after = idx + tok.length < strippedPrefix.length ? strippedPrefix[idx + tok.length] : '';
+      if (/[0-9A-Za-z]/.test(before) || /[0-9A-Za-z]/.test(after)) continue;
+      addCandidateIsbn(tok, isExplicitIsbn);
+    }
+  }
+  const isbns = [...validIsbns, ...explicitIsbns.filter((x) => !validIsbns.includes(x))];
+
+  const languageMatch = opfText.match(/<dc:language[^>]*>([\s\S]*?)<\/dc:language>/i);
+  const rawTitle = titleMatch ? decodeXmlEntities(titleMatch[1].replace(/<[^>]+>/g, '')) : '';
+  const rawLanguage = languageMatch ? decodeXmlEntities(languageMatch[1].replace(/<[^>]+>/g, '')) : '';
+
+  return {
+    title: rawTitle || null,
+    author: authors[0] || null,
+    authors,
+    year: years[0] || null,
+    years,
+    isbn: isbns[0] || null,
+    isbns,
+    language: rawLanguage || null,
+  };
+}
+
 /**
- * Extracts publication metadata (title, author, year, ISBN) directly from an EPUB ZIP buffer.
- * Supports standard uncompressed (method 0) and deflated (method 8) OPF metadata packages.
+ * Extracts publication metadata (title, author, year, ISBN, language) directly from an EPUB ZIP buffer.
+ * Supports Central Directory ZIP lookup (handling streaming data descriptors / flag bit 3)
+ * as well as fallback local-header scanning for synthetic test archives.
  * Returns null if the buffer is invalid or contains no readable OPF package.
  */
 export function extractEpubMetadata(buffer) {
   if (!buffer || !Buffer.isBuffer(buffer) || buffer.length < 30) return null;
   try {
+    // 1. Prefer ZIP Central Directory so archives with bit-3 data descriptors (compressedSize=0 in local header) succeed.
+    const maxCommentSearch = Math.max(0, buffer.length - 65558);
+    let eocdOffset = -1;
+    for (let i = buffer.length - 22; i >= maxCommentSearch; i--) {
+      if (buffer.readUInt32LE(i) === 0x06054b50) {
+        eocdOffset = i;
+        break;
+      }
+    }
+    if (eocdOffset !== -1) {
+      const cdEntries = buffer.readUInt16LE(eocdOffset + 10);
+      const cdOffset = buffer.readUInt32LE(eocdOffset + 16);
+      let pos = cdOffset;
+      for (let i = 0; i < cdEntries && pos + 46 <= buffer.length; i++) {
+        if (buffer.readUInt32LE(pos) !== 0x02014b50) break;
+        const method = buffer.readUInt16LE(pos + 10);
+        const compressedSize = buffer.readUInt32LE(pos + 20);
+        const nameLen = buffer.readUInt16LE(pos + 28);
+        const extraLen = buffer.readUInt16LE(pos + 30);
+        const commentLen = buffer.readUInt16LE(pos + 32);
+        const localOffset = buffer.readUInt32LE(pos + 42);
+        const name = buffer.toString('utf8', pos + 46, pos + 46 + nameLen);
+        pos += 46 + nameLen + extraLen + commentLen;
+
+        if (name.toLowerCase().endsWith('.opf') && localOffset + 30 <= buffer.length) {
+          if (buffer.readUInt32LE(localOffset) !== 0x04034b50) continue;
+          const localNameLen = buffer.readUInt16LE(localOffset + 26);
+          const localExtraLen = buffer.readUInt16LE(localOffset + 28);
+          const dataStart = localOffset + 30 + localNameLen + localExtraLen;
+          const dataEnd = dataStart + compressedSize;
+          if (dataEnd > buffer.length) continue;
+          let opfText = '';
+          if (method === 0) {
+            opfText = buffer.toString('utf8', dataStart, dataEnd);
+          } else if (method === 8) {
+            opfText = zlib.inflateRawSync(buffer.subarray(dataStart, dataEnd)).toString('utf8');
+          }
+          const parsed = parseOpfMetadataXml(opfText);
+          if (parsed) return parsed;
+        }
+      }
+    }
+
+    // 2. Fallback: scan local file headers (supports header-only synthetic test buffers).
     let offset = 0;
-    while (offset < buffer.length - 30) {
+    while (offset <= buffer.length - 30) {
       const sig = buffer.readUInt32LE(offset);
-      if (sig !== 0x04034b50) break; // Local file header signature
+      if (sig !== 0x04034b50) break;
 
       const method = buffer.readUInt16LE(offset + 8);
       const compressedSize = buffer.readUInt32LE(offset + 18);
@@ -94,34 +253,13 @@ export function extractEpubMetadata(buffer) {
         if (method === 0) {
           opfText = buffer.toString('utf8', dataStart, dataEnd);
         } else if (method === 8) {
-          const inflated = zlib.inflateRawSync(buffer.slice(dataStart, dataEnd));
-          opfText = inflated.toString('utf8');
+          opfText = zlib.inflateRawSync(buffer.subarray(dataStart, dataEnd)).toString('utf8');
         }
-
-        if (opfText) {
-          const titleMatch = opfText.match(/<dc:title[^>]*>([^<]+)<\/dc:title>/i);
-          const authorMatch = opfText.match(/<dc:creator[^>]*>([^<]+)<\/dc:creator>/i);
-          const dateMatch = opfText.match(/<dc:date[^>]*>.*?(\d{4}).*?<\/dc:date>/i) ||
-                            opfText.match(/dcterms:modified[^>]*>.*?(\d{4})/i) ||
-                            opfText.match(/<meta[^>]*property=["']dcterms:issued["'][^>]*>.*?(\d{4})/i);
-          const isbnMatch = opfText.match(/urn:isbn:([0-9X-]+)/i) ||
-                            opfText.match(/<dc:identifier[^>]*scheme=["']ISBN["'][^>]*>.*?([0-9X-]{10,17}).*?<\/dc:identifier>/i) ||
-                            opfText.match(/<dc:identifier[^>]*>.*?([0-9X-]{10,17}).*?<\/dc:identifier>/i);
-          const languageMatch = opfText.match(/<dc:language[^>]*>([^<]+)<\/dc:language>/i);
-
-          const rawYear = dateMatch ? parseInt(dateMatch[1], 10) : null;
-          const rawIsbn = isbnMatch ? isbnMatch[1].replace(/[^0-9X]/gi, '') : null;
-          const rawLanguage = languageMatch ? languageMatch[1].trim() : null;
-          return {
-            title: titleMatch ? titleMatch[1].trim() : null,
-            author: authorMatch ? authorMatch[1].trim() : null,
-            year: Number.isFinite(rawYear) && rawYear >= 1000 && rawYear <= 2100 ? rawYear : null,
-            isbn: rawIsbn && rawIsbn.length > 0 ? rawIsbn : null,
-            language: rawLanguage && rawLanguage.length > 0 ? rawLanguage : null,
-          };
-        }
+        const parsed = parseOpfMetadataXml(opfText);
+        if (parsed) return parsed;
       }
 
+      if (compressedSize === 0 && dataEnd === offset) break;
       offset = dataEnd;
     }
   } catch {}
@@ -400,9 +538,11 @@ export function withEpubMetadata(obj) {
   const rawTitle = (copy.bookTitle || copy.title || '').trim();
   if (copy.filePath && (copy.format === 'epub' || String(copy.filePath).toLowerCase().endsWith('.epub'))) {
     const meta = extractEpubMetadataFromFile(copy.filePath);
-    if (meta && (!meta.title || isTitleMatch(meta.title, rawTitle))) {
+    if (meta && (!meta.title || !rawTitle || isTitleMatch(meta.title, rawTitle))) {
       if (meta.year != null && merged.year == null) merged.year = meta.year;
+      if (Array.isArray(meta.years) && meta.years.length && !Array.isArray(merged.years)) merged.years = meta.years;
       if (meta.isbn != null && merged.isbn == null) merged.isbn = meta.isbn;
+      if (Array.isArray(meta.isbns) && meta.isbns.length && !Array.isArray(merged.isbns)) merged.isbns = meta.isbns;
       if (meta.language != null && merged.language == null) merged.language = meta.language;
     }
   }
@@ -415,13 +555,252 @@ export function areEditionsCompatible(a, b) {
   return ID.areEditionsCompatible(withEpubMetadata(a), withEpubMetadata(b));
 }
 
+export function candidateCompatibility(req, rel) {
+  if (!req || !rel) return { outcome: 'reject', conflicts: ['missing_input'], reasonCodes: ['missing_input'], evidence: [] };
+  return ID.candidateCompatibility(withEpubMetadata(req), withEpubMetadata(rel));
+}
+
 export function getEditionIncompatibilityReason(req, rel) {
   if (!req || !rel) return 'incompatible_edition';
-  const d = ID.editionCompatibility(withEpubMetadata(req), withEpubMetadata(rel));
+  const d = ID.candidateCompatibility(withEpubMetadata(req), withEpubMetadata(rel));
   if (d.outcome === 'match' || d.outcome === 'provisional') return null;
   if (Array.isArray(d.conflicts) && d.conflicts.length) return d.conflicts[0];
   if (Array.isArray(d.reasonCodes) && d.reasonCodes.length) return d.reasonCodes[0];
   return 'incompatible_edition';
+}
+
+/**
+ * Stage 2 authoritative post-download edition & identity verification.
+ * Evaluates a downloaded task artifact against the original request specification
+ * before importing into BookOrbit or fulfilling the request.
+ * Missing required edition evidence (year/ISBN) never fabricates a match.
+ */
+export function verifyDownloadedEdition(task, reqSpec = {}) {
+  const rid = reqSpec.requestId ?? null;
+  const expectedTitle = String(
+    reqSpec.title ??
+    (rid && task?.requestTitles?.[rid]) ??
+    task?.requestTitle ??
+    task?.bookTitle ??
+    task?.title ??
+    ''
+  ).trim();
+  const expectedAuthor = String(
+    reqSpec.author ??
+    (rid && task?.requestAuthorsMap?.[rid]) ??
+    task?.requestAuthor ??
+    task?.bookAuthor ??
+    task?.author ??
+    ''
+  ).trim();
+  const expectedLanguage = String(
+    reqSpec.language ??
+    (rid && task?.requestLanguages?.[rid]) ??
+    task?.requestLanguage ??
+    'en'
+  ).trim();
+  const reqYear = parsePositiveInt(
+    reqSpec.year ??
+    (rid && task?.requestYears ? task.requestYears[rid] : undefined) ??
+    task?.requestYear
+  );
+  const reqIsbn = normalizeIsbnBridge(
+    reqSpec.isbn ??
+    (rid && task?.requestIsbns ? task.requestIsbns[rid] : undefined) ??
+    task?.requestIsbn ??
+    ''
+  );
+  const validReqIsbn = (reqIsbn.length === 10 || reqIsbn.length === 13) ? reqIsbn : '';
+
+  const isEpub = Boolean(
+    String(task?.format || '').toLowerCase() === 'epub' ||
+    String(task?.filePath || '').toLowerCase().endsWith('.epub')
+  );
+  const evidence = [];
+  const conflicts = [];
+  let error = null;
+  let isbnFailure = false;
+  let workOrLanguageFailure = false;
+  let opf = null;
+
+  if (isEpub && task?.filePath) {
+    opf = extractEpubMetadataFromFile(task.filePath);
+    if (!opf) {
+      conflicts.push('unverified_epub_metadata');
+      evidence.push({ field: 'opf', level: 'container', status: 'missing', value: null });
+      error = 'EPUB metadata could not be extracted from downloaded container';
+      return {
+        ok: false,
+        outcome: 'reject',
+        errorType: validReqIsbn ? 'isbn_verification_failed' : 'edition_verification_failed',
+        primaryConflict: 'unverified_epub_metadata',
+        conflicts,
+        evidence,
+        error,
+        isbnFailure: Boolean(validReqIsbn),
+        workOrLanguageFailure: false,
+        opf: null,
+      };
+    }
+
+    // 1. Work title verification
+    if (!opf.title && expectedTitle) {
+      conflicts.push('missing_title');
+      workOrLanguageFailure = true;
+      evidence.push({ field: 'title', level: 'work', status: 'missing', expected: expectedTitle, observed: null });
+      error = error || `EPUB title mismatch: expected "${expectedTitle}", got missing title`;
+    } else if (opf.title && expectedTitle && !ID.isTitleMatch(opf.title, expectedTitle)) {
+      conflicts.push('incompatible_title');
+      workOrLanguageFailure = true;
+      evidence.push({ field: 'title', level: 'work', status: 'contradictory', expected: expectedTitle, observed: opf.title });
+      error = error || `EPUB title mismatch: expected "${expectedTitle}", got "${opf.title}"`;
+    } else if (opf.title) {
+      evidence.push({ field: 'title', level: 'work', status: 'verified', expected: expectedTitle, observed: opf.title });
+    }
+
+    // 2. Work author verification
+    const opfAuthors = Array.isArray(opf.authors) && opf.authors.length ? opf.authors : (opf.author ? [opf.author] : []);
+    if (opfAuthors.length > 0 && expectedAuthor && !ID.isAuthorMatch(opfAuthors, expectedAuthor)) {
+      conflicts.push('incompatible_author');
+      workOrLanguageFailure = true;
+      evidence.push({ field: 'author', level: 'work', status: 'contradictory', expected: expectedAuthor, observed: opf.author });
+      error = error || `EPUB author mismatch: expected "${expectedAuthor}", got "${opf.author}"`;
+    } else if (opfAuthors.length === 0 && expectedAuthor && (reqYear || validReqIsbn)) {
+      conflicts.push('missing_author');
+      evidence.push({ field: 'author', level: 'work', status: 'unverified', expected: expectedAuthor, observed: null });
+      error = error || `EPUB author metadata missing: could not verify "${expectedAuthor}"`;
+    } else if (opfAuthors.length > 0) {
+      evidence.push({ field: 'author', level: 'work', status: 'verified', expected: expectedAuthor, observed: opf.author });
+    }
+
+    // 3. Expression language verification
+    const normEpubLang = ID.normalizeLanguageCode(opf.language);
+    const normExpectedLang = ID.normalizeLanguageCode(expectedLanguage) || 'en';
+    if (normEpubLang && normExpectedLang && normEpubLang !== normExpectedLang) {
+      conflicts.push('language_mismatch');
+      workOrLanguageFailure = true;
+      evidence.push({ field: 'language', level: 'expression', status: 'contradictory', expected: normExpectedLang, observed: normEpubLang });
+      error = error || `EPUB language mismatch: expected "${normExpectedLang}", got "${opf.language}" (${normEpubLang})`;
+    } else {
+      evidence.push({ field: 'language', level: 'expression', status: normEpubLang ? 'verified' : 'unverified', expected: normExpectedLang, observed: normEpubLang || null });
+    }
+
+    // 4. Edition ISBN verification
+    const opfIsbns = Array.isArray(opf.isbns) ? opf.isbns : (opf.isbn ? [normalizeIsbnBridge(opf.isbn)].filter(Boolean) : []);
+    let isbnVerified = false;
+    if (validReqIsbn) {
+      const matchedIsbn = opfIsbns.find((fi) =>
+        ID.sameIsbn(validReqIsbn, fi) ||
+        areVerifiedIsbnCounterpartsBridge(validReqIsbn, fi, task?.trustedIsbns, task?.bookMetadata, task?.extra?.bookMetadata)
+      );
+      if (matchedIsbn) {
+        isbnVerified = true;
+        evidence.push({ field: 'isbn', level: 'edition', status: 'verified', expected: validReqIsbn, observed: matchedIsbn });
+      } else if (opfIsbns.length > 0) {
+        conflicts.push('conflicting_isbn');
+        isbnFailure = true;
+        evidence.push({ field: 'isbn', level: 'edition', status: 'contradictory', expected: validReqIsbn, observed: opfIsbns[0] });
+        error = error || `Release ISBN ${opfIsbns[0]} does not match requested ISBN ${validReqIsbn}`;
+      } else {
+        conflicts.push('unverified_isbn');
+        isbnFailure = true;
+        evidence.push({ field: 'isbn', level: 'edition', status: 'unverified', expected: validReqIsbn, observed: null });
+        error = error || 'Release ISBN could not be verified in downloaded file';
+      }
+    } else if (opfIsbns.length > 0) {
+      evidence.push({ field: 'isbn', level: 'edition', status: 'observed', expected: null, observed: opfIsbns[0] });
+    }
+
+    // 5. Edition publication year verification
+    const opfYears = Array.isArray(opf.years) ? opf.years : (opf.year ? [opf.year] : []);
+    const taskClaimedYear = parsePositiveInt(task?.year);
+    if (reqYear) {
+      if (opfYears.length > 0) {
+        if (opfYears.includes(reqYear)) {
+          evidence.push({ field: 'year', level: 'edition', status: 'verified', expected: reqYear, observed: reqYear });
+        } else {
+          conflicts.push('incompatible_year');
+          evidence.push({ field: 'year', level: 'edition', status: 'contradictory', expected: reqYear, observed: opf.year });
+          error = error || `EPUB publication year mismatch: expected ${reqYear}, got ${opf.year}`;
+        }
+      } else if (isbnVerified) {
+        // Requested year satisfied by verified OPF ISBN/counterpart with no conflicting OPF year
+        evidence.push({ field: 'year', level: 'edition', status: 'satisfied_by_isbn', expected: reqYear, observed: null });
+      } else {
+        conflicts.push('unverified_edition_year');
+        evidence.push({ field: 'year', level: 'edition', status: 'unverified', expected: reqYear, observed: null });
+        error = error || `Release publication year (${reqYear}) could not be verified in downloaded EPUB metadata`;
+      }
+    } else if (taskClaimedYear && opfYears.length > 0 && !opfYears.includes(taskClaimedYear)) {
+      conflicts.push('incompatible_year');
+      evidence.push({ field: 'year', level: 'edition', status: 'contradictory', expected: taskClaimedYear, observed: opf.year });
+      error = error || `EPUB publication year mismatch: expected ${taskClaimedYear}, got ${opf.year}`;
+    } else if (opfYears.length > 0) {
+      evidence.push({ field: 'year', level: 'edition', status: 'observed', expected: null, observed: opf.year });
+    }
+  } else {
+    // Non-EPUB (e.g. PDF) or pre-imported task without local EPUB file
+    const taskIsbn = normalizeIsbnBridge(task?.isbn || '');
+    const validTaskIsbn = (taskIsbn.length === 10 || taskIsbn.length === 13) ? taskIsbn : '';
+    let isbnVerified = false;
+    if (validReqIsbn) {
+      if (validTaskIsbn && (ID.sameIsbn(validReqIsbn, validTaskIsbn) || areVerifiedIsbnCounterpartsBridge(validReqIsbn, validTaskIsbn, task?.trustedIsbns, task?.bookMetadata, task?.extra?.bookMetadata))) {
+        isbnVerified = true;
+        evidence.push({ field: 'isbn', level: 'edition', status: 'verified', expected: validReqIsbn, observed: validTaskIsbn });
+      } else if (validTaskIsbn) {
+        conflicts.push('conflicting_isbn');
+        isbnFailure = true;
+        evidence.push({ field: 'isbn', level: 'edition', status: 'contradictory', expected: validReqIsbn, observed: validTaskIsbn });
+        error = error || `Release ISBN ${validTaskIsbn} does not match requested ISBN ${validReqIsbn}`;
+      } else {
+        conflicts.push('unverified_isbn');
+        isbnFailure = true;
+        evidence.push({ field: 'isbn', level: 'edition', status: 'unverified', expected: validReqIsbn, observed: null });
+        error = error || 'Release ISBN could not be verified in downloaded file';
+      }
+    }
+    const taskYear = parsePositiveInt(task?.year);
+    if (reqYear) {
+      if (taskYear) {
+        if (taskYear === reqYear) {
+          evidence.push({ field: 'year', level: 'edition', status: 'verified', expected: reqYear, observed: taskYear });
+        } else {
+          conflicts.push('incompatible_year');
+          evidence.push({ field: 'year', level: 'edition', status: 'contradictory', expected: reqYear, observed: taskYear });
+          error = error || `Release publication year mismatch: expected ${reqYear}, got ${taskYear}`;
+        }
+      } else if (!isbnVerified) {
+        conflicts.push('unverified_edition_year');
+        evidence.push({ field: 'year', level: 'edition', status: 'unverified', expected: reqYear, observed: null });
+        error = error || `Release publication year (${reqYear}) could not be verified`;
+      }
+    }
+  }
+
+  const ok = conflicts.length === 0;
+  const primaryConflict = conflicts[0] || null;
+  let errorType = null;
+  if (!ok) {
+    if (workOrLanguageFailure && conflicts.every((c) => ['incompatible_title', 'missing_title', 'incompatible_author', 'language_mismatch'].includes(c))) {
+      errorType = 'finalization_failed';
+    } else if (isbnFailure) {
+      errorType = 'isbn_verification_failed';
+    } else {
+      errorType = 'edition_verification_failed';
+    }
+  }
+  return {
+    ok,
+    outcome: ok ? 'match' : 'reject',
+    errorType,
+    primaryConflict,
+    conflicts,
+    evidence,
+    error,
+    isbnFailure,
+    workOrLanguageFailure,
+    opf,
+  };
 }
 
 function isHttpUrlBridge(value) {
@@ -892,6 +1271,7 @@ export class BridgeService {
        requestMetadataCandidateCounts: {}, // requestId -> number
        requestReleaseCandidateCounts: {}, // requestId -> number
        requestCandidateRejectionReasons: {}, // requestId -> { reason: count }
+       requestVerification: {}, // requestId -> { ok, taskId, releaseKey, stage, errorType, primaryConflict, conflicts, evidence, error, verifiedAt }
      };
 
     this.reconcileTimer = null;
@@ -950,6 +1330,7 @@ export class BridgeService {
            requestMetadataCandidateCounts: parsed.requestMetadataCandidateCounts || {},
            requestReleaseCandidateCounts: parsed.requestReleaseCandidateCounts || {},
            requestCandidateRejectionReasons: parsed.requestCandidateRejectionReasons || {},
+           requestVerification: parsed.requestVerification || {},
          };
       }
     } catch (err) {
@@ -1600,12 +1981,17 @@ export class BridgeService {
             continue;
           }
 
-           // 5. Filter releases for edition compatibility and filter out recently failed releases
+           // 5. Filter releases for Stage 1 candidate compatibility and filter out recently failed releases
+           const reqForCompatibility = {
+             ...req,
+             year: req.publishedYear || req.publicationYear || req.year || null,
+             isbn: req.isbn13 || req.isbn || (Array.isArray(req.isbn13s) ? req.isbn13s[0] : null) || null,
+             language: req.language || req.lang || 'English',
+           };
            let ineligibilityReason = null;
            const candidateRejectionReasonCounts = {};
            const eligibleReleases = searchResults.filter((rel) => {
-             const reqForCompatibility = { ...req, language: req.language || req.lang || 'English' };
-          const reason = getEditionIncompatibilityReason(reqForCompatibility, rel);
+             const reason = getEditionIncompatibilityReason(reqForCompatibility, rel);
              if (reason) {
                candidateRejectionReasonCounts[reason] = (candidateRejectionReasonCounts[reason] || 0) + 1;
                if (!ineligibilityReason) ineligibilityReason = reason;
@@ -1623,6 +2009,12 @@ export class BridgeService {
              }
              return true;
            });
+           // Rank verified edition matches ('match') ahead of unknown-metadata ('provisional') candidates
+           eligibleReleases.sort((a, b) => {
+             const tierA = candidateCompatibility(reqForCompatibility, a).outcome === 'match' ? 0 : 1;
+             const tierB = candidateCompatibility(reqForCompatibility, b).outcome === 'match' ? 0 : 1;
+             return tierA - tierB;
+           });
            const metadataCandidateCount = Array.isArray(searchResults) ? searchResults.length : 0;
            const releaseCandidateCount = eligibleReleases.length;
            const candidateCounts = { metadataCandidateCount, releaseCandidateCount, candidateRejectionReasonCounts };
@@ -1637,8 +2029,26 @@ export class BridgeService {
 
           if (eligibleReleases.length === 0) {
             const reason = ineligibilityReason || 'no_eligible_edition';
+            const priorVer = this.state.requestVerification?.[reqId];
+            if (priorVer && priorVer.ok === false) {
+              const priorStage = priorVer.stage || 'review_required';
+              const priorReason = priorVer.errorType || reason;
+              console.log(`[Bridge] All remaining candidates exhausted (${reason}) after edition verification failure for request ${reqId} ("${query.title}"); keeping ${priorStage}`);
+              this.setRequestProgress(reqId, priorStage, {
+                reason: priorReason,
+                exhaustionReason: reason,
+                conflict: priorVer.primaryConflict || undefined,
+                ...candidateCounts,
+              });
+              if (this.state.requestErrors[reqId]) {
+                this.state.requestErrors[reqId].exhaustionReason = reason;
+                this.state.requestErrors[reqId].lastAttemptAt = new Date().toISOString();
+              }
+              this.saveState();
+              continue;
+            }
             console.log(`[Bridge] No eligible edition-compatible releases found for approved request ${reqId} ("${query.title}")`);
-             this.setRequestProgress(reqId, 'no_eligible_edition', { reason, ...candidateCounts });
+            this.setRequestProgress(reqId, 'no_eligible_edition', { reason, ...candidateCounts });
             const attemptIdNe = `no_eligible_edition:${reqId}:${new Date().toISOString().slice(0,10)}`;
             this.state.requestAttempts[reqId] = this.state.requestAttempts[reqId] || [];
             if (!this.state.requestAttempts[reqId].some((a) => a.attemptId === attemptIdNe)) {
@@ -1665,7 +2075,11 @@ export class BridgeService {
             const mappedTaskId = candKey ? this.state.releases[candKey] : null;
             if (mappedTaskId && mappedTaskId !== 'uncertain' && this.state.tasks[mappedTaskId]) {
               const existingTask = this.state.tasks[mappedTaskId];
-              if (!areEditionsCompatible(existingTask, req) || !areEditionsCompatible(existingTask, candidateRelease)) {
+              if (existingTask.isbnVerificationFailed || existingTask.editionVerificationFailed) {
+                continue;
+              }
+              if (candidateCompatibility(existingTask, candidateRelease).outcome === 'reject' ||
+                  !areEditionsCompatible(reqForCompatibility, existingTask)) {
                 // Incompatible edition already assigned to this release candidate task; try next candidate
                 continue;
               }
@@ -1780,21 +2194,51 @@ export class BridgeService {
 
 
     // 1. Check if release already tracked or in uncertain queue
+    const parsedReqYear = parsePositiveInt(requestYear) || null;
+    const normalizedReqLang = ID.normalizeLanguageCode(requestLanguage) || 'en';
     const existingTaskId = this.state.releases[releaseKey];
     if (existingTaskId === 'uncertain') {
       const rec = this.state.uncertainQueues[releaseKey];
       if (rec) {
-        // ISBN compatibility check between incoming and existing uncertain record
-        const recIsbn = String(rec.requestIsbn || (Array.isArray(rec.requestIds) ? '' : '') || '').replace(/[^0-9X]/gi, '');
-        const incomingIsbn = String(requestIsbn || '').replace(/[^0-9X]/gi, '');
+        // ISBN and year compatibility check between incoming and existing uncertain record
+        const recIsbn = normalizeIsbnBridge(rec.requestIsbn || '');
+        const incomingIsbn = normalizeIsbnBridge(requestIsbn || '');
         if (incomingIsbn && recIsbn && !ID.sameIsbn(incomingIsbn, recIsbn) && !areVerifiedIsbnCounterpartsBridge(incomingIsbn, recIsbn, rec?.trustedIsbns, rec?.bookMetadata, rec?.extra?.bookMetadata)) {
           throw new Error(`Incompatible ISBN for uncertain queue ${releaseKey}: requested ${incomingIsbn} vs ${recIsbn}`);
+        }
+        const recYear = parsePositiveInt(rec.requestYear || rec.release?.year);
+        if (parsedReqYear && recYear && parsedReqYear !== recYear) {
+          throw new Error(`Incompatible edition year for uncertain queue ${releaseKey}: requested ${parsedReqYear} vs ${recYear}`);
         }
         if (!Array.isArray(rec.requestIds)) rec.requestIds = rec.requestId ? [rec.requestId] : [];
         if (requestId && !rec.requestIds.includes(requestId)) rec.requestIds.push(requestId);
         if (requestId && !rec.requestId) rec.requestId = requestId;
         if (userId && !Array.isArray(rec.userIds)) rec.userIds = rec.userId ? [rec.userId] : [];
         if (userId && Array.isArray(rec.userIds) && !rec.userIds.includes(userId)) rec.userIds.push(userId);
+        if (requestTitle && !rec.requestTitle) rec.requestTitle = requestTitle;
+        if (requestTitle && requestId) {
+          rec.requestTitles = rec.requestTitles || {};
+          if (!rec.requestTitles[requestId]) rec.requestTitles[requestId] = requestTitle;
+        }
+        if (requestAuthor && !rec.requestAuthor) rec.requestAuthor = requestAuthor;
+        if (requestAuthor && requestId) {
+          rec.requestAuthorsMap = rec.requestAuthorsMap || {};
+          if (!rec.requestAuthorsMap[requestId]) rec.requestAuthorsMap[requestId] = requestAuthor;
+        }
+        if (parsedReqYear && !rec.requestYear) rec.requestYear = parsedReqYear;
+        if (parsedReqYear && requestId) {
+          rec.requestYears = rec.requestYears || {};
+          if (!rec.requestYears[requestId]) rec.requestYears[requestId] = parsedReqYear;
+        }
+        if (incomingIsbn && !rec.requestIsbn) rec.requestIsbn = incomingIsbn;
+        if (incomingIsbn && requestId) {
+          rec.requestIsbns = rec.requestIsbns || {};
+          if (!rec.requestIsbns[requestId]) rec.requestIsbns[requestId] = incomingIsbn;
+        }
+        if (requestId) {
+          rec.requestLanguages = rec.requestLanguages || {};
+          if (!rec.requestLanguages[requestId]) rec.requestLanguages[requestId] = normalizedReqLang;
+        }
       }
       if (requestId) this.state.requests[requestId] = 'uncertain';
       this.saveState();
@@ -1805,30 +2249,89 @@ export class BridgeService {
       };
     }
 
-    if (existingTaskId && this.state.tasks[existingTaskId]) {
-      const existing = this.state.tasks[existingTaskId];
-
-      // Safe edition verification before adopting existing task
-      if (!areEditionsCompatible(existing, release)) {
-        throw new Error(`Incompatible edition for existing task ${existingTaskId}: requested "${release.title}" (${release.year || 'unknown year'}) vs task "${existing.title}" (${existing.year || 'unknown year'})`);
+    const verifyExistingTaskAdoption = (existing, idForErr, sameReleaseKey = false) => {
+      if (existing.isbnVerificationFailed || existing.editionVerificationFailed) {
+        throw new Error(`Incompatible edition for existing task ${idForErr}: task failed edition verification`);
       }
-      const existingTaskIsbn = String((existing.requestIsbns && existing.requestIsbns[requestId]) || existing.requestIsbn || '').replace(/[^0-9X]/gi, '');
-      const incomingTaskIsbn = String(requestIsbn || '').replace(/[^0-9X]/gi, '');
-      const existingFileIsbn = (existing.filePath && String(existing.filePath).toLowerCase().endsWith('.epub'))
-        ? normalizeIsbnBridge(extractEpubMetadataFromFile(existing.filePath)?.isbn)
-        : '';
+      if (sameReleaseKey) {
+        if (candidateCompatibility(existing, release).outcome === 'reject') {
+          throw new Error(`Incompatible edition for existing task ${idForErr}: requested "${release.title}" (${release.year || 'unknown year'}) vs task "${existing.title}" (${existing.year || 'unknown year'})`);
+        }
+      } else if (!areEditionsCompatible(existing, release)) {
+        throw new Error(`Incompatible edition for existing task ${idForErr}: requested "${release.title}" (${release.year || 'unknown year'}) vs task "${existing.title}" (${existing.year || 'unknown year'})`);
+      }
+
+      const existingFileMeta = (existing.filePath && String(existing.filePath).toLowerCase().endsWith('.epub'))
+        ? extractEpubMetadataFromFile(existing.filePath)
+        : null;
+      const existingTaskIsbn = normalizeIsbnBridge((existing.requestIsbns && existing.requestIsbns[requestId]) || existing.requestIsbn || '');
+      const incomingTaskIsbn = normalizeIsbnBridge(requestIsbn || '');
+      const existingFileIsbn = normalizeIsbnBridge(existingFileMeta?.isbn || '');
       const existingEvidenceIsbn = existingTaskIsbn || normalizeIsbnBridge(existing.isbn) || existingFileIsbn;
+      let isbnAdoptedMatch = false;
       if (incomingTaskIsbn) {
         if (existingEvidenceIsbn) {
-          if (existingEvidenceIsbn !== incomingTaskIsbn &&
+          if (!ID.sameIsbn(existingEvidenceIsbn, incomingTaskIsbn) &&
               !areVerifiedIsbnCounterpartsBridge(existingEvidenceIsbn, incomingTaskIsbn, existing?.trustedIsbns, existing?.bookMetadata, existing?.extra?.bookMetadata, release?.trustedIsbns, release?.extra?.bookMetadata)) {
-            throw new Error(`Incompatible ISBN for existing task ${existingTaskId}: requested ${incomingTaskIsbn} vs task ${existingEvidenceIsbn}`);
+            throw new Error(`Incompatible ISBN for existing task ${idForErr}: requested ${incomingTaskIsbn} vs task ${existingEvidenceIsbn}`);
           }
+          isbnAdoptedMatch = true;
         } else {
           // No verified ISBN evidence on the existing task; reject adoption for ISBN-specific request.
-          throw new Error(`Incompatible ISBN for existing task ${existingTaskId}: no verified ISBN evidence`);
+          throw new Error(`Incompatible ISBN for existing task ${idForErr}: no verified ISBN evidence`);
         }
       }
+
+      const existingEvidenceYear = parsePositiveInt(
+        (existing.requestYears && existing.requestYears[requestId]) ||
+        existing.requestYear ||
+        existing.year ||
+        existingFileMeta?.year
+      );
+      if (parsedReqYear) {
+        if (existingEvidenceYear) {
+          if (existingEvidenceYear !== parsedReqYear) {
+            throw new Error(`Incompatible edition for existing task ${idForErr}: requested year ${parsedReqYear} vs task year ${existingEvidenceYear}`);
+          }
+        } else if (!isbnAdoptedMatch) {
+          throw new Error(`Incompatible edition for existing task ${idForErr}: no verified year evidence for ${parsedReqYear}`);
+        }
+      }
+    };
+
+    const mergeRequestIntoExistingTask = (existing) => {
+      if (requestTitle && !existing.requestTitle) existing.requestTitle = requestTitle;
+      if (requestTitle) {
+        existing.requestTitles = existing.requestTitles || {};
+        if (!existing.requestTitles[requestId]) existing.requestTitles[requestId] = requestTitle;
+      }
+      if (requestAuthor && !existing.requestAuthor) existing.requestAuthor = requestAuthor;
+      if (requestAuthor) {
+        existing.requestAuthorsMap = existing.requestAuthorsMap || {};
+        if (!existing.requestAuthorsMap[requestId]) existing.requestAuthorsMap[requestId] = requestAuthor;
+      }
+      if (parsedReqYear && !existing.requestYear) existing.requestYear = parsedReqYear;
+      if (parsedReqYear) {
+        existing.requestYears = existing.requestYears || {};
+        if (!existing.requestYears[requestId]) existing.requestYears[requestId] = parsedReqYear;
+      }
+      if (requestLanguage && !existing.requestLanguage) existing.requestLanguage = normalizedReqLang;
+      if (requestId) {
+        existing.requestLanguages = existing.requestLanguages || {};
+        if (!existing.requestLanguages[requestId]) existing.requestLanguages[requestId] = normalizedReqLang;
+      }
+      if (requestIsbn && !existing.requestIsbn) existing.requestIsbn = requestIsbn;
+      if (requestIsbn) {
+        existing.requestIsbns = existing.requestIsbns || {};
+        if (!existing.requestIsbns[requestId]) existing.requestIsbns[requestId] = requestIsbn;
+      }
+      existing.trustedIsbns = gatherTrustedIsbnsBridge(existing.trustedIsbns, existing.bookMetadata, existing.extra, release?.extra?.bookMetadata, release?.extra, release);
+      existing.bookMetadata = existing.bookMetadata || release?.extra?.bookMetadata || null;
+    };
+
+    if (existingTaskId && this.state.tasks[existingTaskId]) {
+      const existing = this.state.tasks[existingTaskId];
+      verifyExistingTaskAdoption(existing, existingTaskId, true);
 
       this.state.requests[requestId] = existingTaskId;
       if (!existing.requestIds.includes(requestId)) {
@@ -1838,37 +2341,7 @@ export class BridgeService {
         existing.userIds.push(userId);
       }
       existing.updatedAt = new Date().toISOString();
-      if (requestTitle && !existing.requestTitle) existing.requestTitle = requestTitle;
-      if (requestTitle) {
-        existing.requestTitles = existing.requestTitles || {};
-        if (!existing.requestTitles[requestId]) existing.requestTitles[requestId] = requestTitle;
-      }
-      if (requestAuthor && !existing.requestAuthor) existing.requestAuthor = requestAuthor;
-      if (requestAuthor) {
-        existing.requestAuthorsMap = existing.requestAuthorsMap || {};
-        if (!existing.requestAuthorsMap[requestId]) existing.requestAuthorsMap[requestId] = requestAuthor;
-      }
-      if (requestYear && !existing.requestYear) existing.requestYear = requestYear;
-      if (requestLanguage && !existing.requestLanguage) existing.requestLanguage = ID.normalizeLanguageCode(requestLanguage) || 'en';
-      if (requestTitle && !existing.requestTitle) existing.requestTitle = requestTitle;
-      if (requestTitle) {
-        existing.requestTitles = existing.requestTitles || {};
-        if (!existing.requestTitles[requestId]) existing.requestTitles[requestId] = requestTitle;
-      }
-      if (requestAuthor && !existing.requestAuthor) existing.requestAuthor = requestAuthor;
-      if (requestAuthor) {
-        existing.requestAuthorsMap = existing.requestAuthorsMap || {};
-        if (!existing.requestAuthorsMap[requestId]) existing.requestAuthorsMap[requestId] = requestAuthor;
-      }
-      if (requestYear && !existing.requestYear) existing.requestYear = requestYear;
-      if (requestLanguage && !existing.requestLanguage) existing.requestLanguage = ID.normalizeLanguageCode(requestLanguage) || 'en';
-      if (requestIsbn && !existing.requestIsbn) existing.requestIsbn = requestIsbn;
-      if (requestIsbn) {
-        existing.requestIsbns = existing.requestIsbns || {};
-        if (!existing.requestIsbns[requestId]) existing.requestIsbns[requestId] = requestIsbn;
-      }
-      existing.trustedIsbns = gatherTrustedIsbnsBridge(existing.trustedIsbns, existing.bookMetadata, existing.extra, release?.extra?.bookMetadata, release?.extra, release);
-      existing.bookMetadata = existing.bookMetadata || release?.extra?.bookMetadata || null;
+      mergeRequestIntoExistingTask(existing);
       this.saveState();
 
       if ((existing.status === 'completed' || existing.status === 'fulfilled') && existing.filePath) {
@@ -2003,6 +2476,16 @@ export class BridgeService {
         userId,
         userIds: userId ? [userId] : [],
         release: downloadPayload,
+        requestTitle: requestTitle || null,
+        requestAuthor: requestAuthor || (Array.isArray(requestAuthors) ? requestAuthors[0] : null) || null,
+        requestYear: parsedReqYear,
+        requestYears: requestId && parsedReqYear ? { [requestId]: parsedReqYear } : {},
+        requestIsbn: requestIsbn || null,
+        requestIsbns: requestId && requestIsbn ? { [requestId]: requestIsbn } : {},
+        requestTitles: requestId && requestTitle ? { [requestId]: requestTitle } : {},
+        requestAuthorsMap: requestId && (requestAuthor || (Array.isArray(requestAuthors) && requestAuthors[0])) ? { [requestId]: requestAuthor || requestAuthors[0] } : {},
+        requestLanguage: normalizedReqLang,
+        requestLanguages: requestId ? { [requestId]: normalizedReqLang } : {},
         trustedIsbns: gatherTrustedIsbnsBridge(release?.extra?.bookMetadata, release?.extra, release),
         bookMetadata: release?.extra?.bookMetadata || null,
         libraryId: libraryId ?? this.defaultLibraryId,
@@ -2054,6 +2537,16 @@ export class BridgeService {
             userId,
             userIds: userId ? [userId] : [],
             release: downloadPayload,
+            requestTitle: requestTitle || null,
+            requestAuthor: requestAuthor || (Array.isArray(requestAuthors) ? requestAuthors[0] : null) || null,
+            requestYear: parsedReqYear,
+            requestYears: requestId && parsedReqYear ? { [requestId]: parsedReqYear } : {},
+            requestIsbn: requestIsbn || null,
+            requestIsbns: requestId && requestIsbn ? { [requestId]: requestIsbn } : {},
+            requestTitles: requestId && requestTitle ? { [requestId]: requestTitle } : {},
+            requestAuthorsMap: requestId && (requestAuthor || (Array.isArray(requestAuthors) && requestAuthors[0])) ? { [requestId]: requestAuthor || requestAuthors[0] } : {},
+            requestLanguage: normalizedReqLang,
+            requestLanguages: requestId ? { [requestId]: normalizedReqLang } : {},
             trustedIsbns: gatherTrustedIsbnsBridge(release?.extra?.bookMetadata, release?.extra, release),
             bookMetadata: release?.extra?.bookMetadata || null,
             libraryId: libraryId ?? this.defaultLibraryId,
@@ -2105,45 +2598,9 @@ export class BridgeService {
     const now = new Date().toISOString();
     if (this.state.tasks[taskId]) {
       const existing = this.state.tasks[taskId];
-      if (!areEditionsCompatible(existing, release)) {
-        throw new Error(`Incompatible edition for existing task ${taskId}: requested "${release.title}" (${release.year || 'unknown year'}) vs task "${existing.title}" (${existing.year || 'unknown year'})`);
-      }
-      const existingTaskIsbn = String((existing.requestIsbns && existing.requestIsbns[requestId]) || existing.requestIsbn || '').replace(/[^0-9X]/gi, '');
-      const incomingTaskIsbn = String(requestIsbn || '').replace(/[^0-9X]/gi, '');
-      const existingFileIsbn = (existing.filePath && String(existing.filePath).toLowerCase().endsWith('.epub'))
-        ? normalizeIsbnBridge(extractEpubMetadataFromFile(existing.filePath)?.isbn)
-        : '';
-      const existingEvidenceIsbn = existingTaskIsbn || normalizeIsbnBridge(existing.isbn) || existingFileIsbn;
-      if (incomingTaskIsbn) {
-        if (existingEvidenceIsbn) {
-          if (existingEvidenceIsbn !== incomingTaskIsbn &&
-              !areVerifiedIsbnCounterpartsBridge(existingEvidenceIsbn, incomingTaskIsbn, existing?.trustedIsbns, existing?.bookMetadata, existing?.extra?.bookMetadata, release?.trustedIsbns, release?.extra?.bookMetadata)) {
-            throw new Error(`Incompatible ISBN for existing task ${taskId}: requested ${incomingTaskIsbn} vs task ${existingEvidenceIsbn}`);
-          }
-        } else {
-          // No verified ISBN evidence on the existing task; reject adoption for ISBN-specific request.
-          throw new Error(`Incompatible ISBN for existing task ${taskId}: no verified ISBN evidence`);
-        }
-      }
-      if (requestTitle && !existing.requestTitle) existing.requestTitle = requestTitle;
-      if (requestTitle) {
-        existing.requestTitles = existing.requestTitles || {};
-        if (!existing.requestTitles[requestId]) existing.requestTitles[requestId] = requestTitle;
-      }
-      if (requestAuthor && !existing.requestAuthor) existing.requestAuthor = requestAuthor;
-      if (requestAuthor) {
-        existing.requestAuthorsMap = existing.requestAuthorsMap || {};
-        if (!existing.requestAuthorsMap[requestId]) existing.requestAuthorsMap[requestId] = requestAuthor;
-      }
-      if (requestYear && !existing.requestYear) existing.requestYear = requestYear;
-      if (requestLanguage && !existing.requestLanguage) existing.requestLanguage = ID.normalizeLanguageCode(requestLanguage) || 'en';
-      if (requestIsbn && !existing.requestIsbn) existing.requestIsbn = requestIsbn;
-      if (requestIsbn) {
-        existing.requestIsbns = existing.requestIsbns || {};
-        if (!existing.requestIsbns[requestId]) existing.requestIsbns[requestId] = requestIsbn;
-      }
-      existing.trustedIsbns = gatherTrustedIsbnsBridge(existing.trustedIsbns, existing.bookMetadata, existing.extra, release?.extra?.bookMetadata, release?.extra, release);
-      existing.bookMetadata = existing.bookMetadata || release?.extra?.bookMetadata || null;
+      const sameSrc = Boolean(existing.sourceId && downloadPayload.source_id && String(existing.sourceId) === String(downloadPayload.source_id));
+      verifyExistingTaskAdoption(existing, taskId, sameSrc);
+      mergeRequestIntoExistingTask(existing);
 
       this.state.requests[requestId] = taskId;
       if (!existing.requestIds.includes(requestId)) {
@@ -2204,15 +2661,17 @@ export class BridgeService {
       requestTitle: requestTitle || null,
       requestAuthor: requestAuthor || (Array.isArray(requestAuthors) ? requestAuthors[0] : null) || null,
       requestAuthors: Array.isArray(requestAuthors) ? requestAuthors : (requestAuthor ? [requestAuthor] : []),
-      requestYear: parsePositiveInt(requestYear) || null,
+      requestYear: parsedReqYear,
+      requestYears: requestId && parsedReqYear ? { [requestId]: parsedReqYear } : {},
       requestIsbn: requestIsbn || null,
-      requestIsbns: requestIsbn ? { [requestId]: requestIsbn } : {},
+      requestIsbns: requestId && requestIsbn ? { [requestId]: requestIsbn } : {},
       requestTitles: requestId && requestTitle ? { [requestId]: requestTitle } : {},
       requestAuthorsMap: requestId && (requestAuthor || (Array.isArray(requestAuthors) && requestAuthors[0])) ? { [requestId]: requestAuthor || requestAuthors[0] } : {},
       trustedIsbns: gatherTrustedIsbnsBridge(release?.extra?.bookMetadata, release?.extra, release),
       bookMetadata: release?.extra?.bookMetadata || null,
       language: ID.normalizeLanguageCode(release.language || downloadPayload.language) || null,
-      requestLanguage: ID.normalizeLanguageCode(requestLanguage) || 'en',
+      requestLanguage: normalizedReqLang,
+      requestLanguages: requestId ? { [requestId]: normalizedReqLang } : {},
       format: (downloadPayload.format || release.format || 'epub').toLowerCase(),
       source: downloadPayload.source,
       sourceId: downloadPayload.source_id,
@@ -3129,55 +3588,6 @@ export class BridgeService {
       }
     }
 
-    const distinctReqIsbns = [...new Set((task.requestIds || []).map((rid) => String((task.requestIsbns && task.requestIsbns[rid]) || task.requestIsbn || '').replace(/[^0-9X]/gi, '')))].filter(Boolean);
-    const requestIsbn = distinctReqIsbns.length === 1 ? distinctReqIsbns[0] : '';
-    if (requestIsbn) {
-      const opf = String(task?.filePath || '').toLowerCase().endsWith('.epub')
-        ? extractEpubMetadataFromFile(task.filePath) : null;
-      const fileIsbn = String(opf?.isbn || '').replace(/[^0-9X]/gi, '');
-      const verified = Boolean(fileIsbn) && (fileIsbn === requestIsbn || areVerifiedIsbnCounterpartsBridge(requestIsbn, fileIsbn, task?.trustedIsbns, task?.bookMetadata, task?.extra?.bookMetadata));
-      if (!verified) {
-        task.error = !fileIsbn
-          ? 'Release ISBN could not be verified in downloaded file'
-          : `Release ISBN ${fileIsbn} does not match requested ISBN ${requestIsbn}`;
-        task.isbnVerificationFailed = true;
-        task.status = 'failed';
-        task.errorSource = 'companion_isbn_verification';
-        if (task.releaseKey && this.state.releases[task.releaseKey] === (task.taskId || task.id)) {
-          delete this.state.releases[task.releaseKey];
-        }
-        if (task.releaseKey) {
-          this.state.failedReleases[task.releaseKey] = {
-            releaseKey: task.releaseKey,
-            source: task.source,
-            sourceId: task.sourceId,
-            failedAt: new Date().toISOString(),
-            error: task.error,
-          };
-        }
-        for (const rid of (task.requestIds || [])) {
-          if (task.requestFulfillments?.[rid]?.fulfilled) continue;
-          const attemptId = `isbn:${task.taskId || task.id}`;
-          this.state.requestAttempts[rid] = this.state.requestAttempts[rid] || [];
-          if (!this.state.requestAttempts[rid].some((a) => a.attemptId === attemptId)) {
-            this.state.requestAttempts[rid].push({ attemptId, taskId: task.taskId, timestamp: new Date().toISOString(), error: task.error });
-            const attempts = this.state.requestAttempts[rid].length;
-            this.state.requestSourceAttempts[rid] = attempts;
-            this.state.requestErrors[rid] = { error: task.error, errorType: 'isbn_verification_failed', lastAttemptAt: new Date().toISOString(), attempts };
-          }
-          if ((this.state.requestSourceAttempts[rid] || 0) < this.maxSourceAttempts) {
-            delete this.state.requests[rid];
-          }
-          this.setRequestProgress(rid, 'review_required', { reason: 'isbn_verification_failed' });
-        }
-        this.saveState();
-        if ((task.requestIds || []).some((rid) => (this.state.requestSourceAttempts[rid] || 0) < this.maxSourceAttempts)) {
-          this.triggerProcessPendingRequests(100);
-        }
-        return { fulfilled: false, error: task.error };
-      }
-    }
-
     // Step 1: Import file into Library if not already uploaded/matched
     if (!matchedBookId) {
       if (!task.filePath) {
@@ -3191,47 +3601,117 @@ export class BridgeService {
         return { fulfilled: false, error: task.error };
       }
 
-      // Verify the downloaded EPUB's actual metadata against the requested edition before upload.
-      if (String(task.filePath).toLowerCase().endsWith('.epub')) {
-        const epubMeta = extractEpubMetadataFromFile(task.filePath);
-        if (epubMeta) {
-          const expectedTitle = task.requestTitle || task.bookTitle || task.title || '';
-          const expectedAuthor = task.requestAuthor || task.bookAuthor || task.author || '';
-          const expectedLanguage = task.requestLanguage || 'en';
+      // Stage 2: Authoritatively verify downloaded file metadata against each active request's
+      // title, author, language, ISBN/counterparts, and publication year BEFORE any upload.
+      const nowVer = new Date().toISOString();
+      const requestsToVerify = activeRequestIds.length > 0 ? activeRequestIds : (task.requestIds?.length ? task.requestIds : ['']);
+      const verifiedActiveIds = [];
+      let firstFailedVer = null;
 
-          if (epubMeta.title && expectedTitle && !ID.isTitleMatch(epubMeta.title, expectedTitle)) {
-            task.status = 'finalization_failed';
-            task.error = `EPUB title mismatch: expected "${expectedTitle}", got "${epubMeta.title}"`;
-            this.recordTaskFailureAttempts(task, 'finalization_failed');
-            this.saveState();
-            if ((task.requestIds || []).some((rid) => (this.state.requestSourceAttempts[rid] || 0) < this.maxSourceAttempts)) {
-              this.triggerProcessPendingRequests(100);
-            }
-            return { fulfilled: false, error: task.error };
+      for (const rid of requestsToVerify) {
+        if (rid && task.requestFulfillments?.[rid]?.fulfilled) continue;
+        const ver = verifyDownloadedEdition(task, { requestId: rid || undefined });
+        const verStage = ver.ok
+          ? 'verified'
+          : (ver.errorType === 'finalization_failed' ? 'finalization_failed' : 'review_required');
+
+        task.verificationEvidence = ver.evidence;
+        task.verificationConflicts = ver.conflicts;
+
+        if (rid) {
+          this.state.requestVerification = this.state.requestVerification || {};
+          this.state.requestVerification[rid] = {
+            ok: ver.ok,
+            taskId: task.taskId || task.id || null,
+            releaseKey: task.releaseKey || null,
+            stage: verStage,
+            errorType: ver.errorType || null,
+            primaryConflict: ver.primaryConflict || null,
+            conflicts: ver.conflicts || [],
+            evidence: ver.evidence || [],
+            error: ver.error || null,
+            verifiedAt: nowVer,
+          };
+        }
+
+        if (ver.ok) {
+          verifiedActiveIds.push(rid);
+          if (ver.opf) {
+            if (!task.year && ver.opf.year) task.year = ver.opf.year;
+            if (!task.isbn && ver.opf.isbn) task.isbn = ver.opf.isbn;
           }
-          if (epubMeta.author && expectedAuthor && !ID.isAuthorMatch(epubMeta.author, expectedAuthor)) {
-            task.status = 'finalization_failed';
-            task.error = `EPUB author mismatch: expected "${expectedAuthor}", got "${epubMeta.author}"`;
-            this.recordTaskFailureAttempts(task, 'finalization_failed');
-            this.saveState();
-            if ((task.requestIds || []).some((rid) => (this.state.requestSourceAttempts[rid] || 0) < this.maxSourceAttempts)) {
-              this.triggerProcessPendingRequests(100);
+        } else {
+          if (!firstFailedVer) firstFailedVer = ver;
+          if (rid) {
+            task.requestFulfillments[rid] = {
+              fulfilled: false,
+              errorType: ver.primaryConflict || ver.errorType || 'edition_verification_failed',
+              error: ver.error,
+              updatedAt: nowVer,
+            };
+            const attemptId = `edition:${task.taskId || task.id}:${rid}`;
+            this.state.requestAttempts[rid] = this.state.requestAttempts[rid] || [];
+            if (!this.state.requestAttempts[rid].some((a) => a.attemptId === attemptId)) {
+              this.state.requestAttempts[rid].push({
+                attemptId,
+                taskId: task.taskId,
+                releaseKey: task.releaseKey,
+                timestamp: nowVer,
+                error: ver.error,
+              });
             }
-            return { fulfilled: false, error: task.error };
-          }
-          const normEpubLang = ID.normalizeLanguageCode(epubMeta.language);
-          const normExpectedLang = ID.normalizeLanguageCode(expectedLanguage);
-          if (normEpubLang && normExpectedLang && normEpubLang !== normExpectedLang) {
-            task.status = 'finalization_failed';
-            task.error = `EPUB language mismatch: expected "${normExpectedLang}", got "${epubMeta.language}" (${normEpubLang})`;
-            this.recordTaskFailureAttempts(task, 'finalization_failed');
-            this.saveState();
-            if ((task.requestIds || []).some((rid) => (this.state.requestSourceAttempts[rid] || 0) < this.maxSourceAttempts)) {
-              this.triggerProcessPendingRequests(100);
+            const attempts = this.state.requestAttempts[rid].length;
+            this.state.requestSourceAttempts[rid] = Math.max(this.state.requestSourceAttempts[rid] || 0, attempts);
+            this.state.requestErrors[rid] = {
+              error: ver.error,
+              errorType: ver.errorType || 'edition_verification_failed',
+              conflict: ver.primaryConflict || null,
+              lastAttemptAt: nowVer,
+              attempts: this.state.requestSourceAttempts[rid],
+            };
+            if ((this.state.requestSourceAttempts[rid] || 0) < this.maxSourceAttempts) {
+              delete this.state.requests[rid];
             }
-            return { fulfilled: false, error: task.error };
+            this.setRequestProgress(rid, verStage, {
+              reason: ver.errorType || 'edition_verification_failed',
+              conflict: ver.primaryConflict || undefined,
+            });
           }
         }
+      }
+
+      if (verifiedActiveIds.length === 0 && firstFailedVer) {
+        task.error = firstFailedVer.error;
+        task.editionVerificationFailed = true;
+        if (firstFailedVer.isbnFailure) {
+          task.isbnVerificationFailed = true;
+        }
+        if (firstFailedVer.errorType === 'finalization_failed') {
+          task.status = 'finalization_failed';
+          delete task.errorSource;
+        } else {
+          task.status = 'failed';
+          task.errorSource = firstFailedVer.isbnFailure
+            ? 'companion_isbn_verification'
+            : 'companion_edition_verification';
+        }
+        if (task.releaseKey && this.state.releases[task.releaseKey] === (task.taskId || task.id)) {
+          delete this.state.releases[task.releaseKey];
+        }
+        if (task.releaseKey) {
+          this.state.failedReleases[task.releaseKey] = {
+            releaseKey: task.releaseKey,
+            source: task.source,
+            sourceId: task.sourceId,
+            failedAt: nowVer,
+            error: task.error,
+          };
+        }
+        this.saveState();
+        if ((task.requestIds || []).some((rid) => (this.state.requestSourceAttempts[rid] || 0) < this.maxSourceAttempts)) {
+          this.triggerProcessPendingRequests(100);
+        }
+        return { fulfilled: false, error: task.error };
       }
 
       // Reconcile uncertain upload state: check authoritative BookOrbit library before re-uploading
@@ -3383,35 +3863,74 @@ export class BridgeService {
         this.saveState();
         continue;
       }
-      const reqIsbn = String((task.requestIsbns && task.requestIsbns[reqId]) || '').replace(/[^0-9X]/gi, '');
-      if (reqIsbn) {
-        const opf = String(task?.filePath || '').toLowerCase().endsWith('.epub')
-          ? extractEpubMetadataFromFile(task.filePath) : null;
-        const fileIsbn = String(opf?.isbn || '').replace(/[^0-9X]/gi, '');
-        const verified = Boolean(fileIsbn) && (fileIsbn === reqIsbn || areVerifiedIsbnCounterpartsBridge(reqIsbn, fileIsbn, task?.trustedIsbns, task?.bookMetadata, task?.extra?.bookMetadata));
-        if (!fileIsbn || !verified) {
-          const errorType = !fileIsbn ? 'unverified_isbn' : 'conflicting_isbn';
+      const hasExplicitReqConstraint = Boolean(
+        task.requestIsbns?.[reqId] ||
+        task.requestYears?.[reqId] ||
+        task.requestTitles?.[reqId] ||
+        task.requestAuthorsMap?.[reqId] ||
+        task.requestLanguages?.[reqId] ||
+        task.requestIsbn ||
+        task.requestYear
+      );
+      if (hasExplicitReqConstraint) {
+        const ver2 = verifyDownloadedEdition(task, { requestId: reqId });
+        const nowVer2 = new Date().toISOString();
+        const verStage2 = ver2.ok
+          ? 'verified'
+          : (ver2.errorType === 'finalization_failed' ? 'finalization_failed' : 'review_required');
+        this.state.requestVerification = this.state.requestVerification || {};
+        this.state.requestVerification[reqId] = {
+          ok: ver2.ok,
+          taskId: task.taskId || task.id || null,
+          releaseKey: task.releaseKey || null,
+          stage: verStage2,
+          errorType: ver2.errorType || null,
+          primaryConflict: ver2.primaryConflict || null,
+          conflicts: ver2.conflicts || [],
+          evidence: ver2.evidence || [],
+          error: ver2.error || null,
+          verifiedAt: nowVer2,
+        };
+        if (!ver2.ok) {
+          const errType2 = ver2.primaryConflict || ver2.errorType || 'edition_verification_failed';
           task.requestFulfillments[reqId] = {
             fulfilled: false,
-            errorType,
-            error: !fileIsbn
-              ? 'Release ISBN could not be verified in downloaded file'
-              : `Release ISBN ${fileIsbn} does not match requested ISBN ${reqIsbn}`,
-            updatedAt: new Date().toISOString(),
+            errorType: errType2,
+            error: ver2.error,
+            updatedAt: nowVer2,
           };
-          this.setRequestProgress(reqId, 'review_required', { reason: errorType });
-          const attemptId = `${errorType}:${task.taskId}:${reqId}`;
+          this.setRequestProgress(reqId, verStage2, {
+            reason: ver2.errorType || errType2,
+            conflict: ver2.primaryConflict || undefined,
+          });
+          const attemptId = `edition:${task.taskId || task.id}:${reqId}`;
           this.state.requestAttempts[reqId] = this.state.requestAttempts[reqId] || [];
           if (!this.state.requestAttempts[reqId].some((a) => a.attemptId === attemptId)) {
-            this.state.requestAttempts[reqId].push({ attemptId, taskId: task.taskId, timestamp: new Date().toISOString(), error: errorType });
-            const attempts = this.state.requestAttempts[reqId].length;
-            this.state.requestSourceAttempts[reqId] = attempts;
-            this.state.requestErrors[reqId] = { error: task.requestFulfillments[reqId].error, errorType, lastAttemptAt: new Date().toISOString(), attempts };
+            this.state.requestAttempts[reqId].push({
+              attemptId,
+              taskId: task.taskId,
+              releaseKey: task.releaseKey,
+              timestamp: nowVer2,
+              error: ver2.error,
+            });
           }
-          if ((this.state.requestSourceAttempts[reqId] || 0) < this.maxSourceAttempts) delete this.state.requests[reqId];
-          task.isbnVerificationFailed = true;
+          const attempts = this.state.requestAttempts[reqId].length;
+          this.state.requestSourceAttempts[reqId] = Math.max(this.state.requestSourceAttempts[reqId] || 0, attempts);
+          this.state.requestErrors[reqId] = {
+            error: ver2.error,
+            errorType: ver2.errorType || errType2,
+            conflict: ver2.primaryConflict || null,
+            lastAttemptAt: nowVer2,
+            attempts: this.state.requestSourceAttempts[reqId],
+          };
+          if ((this.state.requestSourceAttempts[reqId] || 0) < this.maxSourceAttempts) {
+            delete this.state.requests[reqId];
+          }
+          if (ver2.isbnFailure) task.isbnVerificationFailed = true;
           this.saveState();
-          this.triggerProcessPendingRequests(100);
+          if ((this.state.requestSourceAttempts[reqId] || 0) < this.maxSourceAttempts) {
+            this.triggerProcessPendingRequests(100);
+          }
           continue;
         }
       }
@@ -3543,6 +4062,9 @@ export class BridgeService {
 
     task.fulfilledRequestIds = task.requestIds.filter((id) => task.requestFulfillments[id]?.fulfilled);
     task.unfulfilledRequestIds = task.requestIds.filter((id) => !task.requestFulfillments[id]?.fulfilled);
+    for (const fId of task.fulfilledRequestIds) {
+      this.setRequestProgress(fId, 'fulfilled', { reason: 'fulfilled', bookId: matchedBookId });
+    }
 
     const allFulfilled = task.requestIds.length > 0 && task.unfulfilledRequestIds.length === 0;
     if (allFulfilled) {
@@ -3644,7 +4166,7 @@ export class BridgeService {
           if (this.state.tasks[realTaskId]) {
             // Task already exists: apply collision-safe merging rules without erasing existing state!
             const existing = this.state.tasks[realTaskId];
-            if (!areEditionsCompatible(existing, unrec.release)) {
+            if (existing.isbnVerificationFailed || existing.editionVerificationFailed || candidateCompatibility(existing, unrec.release).outcome === 'reject') {
               console.warn(`[Bridge] Uncertain queue resolution collided with incompatible existing task ${realTaskId}`);
               continue;
             }
@@ -3659,6 +4181,16 @@ export class BridgeService {
                 existing.unfulfilledRequestIds.push(rid);
               }
             }
+            if (unrec.requestTitle && !existing.requestTitle) existing.requestTitle = unrec.requestTitle;
+            if (unrec.requestTitles) existing.requestTitles = { ...(unrec.requestTitles || {}), ...(existing.requestTitles || {}) };
+            if (unrec.requestAuthor && !existing.requestAuthor) existing.requestAuthor = unrec.requestAuthor;
+            if (unrec.requestAuthorsMap) existing.requestAuthorsMap = { ...(unrec.requestAuthorsMap || {}), ...(existing.requestAuthorsMap || {}) };
+            if (unrec.requestYear && !existing.requestYear) existing.requestYear = unrec.requestYear;
+            if (unrec.requestYears) existing.requestYears = { ...(unrec.requestYears || {}), ...(existing.requestYears || {}) };
+            if (unrec.requestIsbn && !existing.requestIsbn) existing.requestIsbn = unrec.requestIsbn;
+            if (unrec.requestIsbns) existing.requestIsbns = { ...(unrec.requestIsbns || {}), ...(existing.requestIsbns || {}) };
+            if (unrec.requestLanguage && !existing.requestLanguage) existing.requestLanguage = unrec.requestLanguage;
+            if (unrec.requestLanguages) existing.requestLanguages = { ...(unrec.requestLanguages || {}), ...(existing.requestLanguages || {}) };
             const unrecUserIds = Array.isArray(unrec.userIds) && unrec.userIds.length ? unrec.userIds : (unrec.userId ? [unrec.userId] : []);
             for (const uid of unrecUserIds) {
               if (!existing.userIds.includes(uid)) existing.userIds.push(uid);
@@ -3684,6 +4216,16 @@ export class BridgeService {
               author: unrec.release?.author,
               year: parsePositiveInt(unrec.release?.year || unrec.release?.publicationYear) || null,
               isbn: unrec.release?.isbn13 || unrec.release?.isbn || null,
+              requestTitle: unrec.requestTitle || null,
+              requestAuthor: unrec.requestAuthor || null,
+              requestYear: parsePositiveInt(unrec.requestYear) || null,
+              requestYears: { ...(unrec.requestYears || {}) },
+              requestIsbn: unrec.requestIsbn || null,
+              requestIsbns: { ...(unrec.requestIsbns || {}) },
+              requestTitles: { ...(unrec.requestTitles || {}) },
+              requestAuthorsMap: { ...(unrec.requestAuthorsMap || {}) },
+              requestLanguage: unrec.requestLanguage || 'en',
+              requestLanguages: { ...(unrec.requestLanguages || {}) },
               trustedIsbns: gatherTrustedIsbnsBridge(unrec.trustedIsbns, unrec.bookMetadata, unrec.release?.extra?.bookMetadata, unrec.release),
               bookMetadata: unrec.bookMetadata || unrec.release?.extra?.bookMetadata || null,
               format: (unrec.release?.format || 'epub').toLowerCase(),
@@ -3751,7 +4293,7 @@ export class BridgeService {
       if (task.status === 'fulfilled') {
         continue;
       }
-      if (task.isbnVerificationFailed) {
+      if (task.isbnVerificationFailed || task.editionVerificationFailed) {
         continue;
       }
 
@@ -4001,6 +4543,7 @@ export class BridgeService {
     const failedReleases = this.state.failedReleases || {};
     const uncertain = this.state.uncertainQueues || {};
     const sourceAttempts = this.state.requestSourceAttempts || {};
+    const reqVerification = requestId ? (this.state.requestVerification?.[requestId] || null) : null;
 
      const report = {
       generatedAt: new Date().toISOString(),
@@ -4011,8 +4554,9 @@ export class BridgeService {
       searchAttempts: requestId ? (sourceAttempts[requestId] ?? 0) : sourceAttempts,
       attempts: requestId ? (attempts[requestId] || []) : attempts,
        errors: requestId ? (errors[requestId] || null) : errors,
-       verificationEvidence: requestId ? (tasks[requests[requestId]]?.verificationEvidence || null) : undefined,
-       verificationConflicts: requestId ? (tasks[requests[requestId]]?.verificationConflicts || null) : undefined,
+       verificationEvidence: requestId ? (tasks[requests[requestId]]?.verificationEvidence || reqVerification?.evidence || null) : undefined,
+       verificationConflicts: requestId ? (tasks[requests[requestId]]?.verificationConflicts || reqVerification?.conflicts || null) : undefined,
+       lastVerification: requestId ? reqVerification : undefined,
       retryState: requestId ? { attempts: sourceAttempts[requestId] ?? 0, max: this.maxSourceAttempts } : undefined,
       taskStatuses: Object.fromEntries(Object.entries(tasks).map(([k, v]) => [k, v?.status || v?.state || 'unknown'])),
        uncertainQueueCount: Object.keys(uncertain).length,

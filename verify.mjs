@@ -46,6 +46,8 @@ import {
   normalizeTaskGroup,
   parsePositiveInt,
   areEditionsCompatible,
+  candidateCompatibility,
+  verifyDownloadedEdition,
   titleMatchDecision,
   authorMatchDecision,
   editionCompatibility,
@@ -69,7 +71,7 @@ import {
 } from './bridge/bridge.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
-const EXPECTED_VERSION = '1.7.5';
+const EXPECTED_VERSION = '1.7.6';
 const RELEASE_MODE = process.argv.includes('--release');
 const TEST_TIMEOUT_MS = 10_000;
 const tests = [];
@@ -389,7 +391,7 @@ test('DECLARATION: BookOrbit API v1, Shelfmark indexer and ebook-only', () => {
   assert.equal(plugin.type, 'shelfmark');
   assert.deepEqual(plugin.mediaKinds, ['ebook']);
 });
-test('DECLARATION: native indexer advertises v1.7.5, never a previous version', () => {
+test('DECLARATION: native indexer advertises v1.7.6, never a previous version', () => {
   assert.equal(plugin.version, EXPECTED_VERSION);
 });
 test('DECLARATION: exposes search, test, and resolveFile entry points', () => {
@@ -415,7 +417,7 @@ test('RELEASE CONTRACT: package version, plugin version and release target agree
   assert.equal(plugin.version, EXPECTED_VERSION);
 });
 if (RELEASE_MODE) {
-  test('RELEASE: signed manifest has declared format and v1.7.5 version', () => {
+  test('RELEASE: signed manifest has declared format and v1.7.6 version', () => {
     const manifest = JSON.parse(readFileSync(join(HERE, 'updates', 'shelfmark.json'), 'utf8'));
     assert.equal(manifest.schemaVersion, 1);
     assert.equal(manifest.type, 'shelfmark');
@@ -3457,9 +3459,18 @@ test('PROPERTY: unknown evidence cannot become verified (year)', () => {
   const req = { title: 'Dune', author: 'Frank Herbert', year: 1965 };
   const cand = { title: 'Dune', author: 'Frank Herbert', year: null };
   const d = editionCompatibility(req, cand);
-  // known requested year + unknown release year => reject unless ISBN verified
-  assert.equal(d.outcome, 'reject');
-  assert.ok(d.conflicts.includes('unknown_release_year'));
+  // Stage 1 candidate discovery: plausible work with missing release year is provisional (never 'match' or 'verified')
+  assert.equal(d.outcome, 'provisional');
+  assert.equal(d.editionConfidence, 'low');
+  assert.ok(d.reasonCodes.includes('unknown_release_year'));
+  assert.ok(!d.conflicts.includes('unknown_release_year'));
+  const yearEv = d.evidence.find((e) => e.field === 'year');
+  assert.equal(yearEv?.status, 'unverified');
+  // Stage 2 / authoritative edition check: missing year without verified ISBN is rejected
+  const finalDecision = editionCompatibility(req, cand, { stage: 'final' });
+  assert.equal(finalDecision.outcome, 'reject');
+  assert.ok(finalDecision.conflicts.includes('unverified_edition_year'));
+  assert.equal(areEditionsCompatible(req, cand), false);
 });
 
 test('PROPERTY: contradictory edition evidence prevents fulfillment', () => {
@@ -3639,12 +3650,33 @@ test('REGRESSION: missing request year with known release year is accepted', () 
   assert.ok(!d.conflicts.includes('incompatible_year'));
 });
 
-test('REGRESSION: known request year with unknown release year is rejected without verified ISBN', () => {
-  const req = { title: 'Fahrenheit 451', author: 'Ray Bradbury', year: 1953 };
-  const cand = { title: 'Fahrenheit 451', author: 'Ray Bradbury', year: null };
-  const d = editionCompatibility(req, cand);
-  assert.equal(d.outcome, 'reject');
-  assert.ok(d.conflicts.includes('unknown_release_year'));
+test('REGRESSION: two-stage policy keeps unknown release year provisional in Stage 1 and rejects unverified edition in Stage 2', () => {
+  const req = { title: 'Fahrenheit 451', author: 'Ray Bradbury', year: 1953, isbn: '9781451673319' };
+  const candUnknown = { title: 'Fahrenheit 451', author: 'Ray Bradbury', year: null, isbn: null };
+  const candWrongYear = { title: 'Fahrenheit 451', author: 'Ray Bradbury', year: 2015, isbn: null };
+  const candVerified = { title: 'Fahrenheit 451', author: 'Ray Bradbury', year: 1953, isbn: '9781451673319' };
+
+  const stage1Unknown = candidateCompatibility(req, candUnknown);
+  assert.equal(stage1Unknown.outcome, 'provisional');
+  assert.equal(stage1Unknown.editionConfidence, 'low');
+  assert.deepEqual(stage1Unknown.conflicts, []);
+  assert.ok(stage1Unknown.reasonCodes.includes('unknown_release_year'));
+  assert.ok(stage1Unknown.reasonCodes.includes('unknown_release_isbn'));
+
+  const stage1WrongYear = candidateCompatibility(req, candWrongYear);
+  assert.equal(stage1WrongYear.outcome, 'reject');
+  assert.ok(stage1WrongYear.conflicts.includes('incompatible_year'));
+
+  const stage1Verified = candidateCompatibility(req, candVerified);
+  assert.equal(stage1Verified.outcome, 'match');
+  assert.equal(stage1Verified.editionConfidence, 'high');
+
+  const stage2Unverified = editionCompatibility(req, candUnknown, { stage: 'final' });
+  assert.equal(stage2Unverified.outcome, 'reject');
+  assert.ok(stage2Unverified.conflicts.includes('unverified_isbn'));
+  assert.ok(stage2Unverified.conflicts.includes('unverified_edition_year'));
+  assert.equal(areEditionsCompatible(req, candUnknown), false);
+  assert.equal(areEditionsCompatible(req, candVerified), true);
 });
 
 test('REGRESSION: titleMatchDecision rejects anthology/compilation false positives', () => {
@@ -3787,12 +3819,351 @@ test('REGRESSION: handleWebhook responds promptly with finalization scheduled an
   task.matchedBookId = 999;
   bridge.saveState();
 
-  const dupRes = await bridge.handleWebhook(payload, 'e2e-fixture-secret');
+  const dupRes = await bridge.handleWebhook(payload, 'e2e-fixture-secret', apiScenarios().fetch);
   assert.equal(dupRes.ok, true);
   assert.equal(dupRes.fulfilled, true);
   assert.equal(dupRes.finalization, 'already_fulfilled');
   assert.equal(task.status, 'fulfilled');
   assert.equal(task.matchedBookId, 999);
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 16. Two-Stage Edition Validation & Real-World EPUB OPF Regressions (v1.7.6)
+// ─────────────────────────────────────────────────────────────────────────────
+function zipBytesWithStreamingDataDescriptor(entries) {
+  const locals = [];
+  const central = [];
+  let offset = 0;
+  for (const [name, value] of entries) {
+    const bytes = Buffer.isBuffer(value) ? value : Buffer.from(value, 'utf8');
+    const filename = Buffer.from(name, 'utf8');
+    const sum = crc32(bytes);
+    // Local file header with general-purpose bit 3 (0x0008): compressedSize=0, uncompressedSize=0, crc=0
+    const local = Buffer.alloc(30);
+    local.writeUInt32LE(0x04034b50, 0);
+    local.writeUInt16LE(20, 4);
+    local.writeUInt16LE(0x0008, 6);
+    local.writeUInt16LE(0, 8);
+    local.writeUInt32LE(0, 14);
+    local.writeUInt32LE(0, 18);
+    local.writeUInt32LE(0, 22);
+    local.writeUInt16LE(filename.length, 26);
+    local.writeUInt16LE(0, 28);
+    // Data descriptor following payload
+    const descriptor = Buffer.alloc(16);
+    descriptor.writeUInt32LE(0x08074b50, 0);
+    descriptor.writeUInt32LE(sum, 4);
+    descriptor.writeUInt32LE(bytes.length, 8);
+    descriptor.writeUInt32LE(bytes.length, 12);
+    locals.push(local, filename, bytes, descriptor);
+
+    // Central Directory entry carries authoritative sizes and local header offset
+    const directory = Buffer.alloc(46);
+    directory.writeUInt32LE(0x02014b50, 0);
+    directory.writeUInt16LE(20, 4);
+    directory.writeUInt16LE(20, 6);
+    directory.writeUInt16LE(0x0008, 8);
+    directory.writeUInt16LE(0, 10);
+    directory.writeUInt32LE(sum, 16);
+    directory.writeUInt32LE(bytes.length, 20);
+    directory.writeUInt32LE(bytes.length, 24);
+    directory.writeUInt16LE(filename.length, 28);
+    directory.writeUInt32LE(offset, 42);
+    central.push(directory, filename);
+    offset += local.length + filename.length + bytes.length + descriptor.length;
+  }
+  const centralLength = central.reduce((n, b) => n + b.length, 0);
+  const end = Buffer.alloc(22);
+  end.writeUInt32LE(0x06054b50, 0);
+  end.writeUInt16LE(entries.length, 8);
+  end.writeUInt16LE(entries.length, 10);
+  end.writeUInt32LE(centralLength, 12);
+  end.writeUInt32LE(offset, 16);
+  return Buffer.concat([...locals, ...central, end]);
+}
+
+test('TWO-STAGE: extractEpubMetadata parses ZIP bit-3 streaming data descriptors, ignores dcterms:modified, and ignores UUID digits before real ISBN', () => {
+  const opf = `<?xml version="1.0" encoding="UTF-8"?>
+<package xmlns="http://www.idpf.org/2007/opf" version="3.0" unique-identifier="uid">
+  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:opf="http://www.idpf.org/2007/opf">
+    <dc:title>Fahrenheit 451 &amp; Afterword</dc:title>
+    <dc:creator>Ray Bradbury</dc:creator>
+    <dc:language>en-US</dc:language>
+    <dc:identifier id="uid" opf:scheme="UUID">urn:uuid:45100000-1951-2016-0000-000000000000</dc:identifier>
+    <dc:identifier opf:scheme="calibre">20240501120000</dc:identifier>
+    <dc:identifier opf:scheme="ISBN">978-1-4516-7331-9</dc:identifier>
+    <meta property="dcterms:modified">2024-05-01T12:00:00Z</meta>
+  </metadata>
+</package>`;
+  const buf = zipBytesWithStreamingDataDescriptor([
+    ['mimetype', 'application/epub+zip'],
+    ['META-INF/container.xml', '<?xml version="1.0"?><container xmlns="urn:oasis:names:tc:opendocument:xmlns:container" version="1.0"><rootfiles><rootfile full-path="ops/9781451673319.opf" media-type="application/oebps-package+xml"/></rootfiles></container>'],
+    ['ops/9781451673319.opf', opf],
+  ]);
+  const meta = extractEpubMetadata(buf);
+  assert.ok(meta, 'Central Directory parser must extract OPF when local headers use streaming data descriptors');
+  assert.equal(meta.title, 'Fahrenheit 451 & Afterword');
+  assert.equal(meta.author, 'Ray Bradbury');
+  assert.equal(meta.language, 'en-US');
+  assert.equal(meta.isbn, '9781451673319', 'UUID/calibre identifiers must not shadow real ISBN');
+  assert.ok(!meta.isbns.includes('451000001951201'));
+  assert.equal(meta.year, null, 'dcterms:modified packaging timestamp must not fabricate publication year');
+});
+
+test('TWO-STAGE: plugin.search discovers unknown-year releases for populated year+ISBN query, rejects conflicting years, and ranks verified matches first', async () => {
+  const query = {
+    title: 'Fahrenheit 451',
+    author: 'Ray Bradbury',
+    year: 1953,
+    isbn13: '9781451673319',
+    mediaKind: 'ebook',
+    language: 'English',
+  };
+  const fake = apiScenarios({
+    books: [metadata('Fahrenheit 451', 'Ray Bradbury', { year: 1953, isbn: '9781451673319' })],
+    onReleases: ({ query: q }) => {
+      // Simulate CT105 reality: ?isbn=... returns 0 or unverified releases; title+author returns unknown-year releases
+      if (q.get('isbn')) return [];
+      return [
+        release('Fahrenheit 451', 'Ray Bradbury', { source_id: 'unknown-year-src', year: null, isbn: null }),
+        release('Fahrenheit 451', 'Ray Bradbury', { source_id: 'wrong-year-2015', year: 2015, isbn: null }),
+        release('Fahrenheit 451', 'Ray Bradbury', { source_id: 'verified-1953-src', year: 1953, isbn: '1451673310' }), // equivalent ISBN-10!
+      ];
+    },
+  });
+  const results = await plugin.search(query, config(), hostWith(fake.fetch));
+  const ids = results.map((r) => r.extra?.sourceId);
+  assert.ok(!ids.includes('wrong-year-2015'), 'conflicting known year must be rejected in Stage 1');
+  assert.ok(ids.includes('verified-1953-src'), 'verified ISBN-10/year release must be discovered');
+  assert.ok(ids.includes('unknown-year-src'), 'unknown-year candidate must remain eligible for Stage 2 inspection');
+  assert.equal(ids[0], 'verified-1953-src', 'verified edition match must rank ahead of provisional unknown-year candidate');
+  fake.assertKnownRoutes();
+});
+
+test('TWO-STAGE E2E: request with populated publishedYear + isbn13 fulfills automatically from unknown-year release when EPUB OPF proves edition', async () => {
+  const stateFilePath = newStateFile();
+  const bridge = established(new BridgeService(bridgeOpts({ stateFilePath, secret: 'two-stage-secret' })), ['hist-1']);
+  const epubPath = join(root, 'f451-verified-from-unknown.epub');
+  // EPUB carries ISBN-10 equivalent (1451673310 === 9781451673319) and publication year 1953 inside streaming ZIP
+  const opf = `<?xml version="1.0" encoding="UTF-8"?>
+<package xmlns="http://www.idpf.org/2007/opf" version="3.0">
+  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:opf="http://www.idpf.org/2007/opf">
+    <dc:title>Fahrenheit 451</dc:title>
+    <dc:creator>Ray Bradbury</dc:creator>
+    <dc:language>eng</dc:language>
+    <dc:date>1953-10-19</dc:date>
+    <dc:identifier opf:scheme="UUID">urn:uuid:12345678-1234-1234-1234-123456789012</dc:identifier>
+    <dc:identifier opf:scheme="ISBN">1-4516-7331-0</dc:identifier>
+  </metadata>
+</package>`;
+  writeFileSync(epubPath, zipBytesWithStreamingDataDescriptor([
+    ['mimetype', 'application/epub+zip'],
+    ['META-INF/container.xml', '<?xml version="1.0"?><container xmlns="urn:oasis:names:tc:opendocument:xmlns:container" version="1.0"><rootfiles><rootfile full-path="OEBPS/content.opf" media-type="application/oebps-package+xml"/></rootfiles></container>'],
+    ['OEBPS/content.opf', opf],
+  ]));
+
+  const req = request('req-108', 'Fahrenheit 451', 'Ray Bradbury', {
+    publishedYear: 1953,
+    isbn13: '9781451673319',
+  });
+  const fake = apiScenarios({
+    requests: [req],
+    books: [metadata('Fahrenheit 451', 'Ray Bradbury', { year: 1953 })],
+    releases: [release('Fahrenheit 451', 'Ray Bradbury', { source_id: 'unknown-year-f451', year: null, isbn: null })],
+    taskId: 'sm-task-unknown-108',
+    'bo.upload': { id: 7108, title: 'Fahrenheit 451', author: 'Ray Bradbury', year: 1953 },
+    'bo.fulfill': { id: 'req-108', status: 'AVAILABLE' },
+  });
+
+  await bridge.processPendingRequests({ fetchFn: fake.fetch });
+  assert.equal(bridge.state.requests['req-108'], 'sm-task-unknown-108', 'Stage 1 must queue plausible unknown-year release');
+  assert.equal(fake.called('sm.download').length, 1);
+
+  const wh = await bridge.handleWebhook({
+    version: 1,
+    phase: 'post_transfer',
+    task: { task_id: 'sm-task-unknown-108', source: 'annas', title: 'Fahrenheit 451', format: 'epub' },
+    paths: { destination: root, target: epubPath, final_paths: [epubPath] },
+  }, 'two-stage-secret', fake.fetch);
+  assert.equal(wh.ok, true);
+
+  await waitUntil(() => bridge.state.tasks['sm-task-unknown-108']?.status === 'fulfilled', 2000);
+  assert.equal(fake.called('bo.upload').length, 1);
+  assert.equal(fake.called('bo.fulfill').length, 1);
+  assert.equal(bridge.state.tasks['sm-task-unknown-108'].matchedBookId, 7108);
+
+  const diag = bridge.diagnose('req-108');
+  assert.equal(diag.stage?.stage, 'fulfilled');
+  assert.ok(Array.isArray(diag.verificationEvidence) && diag.verificationEvidence.length > 0);
+  assert.equal(diag.verificationEvidence.find((e) => e.field === 'isbn')?.status, 'verified');
+  assert.equal(diag.verificationEvidence.find((e) => e.field === 'year')?.status, 'verified');
+  assert.deepEqual(diag.verificationConflicts, []);
+  fake.assertKnownRoutes();
+});
+
+test('TWO-STAGE E2E: wrong-edition EPUB and unverifiable EPUB from unknown-year releases are rejected BEFORE upload and never fabricated as matches', async () => {
+  const bridge = established(new BridgeService(bridgeOpts({ secret: 'two-stage-reject-secret' })), ['hist-1']);
+
+  // Case A: Wrong edition (OPF has year 2015 and different ISBN)
+  const wrongEpub = join(root, 'f451-wrong-2015.epub');
+  writeFileSync(wrongEpub, epubBytes({
+    title: 'Fahrenheit 451',
+    author: 'Ray Bradbury',
+    year: 2015,
+    isbn: '9780060850524',
+    language: 'en',
+  }));
+
+  const reqWrong = request('req-wrong-ed', 'Fahrenheit 451', 'Ray Bradbury', {
+    publishedYear: 1953,
+    isbn13: '9781451673319',
+  });
+  const fakeWrong = apiScenarios({
+    requests: [reqWrong],
+    books: [metadata('Fahrenheit 451', 'Ray Bradbury')],
+    releases: [release('Fahrenheit 451', 'Ray Bradbury', { source_id: 'src-wrong-ed', year: null, isbn: null })],
+    taskId: 'task-wrong-ed',
+    'bo.upload': { id: 9991 },
+    'bo.fulfill': { status: 'AVAILABLE' },
+  });
+
+  await bridge.processPendingRequests({ fetchFn: fakeWrong.fetch });
+  assert.equal(bridge.state.requests['req-wrong-ed'], 'task-wrong-ed');
+  await bridge.handleWebhook({
+    task: { task_id: 'task-wrong-ed', source: 'annas', title: 'Fahrenheit 451', format: 'epub' },
+    paths: { target: wrongEpub, final_paths: [wrongEpub] },
+  }, 'two-stage-reject-secret', fakeWrong.fetch);
+
+  await waitUntil(() => bridge.state.tasks['task-wrong-ed']?.editionVerificationFailed === true, 2000);
+  assert.equal(fakeWrong.called('bo.upload').length, 0, 'wrong edition must NEVER be uploaded');
+  assert.equal(fakeWrong.called('bo.fulfill').length, 0, 'wrong edition must NEVER be fulfilled');
+  const diagWrong = bridge.diagnose('req-wrong-ed');
+  assert.equal(diagWrong.stage?.stage, 'review_required');
+  assert.ok(diagWrong.verificationConflicts.includes('conflicting_isbn'));
+  assert.ok(diagWrong.verificationConflicts.includes('incompatible_year'));
+
+  // Case B: Unverifiable edition (OPF has matching title/author/language and dcterms:modified, but NO publication year and NO ISBN)
+  const unverifiableEpub = join(root, 'f451-unverifiable.epub');
+  const unverifiableOpf = `<?xml version="1.0" encoding="UTF-8"?>
+<package xmlns="http://www.idpf.org/2007/opf" version="3.0">
+  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/">
+    <dc:title>Fahrenheit 451</dc:title>
+    <dc:creator>Ray Bradbury</dc:creator>
+    <dc:language>en</dc:language>
+    <meta property="dcterms:modified">2024-01-15T00:00:00Z</meta>
+  </metadata>
+</package>`;
+  writeFileSync(unverifiableEpub, zipBytes([
+    ['mimetype', 'application/epub+zip'],
+    ['META-INF/container.xml', '<?xml version="1.0"?><container xmlns="urn:oasis:names:tc:opendocument:xmlns:container" version="1.0"><rootfiles><rootfile full-path="OEBPS/content.opf" media-type="application/oebps-package+xml"/></rootfiles></container>'],
+    ['OEBPS/content.opf', unverifiableOpf],
+  ]));
+
+  const bridgeUnv = established(new BridgeService(bridgeOpts({ secret: 'two-stage-unv-secret' })), ['hist-1']);
+  const reqUnv = request('req-unverifiable', 'Fahrenheit 451', 'Ray Bradbury', {
+    publishedYear: 1953,
+    isbn13: '9781451673319',
+  });
+  const fakeUnv = apiScenarios({
+    requests: [reqUnv],
+    books: [metadata('Fahrenheit 451', 'Ray Bradbury')],
+    releases: [release('Fahrenheit 451', 'Ray Bradbury', { source_id: 'src-unverifiable', year: null, isbn: null })],
+    taskId: 'task-unverifiable',
+    'bo.upload': { id: 9992 },
+    'bo.fulfill': { status: 'AVAILABLE' },
+  });
+
+  await bridgeUnv.processPendingRequests({ fetchFn: fakeUnv.fetch });
+  await bridgeUnv.handleWebhook({
+    task: { task_id: 'task-unverifiable', source: 'annas', title: 'Fahrenheit 451', format: 'epub' },
+    paths: { target: unverifiableEpub, final_paths: [unverifiableEpub] },
+  }, 'two-stage-unv-secret', fakeUnv.fetch);
+
+  await waitUntil(() => bridgeUnv.state.tasks['task-unverifiable']?.editionVerificationFailed === true, 2000);
+  assert.equal(fakeUnv.called('bo.upload').length, 0, 'unverifiable edition must NEVER be uploaded');
+  assert.equal(fakeUnv.called('bo.fulfill').length, 0, 'unverifiable edition must NEVER be fulfilled');
+  const diagUnv = bridgeUnv.diagnose('req-unverifiable');
+  assert.equal(diagUnv.stage?.stage, 'review_required');
+  assert.ok(diagUnv.verificationConflicts.includes('unverified_isbn'));
+  assert.ok(diagUnv.verificationConflicts.includes('unverified_edition_year'));
+
+  // Also verify year-only request against unverifiable EPUB fails closed
+  const yearOnlyVer = verifyDownloadedEdition({
+    filePath: unverifiableEpub,
+    format: 'epub',
+    requestTitle: 'Fahrenheit 451',
+    requestAuthor: 'Ray Bradbury',
+    requestLanguage: 'en',
+    requestYear: 1953,
+  });
+  assert.equal(yearOnlyVer.ok, false);
+  assert.ok(yearOnlyVer.conflicts.includes('unverified_edition_year'));
+});
+
+test('TWO-STAGE E2E: bounded alternative recovery cools down rejected unknown-year candidate, queues valid alternative, and reconcile never resurrects rejected task', async () => {
+  const bridge = established(new BridgeService(bridgeOpts({ secret: 'bounded-alt-secret' })), ['hist-1']);
+  const badEpub = join(root, 'alt-bad.epub');
+  const goodEpub = join(root, 'alt-good.epub');
+  writeFileSync(badEpub, epubBytes({ title: 'Animal Farm', author: 'George Orwell', year: 2003, isbn: '9780141036137', language: 'en' }));
+  writeFileSync(goodEpub, epubBytes({ title: 'Animal Farm', author: 'George Orwell', year: 1945, isbn: '9780451526342', language: 'en' }));
+
+  const req = request('req-bounded-alt', 'Animal Farm', 'George Orwell', {
+    publishedYear: 1945,
+    isbn13: '9780451526342',
+  });
+  const fake = apiScenarios({
+    requests: [req],
+    books: [metadata('Animal Farm', 'George Orwell')],
+    releases: [
+      release('Animal Farm', 'George Orwell', { source: 'annas', source_id: 'cand-1-wrong', year: null, isbn: null }),
+      release('Animal Farm', 'George Orwell', { source: 'annas', source_id: 'cand-2-good', year: null, isbn: null }),
+    ],
+    'sm.download': ({ options }) => {
+      const p = expectedJson(options);
+      return response({ task_id: p.source_id === 'cand-1-wrong' ? 'task-cand-1' : 'task-cand-2' });
+    },
+    'sm.status': () => response({
+      complete: {
+        'task-cand-1': { id: 'task-cand-1', source: 'annas', source_id: 'cand-1-wrong', title: 'Animal Farm', format: 'epub', target: badEpub },
+      },
+      downloading: {},
+      queued: {},
+      error: {},
+    }),
+    'bo.upload': { id: 8845, title: 'Animal Farm', author: 'George Orwell', year: 1945 },
+    'bo.fulfill': { id: 'req-bounded-alt', status: 'AVAILABLE' },
+  });
+
+  // 1. Queues first unknown-year candidate
+  await bridge.processPendingRequests({ fetchFn: fake.fetch });
+  assert.equal(bridge.state.requests['req-bounded-alt'], 'task-cand-1');
+
+  // 2. Webhook for candidate 1 triggers Stage 2 rejection -> cooldown + unmap
+  await bridge.handleWebhook({
+    task: { task_id: 'task-cand-1', source: 'annas', title: 'Animal Farm', format: 'epub' },
+    paths: { target: badEpub, final_paths: [badEpub] },
+  }, 'bounded-alt-secret', fake.fetch);
+  await waitUntil(() => bridge.state.tasks['task-cand-1']?.editionVerificationFailed === true, 2000);
+  assert.equal(fake.called('bo.upload').length, 0);
+  assert.ok(bridge.state.failedReleases['annas:cand-1-wrong'], 'rejected candidate must be cooled down');
+  assert.equal(bridge.state.requestSourceAttempts['req-bounded-alt'], 1);
+
+  // 3. Reconcile runs while task-cand-1 is still in Shelfmark complete AND queues cand-2-good!
+  await bridge.reconcile({ fetchFn: fake.fetch });
+  assert.equal(bridge.state.tasks['task-cand-1'].editionVerificationFailed, true, 'reconcile must never resurrect rejected task');
+  assert.equal(bridge.state.requests['req-bounded-alt'], 'task-cand-2', 'second unknown-year candidate must be selected automatically');
+  assert.equal(fake.called('bo.upload').length, 0);
+
+  // 4. Webhook for candidate 2 passes Stage 2 verification -> uploads once and fulfills!
+  await bridge.handleWebhook({
+    task: { task_id: 'task-cand-2', source: 'annas', title: 'Animal Farm', format: 'epub' },
+    paths: { target: goodEpub, final_paths: [goodEpub] },
+  }, 'bounded-alt-secret', fake.fetch);
+  await waitUntil(() => bridge.state.tasks['task-cand-2']?.status === 'fulfilled', 2000);
+  assert.equal(fake.called('bo.upload').length, 1);
+  assert.equal(fake.called('bo.fulfill').length, 1);
+  assert.equal(bridge.state.tasks['task-cand-2'].matchedBookId, 8845);
+  fake.assertKnownRoutes();
 });
 
 
