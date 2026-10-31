@@ -1443,6 +1443,18 @@ export function verifyDownloadedEdition(task, reqSpec = {}) {
     task?.author ??
     ''
   ).trim();
+  const expectedSeriesName = String(
+    reqSpec.seriesName ??
+    (rid && task?.requestSeriesNames?.[rid]) ??
+    task?.requestSeriesName ??
+    task?.seriesName ??
+    ''
+  ).trim();
+  const expectedSeriesIndex =
+    reqSpec.seriesIndex ??
+    (rid && task?.requestSeriesIndices ? task.requestSeriesIndices[rid] : undefined) ??
+    task?.requestSeriesIndex ??
+    task?.seriesIndex;
   const expectedLanguage = String(
     reqSpec.language ??
     (rid && task?.requestLanguages?.[rid]) ??
@@ -1491,15 +1503,28 @@ export function verifyDownloadedEdition(task, reqSpec = {}) {
       };
     }
 
-    // 1. Work title verification
+    // 1. Work title & series-volume verification
     if (!opf.title && expectedTitle) {
       conflicts.push('missing_title');
       evidence.push({ field: 'title', level: 'work', status: 'missing', expected: expectedTitle, observed: null });
       error = error || `EPUB title mismatch: expected "${expectedTitle}", got missing title`;
-    } else if (opf.title && expectedTitle && !ID.isTitleMatch(opf.title, expectedTitle)) {
-      conflicts.push('incompatible_title');
-      evidence.push({ field: 'title', level: 'work', status: 'contradictory', expected: expectedTitle, observed: opf.title });
-      error = error || `EPUB title mismatch: expected "${expectedTitle}", got "${opf.title}"`;
+    } else if (opf.title && expectedTitle) {
+      const td = ID.titleMatchDecision(opf.title, expectedTitle, {
+        candAuthor: opf.author || '',
+        reqAuthor: expectedAuthor || '',
+        reqSeriesName: expectedSeriesName,
+        reqSeriesIndex: expectedSeriesIndex,
+      });
+      if (td.outcome !== 'match' && td.outcome !== 'provisional') {
+        if (td.conflicts.includes('incompatible_series_volume')) {
+          conflicts.push('incompatible_series_volume');
+        }
+        conflicts.push('incompatible_title');
+        evidence.push({ field: 'title', level: 'work', status: 'contradictory', expected: expectedTitle, observed: opf.title });
+        error = error || `EPUB title mismatch: expected "${expectedTitle}", got "${opf.title}"`;
+      } else {
+        evidence.push({ field: 'title', level: 'work', status: 'verified', expected: expectedTitle, observed: opf.title });
+      }
     } else if (opf.title) {
       evidence.push({ field: 'title', level: 'work', status: 'verified', expected: expectedTitle, observed: opf.title });
     }
@@ -1628,7 +1653,7 @@ export function verifyDownloadedEdition(task, reqSpec = {}) {
   }
 
   const ok = conflicts.length === 0;
-  const hardFailureSet = new Set(['incompatible_title', 'missing_title', 'incompatible_author', 'language_mismatch']);
+  const hardFailureSet = new Set(['incompatible_series_volume', 'incompatible_title', 'missing_title', 'incompatible_author', 'language_mismatch']);
   const hardConflict = conflicts.find((c) => hardFailureSet.has(c)) || null;
   const primaryConflict = hardConflict || conflicts[0] || null;
   const workOrLanguageFailure = Boolean(hardConflict);
@@ -2741,6 +2766,9 @@ export class BridgeService {
           // 4. Search releases using corrected plugin logic (bounded per request)
           const query = {
             title: req.title,
+            subtitle: req.subtitle || undefined,
+            seriesName: req.seriesName || req.series || undefined,
+            seriesIndex: req.seriesIndex ?? req.seriesPosition ?? req.series_position ?? undefined,
             author: req.author || (Array.isArray(req.authors) ? req.authors[0] : ''),
             year: req.year || req.publicationYear || req.publishedYear || undefined,
             isbn13: req.isbn13 || (Array.isArray(req.isbn13s) ? req.isbn13s[0] : undefined),
@@ -2979,6 +3007,8 @@ export class BridgeService {
                 requestTitle: req.title,
                 requestAuthor: req.author || (Array.isArray(req.authors) ? req.authors[0] : null),
                 requestAuthors: Array.isArray(req.authors) ? req.authors : (req.author ? [req.author] : []),
+                requestSeriesName: req.seriesName || req.series || undefined,
+                requestSeriesIndex: req.seriesIndex ?? req.seriesPosition ?? req.series_position ?? undefined,
                 requestYear: parsePositiveInt(req.publishedYear || req.year),
                 requestLanguage: req.language || req.lang || 'English',
                 requestIsbn: req.isbn13 || req.isbn || (Array.isArray(req.isbn13s) ? req.isbn13s[0] : undefined),
@@ -3052,7 +3082,7 @@ export class BridgeService {
    * Queues a release exactly once. If already queued or completed, adopts existing task.
    * If Shelfmark returns an uncertain response without a task ID, tracks in uncertain_queue state.
    */
-  async queueRelease({ requestId, userId, release, libraryId, folderId, requestTitle, requestAuthor, requestAuthors, requestYear, requestLanguage, shelfmarkUrl, apiKey, requestIsbn, fetchFn = globalThis.fetch }) {
+  async queueRelease({ requestId, userId, release, libraryId, folderId, requestTitle, requestAuthor, requestAuthors, requestSeriesName, requestSeriesIndex, requestYear, requestLanguage, shelfmarkUrl, apiKey, requestIsbn, fetchFn = globalThis.fetch }) {
     if (this.isQueueingRelease) throw new Error('Queue operation already in progress');
     this.isQueueingRelease = true;
     try {
@@ -3166,6 +3196,16 @@ export class BridgeService {
       if (requestIsbn) {
         existing.requestIsbns = existing.requestIsbns || {};
         if (!existing.requestIsbns[requestId]) existing.requestIsbns[requestId] = requestIsbn;
+      }
+      if (requestSeriesName && !existing.requestSeriesName) existing.requestSeriesName = requestSeriesName;
+      if (requestSeriesName && requestId) {
+        existing.requestSeriesNames = existing.requestSeriesNames || {};
+        if (!existing.requestSeriesNames[requestId]) existing.requestSeriesNames[requestId] = requestSeriesName;
+      }
+      if (requestSeriesIndex != null && existing.requestSeriesIndex == null) existing.requestSeriesIndex = requestSeriesIndex;
+      if (requestSeriesIndex != null && requestId) {
+        existing.requestSeriesIndices = existing.requestSeriesIndices || {};
+        if (existing.requestSeriesIndices[requestId] == null) existing.requestSeriesIndices[requestId] = requestSeriesIndex;
       }
       existing.trustedIsbns = gatherTrustedIsbnsBridge(existing.trustedIsbns, existing.bookMetadata, existing.extra, release?.extra?.bookMetadata, release?.extra, release);
       existing.bookMetadata = existing.bookMetadata || release?.extra?.bookMetadata || null;
@@ -3509,6 +3549,10 @@ export class BridgeService {
       requestIsbns: requestId && requestIsbn ? { [requestId]: requestIsbn } : {},
       requestTitles: requestId && requestTitle ? { [requestId]: requestTitle } : {},
       requestAuthorsMap: requestId && (requestAuthor || (Array.isArray(requestAuthors) && requestAuthors[0])) ? { [requestId]: requestAuthor || requestAuthors[0] } : {},
+      requestSeriesName: requestSeriesName || null,
+      requestSeriesNames: requestId && requestSeriesName ? { [requestId]: requestSeriesName } : {},
+      requestSeriesIndex: requestSeriesIndex ?? null,
+      requestSeriesIndices: requestId && requestSeriesIndex != null ? { [requestId]: requestSeriesIndex } : {},
       trustedIsbns: gatherTrustedIsbnsBridge(release?.extra?.bookMetadata, release?.extra, release),
       bookMetadata: release?.extra?.bookMetadata || null,
       language: ID.normalizeLanguageCode(release.language || downloadPayload.language) || null,
@@ -3916,32 +3960,45 @@ export class BridgeService {
     if (!libraryId || !title || title.length > 200) return null;
     const url = `${this.bookorbitUrl}/api/v1/libraries/${libraryId}/books`;
     const size = 100;
-    const all = [];
-    try {
+    const queryPages = async (qStr) => {
+      const items = [];
       for (let page = 0; page < 5; page++) {
         const result = await fetchFn(url, {
           method: 'POST',
           headers: { ...headers, 'Content-Type': 'application/json' },
-          body: JSON.stringify({ q: title, sort: [], pagination: { page, size } }),
+          body: JSON.stringify({ q: qStr, sort: [], pagination: { page, size } }),
         });
         if (!result?.ok) return null;
         const data = await result.json();
         if (!data || !Array.isArray(data.items)) return null;
-        all.push(...data.items);
+        items.push(...data.items);
         const total = Number(data.total);
         // A shortened page when total says more results remain is not full evidence.
         if (Number.isFinite(total) && total >= 0) {
-          if (all.length >= total) return all;
+          if (items.length >= total) return items;
           if (data.items.length < size) return null;
         } else if (data.items.length < size) {
-          return all;
+          return items;
         }
       }
+      // A >500-match query is not complete evidence. Fail closed rather than guess.
+      return null;
+    };
+    try {
+      const primary = await queryPages(title);
+      if (primary === null) return null;
+      if (primary.length > 0) return primary;
+      const canonical = ID.extractCoreTitle(task?.requestTitle || title, { author: task?.requestAuthor || task?.author || '' });
+      if (canonical && canonical.length <= 200 && ID.normalizeString(canonical) !== ID.normalizeString(title)) {
+        const fallback = await queryPages(canonical);
+        if (fallback === null) return null;
+        return fallback;
+      }
+      return primary;
     } catch (err) {
       console.warn(`[Bridge] Library lookup unavailable: ${sanitizeLog(err?.message || err)}`);
+      return null;
     }
-    // A >500-match query is not complete evidence. Fail closed rather than guess.
-    return null;
   }
 
   /**
@@ -5737,4 +5794,9 @@ export {
   matchDecision,
   normalizeIsbn,
   areVerifiedCounterparts,
+  extractSearchTitleCandidates,
+  extractSeriesVolumeNumber,
+  decomposeTitleStructure,
+  stripEditionDescriptors,
+  hasMultiVolumeIndicator,
 } from '../shared/identity.mjs';
