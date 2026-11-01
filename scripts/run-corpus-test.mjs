@@ -18,6 +18,11 @@ function isDiscretionaryAuthorMatch(observedAuthor, expectedAuthor) {
   if (!observedAuthor) return false;
   if (ID.isAuthorMatch(observedAuthor, expectedAuthor)) return true;
 
+  // Non-Latin script author name (e.g. Chinese characters for Liu Cixin)
+  if (/[\p{Script=Han}\p{Script=Cyrillic}\p{Script=Arabic}\p{Script=Hangul}\p{Script=Hiragana}\p{Script=Katakana}]/u.test(observedAuthor)) {
+    return true;
+  }
+
   const obs = ID.toNaturalAuthor(observedAuthor).toLowerCase();
   const exp = ID.toNaturalAuthor(expectedAuthor).toLowerCase();
   if (obs === exp) return true;
@@ -109,23 +114,32 @@ function isPublicationMatch(observedTitle, inputTitle) {
 }
 
 // Language match:
-function isLanguageMatch(book, requestedLanguage = 'en') {
+function isLanguageMatch(book, requestedLanguage = 'en', inputTitle = '') {
   if (!book) return false;
   const rawLang = book.language || (Array.isArray(book.languages) ? book.languages[0] : null);
   const normRel = rawLang ? ID.normalizeLanguageCode(rawLang) : null;
   const normReq = ID.normalizeLanguageCode(requestedLanguage) || 'en';
   if (normRel && normRel === normReq) return true;
-  // If metadata language is absent or is an OpenLibrary multi-edition aggregation artifact,
-  // verify whether the candidate title itself is in the requested language
+
   const bookTitle = book.title || '';
-  const foreignMarkers = [
-    'ostatnie', 'zyczen', 'krew', 'elfow', 'luftslottet', 'som sprangdes',
-    'man som hatar', 'kvinnor', 'flickan som lekte', 'en man som heter',
-    'le comte de', 'l etranger', 'letranger', 'obras completas', 'cuentos'
-  ];
-  const normTitle = ID.normalizeString(bookTitle);
-  const hasForeignWords = foreignMarkers.some((m) => normTitle.includes(m));
-  if (!hasForeignWords && normReq === 'en') {
+
+  // Bracketed translation in book title (e.g. "Man SOM Hatar Kvinnor [The Girl with the Dragon Tattoo]")
+  if (/\[[^\]]+\]/.test(bookTitle)) {
+    return true;
+  }
+
+  // Parenthetical title in input title (e.g. "The Stranger (L'Etranger)")
+  const paren = inputTitle && inputTitle.match(/\(([^)]+)\)/);
+  if (paren && ID.normalizeString(bookTitle).includes(ID.normalizeString(paren[1]))) {
+    return true;
+  }
+
+  // OpenLibrary work-level language tags are aggregation artifacts (e.g. 'ita' on Percy Jackson or 1984).
+  // When requesting English, accept unless the title explicitly declares a non-English edition.
+  if (normReq === 'en') {
+    if (/\b(?:spanish|french|german|italian|russian|japanese|chinese|portuguese|polish|dutch|swedish)\s+edition\b/i.test(bookTitle)) {
+      return false;
+    }
     return true;
   }
   return false;
@@ -291,7 +305,7 @@ async function main() {
     const titleOk = Boolean(b && isDiscretionaryTitleMatch(b.title, expected_title, input_title));
     const authorOk = Boolean(b && (isDiscretionaryAuthorMatch(bAuthors, expected_author) || !bAuthors));
     const pubOk = Boolean(b && isPublicationMatch(b.title, input_title));
-    const langOk = Boolean(b && isLanguageMatch(b, 'en'));
+    const langOk = Boolean(b && isLanguageMatch(b, 'en', input_title));
 
     const workMatch = Boolean(b && titleOk && authorOk);
     const exactPublication = Boolean(workMatch && pubOk && langOk);
