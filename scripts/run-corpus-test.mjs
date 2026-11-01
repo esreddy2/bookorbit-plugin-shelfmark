@@ -77,44 +77,99 @@ function levenshteinDistance(a, b) {
 }
 
 // Discretionary title matching:
-function isDiscretionaryTitleMatch(observedTitle, expectedTitle, inputTitle) {
+// Strictly evaluates whether observedTitle matches expectedTitle using canonical work
+// title equivalence, core equality, or normalized title match, without tautologies or
+// accidental self-matches against input_title.
+function isDiscretionaryTitleMatch(observedTitle, expectedTitle, authorOrOptions = {}) {
   if (!observedTitle || !expectedTitle) return false;
-  if (ID.isTitleMatch(observedTitle, expectedTitle)) return true;
+  const opt = typeof authorOrOptions === 'string'
+    ? { author: authorOrOptions }
+    : (authorOrOptions && typeof authorOrOptions === 'object' ? authorOrOptions : {});
 
-  const obsCore = ID.extractCoreTitle(observedTitle).toLowerCase();
-  const expCore = ID.extractCoreTitle(expectedTitle).toLowerCase();
-  if (obsCore === expCore) return true;
-  if (ID.isTitleMatch(obsCore, expCore)) return true;
+  // 1. Authoritative title match decision from shared identity library (both directions)
+  if (ID.isTitleMatch(observedTitle, expectedTitle, opt)) return true;
+  if (ID.isTitleMatch(expectedTitle, observedTitle, opt)) return true;
 
-  // If observed title matches input title core
-  const inCore = ID.extractCoreTitle(inputTitle).toLowerCase();
-  if (obsCore === inCore || ID.isTitleMatch(obsCore, inCore)) return true;
-
-  // Check known translation equivalents
+  // 2. Normalized title match (with and without leading articles, whitespace collapse)
   const obsNorm = ID.normalizeString(observedTitle);
   const expNorm = ID.normalizeString(expectedTitle);
-  const inNorm = ID.normalizeString(inputTitle);
-
-  const eqsExp = ID.KNOWN_TITLE_EQUIVALENTS.get(expNorm) || [];
-  if (eqsExp.some((eq) => ID.normalizeString(eq) === obsNorm || obsNorm.includes(ID.normalizeString(eq)))) return true;
-
-  const eqsObs = ID.KNOWN_TITLE_EQUIVALENTS.get(obsNorm) || [];
-  if (eqsObs.some((eq) => ID.normalizeString(eq) === expNorm || expNorm.includes(ID.normalizeString(eq)))) return true;
-
-  // Check normalized substring containment for subtitles
-  if (obsNorm && expNorm && (obsNorm.includes(expNorm) || expNorm.includes(obsNorm))) {
-    return true;
+  if (obsNorm && expNorm) {
+    if (obsNorm === expNorm) return true;
+    const obsNoArt = ID.stripLeadingArticle(obsNorm);
+    const expNoArt = ID.stripLeadingArticle(expNorm);
+    if (obsNoArt && expNoArt && obsNoArt === expNoArt) return true;
+    if (obsNorm.replace(/\s+/g, '') === expNorm.replace(/\s+/g, '')) return true;
   }
 
-  // Parenthetical alias inside input title (e.g. "The Stranger (L'Etranger)")
-  const paren = inputTitle.match(/\(([^)]+)\)/);
-  if (paren) {
-    const pNorm = ID.normalizeString(paren[1]);
-    if (pNorm && (obsNorm.includes(pNorm) || pNorm.includes(obsNorm))) return true;
+  // 3. Core equality (canonical work title extracted from each)
+  const obsCore = ID.extractCoreTitle(observedTitle, opt);
+  const expCore = ID.extractCoreTitle(expectedTitle, opt);
+  const obsCoreNorm = ID.normalizeString(obsCore);
+  const expCoreNorm = ID.normalizeString(expCore);
+  if (obsCoreNorm && expCoreNorm) {
+    if (obsCoreNorm === expCoreNorm) return true;
+    const obsCoreNoArt = ID.stripLeadingArticle(obsCoreNorm);
+    const expCoreNoArt = ID.stripLeadingArticle(expCoreNorm);
+    if (obsCoreNoArt && expCoreNoArt && obsCoreNoArt === expCoreNoArt) return true;
+    if (obsCoreNorm.replace(/\s+/g, '') === expCoreNorm.replace(/\s+/g, '')) return true;
+    if (ID.isTitleMatch(obsCore, expCore, opt) || ID.isTitleMatch(expCore, obsCore, opt)) return true;
+  }
+
+  // 4. Cross core-to-full match
+  if (obsCoreNorm && expNorm) {
+    if (obsCoreNorm === expNorm || ID.stripLeadingArticle(obsCoreNorm) === ID.stripLeadingArticle(expNorm)) return true;
+  }
+  if (obsNorm && expCoreNorm) {
+    if (obsNorm === expCoreNorm || ID.stripLeadingArticle(obsNorm) === ID.stripLeadingArticle(expCoreNorm)) return true;
+  }
+
+  // 5. Known translation and numeric title equivalents
+  const eqsExp = ID.KNOWN_TITLE_EQUIVALENTS.get(expNorm) || [];
+  if (eqsExp.some((eq) => {
+    const neq = ID.normalizeString(eq);
+    return neq === obsNorm || ID.stripLeadingArticle(neq) === ID.stripLeadingArticle(obsNorm) || neq === obsCoreNorm;
+  })) return true;
+
+  const eqsObs = ID.KNOWN_TITLE_EQUIVALENTS.get(obsNorm) || [];
+  if (eqsObs.some((eq) => {
+    const neq = ID.normalizeString(eq);
+    return neq === expNorm || ID.stripLeadingArticle(neq) === ID.stripLeadingArticle(expNorm) || neq === expCoreNorm;
+  })) return true;
+
+  // 6. Parenthetical alias inside expected title or observed title (e.g. "The Stranger (L'Etranger)")
+  const parenExp = expectedTitle.match(/\(([^)]+)\)/);
+  if (parenExp) {
+    const pNorm = ID.normalizeString(parenExp[1]);
+    if (pNorm && (pNorm === obsNorm || ID.stripLeadingArticle(pNorm) === ID.stripLeadingArticle(obsNorm) || pNorm === obsCoreNorm)) {
+      return true;
+    }
+  }
+  const parenObs = observedTitle.match(/\(([^)]+)\)/);
+  if (parenObs) {
+    const pNorm = ID.normalizeString(parenObs[1]);
+    if (pNorm && (pNorm === expNorm || ID.stripLeadingArticle(pNorm) === ID.stripLeadingArticle(expNorm) || pNorm === expCoreNorm)) {
+      return true;
+    }
+  }
+
+  // 7. Work title suffix match when title is "<Franchise> and the <Work>" or "<Series> of <Work>"
+  if (obsNorm && expNorm) {
+    const checkSuffix = (full, work) => {
+      if (!full.endsWith(work)) return false;
+      const prefix = full.slice(0, -work.length).trim();
+      const workTokens = ID.getTokens(work).filter((t) => !['the', 'a', 'an', 'of', 'and', 'or'].includes(t));
+      if (workTokens.length < 2) return false;
+      return /(?:^|\s)(?:and\s+the|and|&|of|or)\s*$/i.test(prefix);
+    };
+    if (checkSuffix(expNorm, obsNorm) || checkSuffix(obsNorm, expNorm)) return true;
+    if (obsCoreNorm && expCoreNorm) {
+      if (checkSuffix(expCoreNorm, obsCoreNorm) || checkSuffix(obsCoreNorm, expCoreNorm)) return true;
+    }
   }
 
   return false;
 }
+
 
 // Stricter publication match:
 // Checks if the observed book is an individual original book vs box set / compilation / adaptation / study guide / trivia
@@ -264,8 +319,8 @@ async function main() {
     const coreTitle = ID.extractCoreTitle(input_title, { author: expected_author });
     const candidates = ID.extractSearchTitleCandidates(input_title, { author: expected_author });
 
-    const coreMatch = isDiscretionaryTitleMatch(coreTitle, expected_title, input_title);
-    const candMatch = candidates.some((c) => isDiscretionaryTitleMatch(c, expected_title, input_title));
+    const coreMatch = isDiscretionaryTitleMatch(coreTitle, expected_title, expected_author);
+    const candMatch = candidates.some((c) => isDiscretionaryTitleMatch(c, expected_title, expected_author));
 
     if (coreMatch || candMatch) {
       decompPass++;
@@ -293,6 +348,10 @@ async function main() {
     }
   }
 
+  if (process.env.SUITE === '1' || process.argv.includes('--decomp-only')) {
+    return;
+  }
+
   console.log('\n========================================================================');
   console.log('SUITE 2: Live Metadata Search & Multi-Criteria Discretionary Evaluation');
   console.log('========================================================================\n');
@@ -314,7 +373,7 @@ async function main() {
     const b = searchRes.matchedBook;
 
     const bAuthors = b ? (Array.isArray(b.authors) ? b.authors.join(', ') : (b.author || '')) : '';
-    const titleOk = Boolean(b && isDiscretionaryTitleMatch(b.title, expected_title, input_title));
+    const titleOk = Boolean(b && isDiscretionaryTitleMatch(b.title, expected_title, expected_author));
     const authorOk = Boolean(b && (isDiscretionaryAuthorMatch(bAuthors, expected_author) || !bAuthors));
     const pubOk = Boolean(b && isPublicationMatch(b.title, input_title));
     const langOk = Boolean(b && isLanguageMatch(b, 'en', input_title));
