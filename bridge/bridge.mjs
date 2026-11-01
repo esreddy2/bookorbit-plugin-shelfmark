@@ -5799,4 +5799,6 @@ export {
   decomposeTitleStructure,
   stripEditionDescriptors,
   hasMultiVolumeIndicator,
+  hasCompilationIndicator,
+  scoreBookMatch,
 } from '../shared/identity.mjs';

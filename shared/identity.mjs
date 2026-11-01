@@ -14,6 +14,41 @@ export const KNOWN_TITLE_EQUIVALENTS = new Map([
   ['nineteen eighty-four', ['1984']],
   ['2001', ['two thousand and one']],
   ['two thousand and one', ['2001']],
+  ['the last wish', ['ostatnie zyczenie']],
+  ['ostatnie zyczenie', ['the last wish']],
+  ['blood of elves', ['krew elfow']],
+  ['krew elfow', ['blood of elves']],
+  ['the girl who kicked the hornets nest', ['luftslottet som sprangdes']],
+  ['luftslottet som sprangdes', ['the girl who kicked the hornets nest']],
+  ['the girl with the dragon tattoo', ['man som hatar kvinnor']],
+  ['man som hatar kvinnor', ['the girl with the dragon tattoo']],
+  ['the girl who played with fire', ['flickan som lekte med elden']],
+  ['flickan som lekte med elden', ['the girl who played with fire']],
+  ['a man called ove', ['en man som heter ove']],
+  ['en man som heter ove', ['a man called ove']],
+  ['the stranger', ['l etranger', 'letranger']],
+  ['l etranger', ['the stranger']],
+  ['letranger', ['the stranger']],
+  ['the count of monte cristo', ['le comte de monte cristo', 'le comte de monte-cristo']],
+  ['le comte de monte cristo', ['the count of monte cristo']],
+  ['le comte de monte-cristo', ['the count of monte cristo']],
+  ['sorcerers stone', ['philosophers stone']],
+  ['philosophers stone', ['sorcerers stone']],
+  ['harry potter and the sorcerers stone', ['harry potter and the philosophers stone']],
+  ['harry potter and the philosophers stone', ['harry potter and the sorcerers stone']],
+  ['unfinished tales of numenor and middle earth', ['unfinished tales of numenor and middle-earth', 'unfinished tales']],
+  ['unfinished tales of numenor and middle-earth', ['unfinished tales of numenor and middle earth', 'unfinished tales']],
+  ['the color of magic', ['the colour of magic']],
+  ['the colour of magic', ['the color of magic']],
+  ['color of magic', ['colour of magic']],
+  ['colour of magic', ['color of magic']],
+  ['catch 22', ['catch-22']],
+  ['catch-22', ['catch 22']],
+]);
+
+export const KNOWN_AUTHOR_EQUIVALENTS = new Map([
+  ['liu cixin', ['刘慈欣', 'cixin liu']],
+  ['刘慈欣', ['liu cixin', 'cixin liu']],
 ]);
 
 export function normalizeString(str) {
@@ -266,7 +301,7 @@ const MULTI_VOLUME_RANGE_RE = new RegExp(
   'i'
 );
 const HASH_VOLUME_RANGE_RE = /(?:^|[\s([,])#\s*0*\d{1,2}\s*[-–—]\s*#?\s*0*\d{1,2}\b/i;
-const MULTI_BOOK_PACK_RE = /\b(?:\d{1,2}\s*[-–—]?\s*books?\s+(?:set|pack|bundle|collection|series|omnibus|in\s+1|in\s+one)|\d{1,2}\s*-\s*in\s*-\s*1|complete\s+series|series\s+collection)\b/i;
+const MULTI_BOOK_PACK_RE = /\b(?:\d{1,2}\s*[-–—]?\s*books?\s+(?:set|pack|bundle|collection|series|omnibus|in\s+1|in\s+one)|\d{1,2}\s*-\s*in\s*-\s*1|complete\s+series|series\s+collection|\d{1,3}\s+(?:short\s+)?stories|\d{1,2}\s+novels|\d{1,3}\s+tales)\b/i;
 
 export function hasMultiVolumeIndicator(title) {
   if (!title) return false;
@@ -282,6 +317,8 @@ export function hasMultiVolumeIndicator(title) {
   }
   return false;
 }
+
+export const hasCompilationIndicator = hasMultiVolumeIndicator;
 
 const EXPLICIT_VOLUME_KEYWORD_RE = new RegExp(
   `\\b(?:book|vol\\.?|volume|part|tome)\\s+#?0*(${VOLUME_NUM_PATTERN})\\b`,
@@ -410,11 +447,20 @@ function looksLikePersonNamePrefix(seg) {
   }
   const rawParts = s.split(/\s+/).filter(Boolean);
   if (rawParts.length < 2 || rawParts.length > 4) return false;
-  // Require initials (e.g. "J K Rowling", "J.K. Rowling") to avoid mistaking 2-word book titles for author names when author is unknown
+  // Require initials (e.g. "J K Rowling", "J.K. Rowling")
   const hasInitial = rawParts.slice(0, -1).some((p) => /^(?:[\p{Lu}]\.?){1,2}$/u.test(p));
-  if (!hasInitial) return false;
-  const toks = getTokens(s);
-  return toks.length >= 2 && toks.every((t) => !NON_PERSON_TITLE_WORDS.has(t));
+  if (hasInitial) {
+    const toks = getTokens(s);
+    return toks.length >= 2 && toks.every((t) => !NON_PERSON_TITLE_WORDS.has(t));
+  }
+  // Standard capitalized 2-3 word person name (e.g. "Agatha Christie", "Arthur Conan Doyle")
+  if (rawParts.length >= 2 && rawParts.length <= 3 && rawParts.every((p) => /^[\p{Lu}][\p{Ll}'’-]{1,25}$/u.test(p))) {
+    const toks = getTokens(s);
+    if (toks.length >= 2 && toks.every((t) => !NON_PERSON_TITLE_WORDS.has(t))) {
+      return true;
+    }
+  }
+  return false;
 }
 
 export function decomposeTitleStructure(title, options = {}) {
@@ -493,11 +539,18 @@ export function decomposeTitleStructure(title, options = {}) {
     };
   }
 
+  const optAuthor = options?.author || '';
+  if (cleanedSegments.length > 1) {
+    const lastSeg = cleanedSegments[cleanedSegments.length - 1];
+    if ((optAuthor && isAuthorMatch(lastSeg, optAuthor)) || (!optAuthor && /\s+[-–—]\s+/.test(s) && looksLikePersonNamePrefix(lastSeg))) {
+      cleanedSegments.pop();
+    }
+  }
+
   const rawCore = cleanedSegments[0];
   let idx = 0;
   let hasExplicitPrefix = false;
   let seriesPrefix = null;
-  const optAuthor = options?.author || '';
   const normOptSeries = normalizeString(options?.seriesName || '');
 
   // Peel up to 3 leading series/volume/franchise/author prefix segments when followed by a real work title segment
@@ -552,11 +605,11 @@ export function decomposeTitleStructure(title, options = {}) {
     // Remaining prefix rules require nextSeg not to be a generic/descriptive subtitle (preserves "From Russia with Love: A Novel")
     if (isGenericOrDescriptiveSubtitle(nextSeg)) break;
 
-    // 4. Multi-word series prefix ending in bare 1..30 volume number (e.g. "Percy Jackson 5 - The Last Olympian")
+    // 4. Series prefix ending in bare 1..30 volume number (e.g. "Percy Jackson 5 - The Last Olympian" or "ACOTAR 3 - A Court of Wings and Ruin")
     const bareSeriesVol = seg.match(SERIES_WITH_BARE_NUMBER_SEGMENT_RE);
     if (bareSeriesVol) {
       const prefixTokens = getTokens(bareSeriesVol[1]);
-      if (prefixTokens.length >= 2) {
+      if (prefixTokens.length >= 1) {
         const parsedV = parseInt(bareSeriesVol[2], 10);
         if (volumeNumber === null && parsedV >= 1 && parsedV <= 30) volumeNumber = parsedV;
         if (!seriesPrefix) seriesPrefix = bareSeriesVol[1].trim();
@@ -602,15 +655,20 @@ export function decomposeTitleStructure(title, options = {}) {
     const tailTokens = getTokens(tailSeg).filter((t) => !['the', 'a', 'an'].includes(t));
     if (tailTokens.length >= 1) {
       substantiveTail = tailSeg;
-      // If original title used ':' and both sides have >= 2 words, RHS may be the standalone work title of an unnumbered series entry
-      const colonParts = s.split(':');
-      if (colonParts.length === 2 && getTokens(workSeg).length >= 2 && getTokens(tailSeg).length >= 2) {
+      // If original title used ':' or '-' and both sides have >= 2 words, RHS may be the standalone work title of an unnumbered series entry
+      const delimParts = s.split(/(?:\s+[-–—]\s+|:)/);
+      if (delimParts.length === 2 && getTokens(workSeg).length >= 2 && getTokens(tailSeg).length >= 2) {
         colonRhsWorkCandidate = tailSeg;
       }
     }
   }
 
-  const canonicalTitle = (workSeg && workSeg.length >= 2) ? workSeg : (rawCore && rawCore.length >= 2 ? rawCore : s);
+  let canonicalTitle = (workSeg && workSeg.length >= 2) ? workSeg : (rawCore && rawCore.length >= 2 ? rawCore : s);
+  if (!hasExplicitPrefix && idx === 0 && substantiveTail && volumeNumber !== null) {
+    if (!seriesPrefix) seriesPrefix = workSeg;
+    hasExplicitPrefix = true;
+    canonicalTitle = substantiveTail;
+  }
   return {
     canonicalTitle,
     rawCore,
@@ -643,14 +701,34 @@ export function extractSearchTitleCandidates(title, options = {}) {
   const rawTitle = String(title || '').trim();
   const decomp = decomposeTitleStructure(rawTitle, options);
 
-  // 1. Canonical decomposed work title (e.g. "The Last Olympian", "The Chalice of the Gods", "Harry Potter and the Chamber of Secrets")
+  // Prioritize specific colon RHS work candidate over generic franchise prefix
+  // (e.g. "Sherlock Holmes: A Study in Scarlet" -> "A Study in Scarlet")
+  if (decomp.colonRhsWorkCandidate && decomp.canonicalTitle !== decomp.colonRhsWorkCandidate) {
+    pushCandidate(decomp.colonRhsWorkCandidate);
+  }
+
+  // 1. Canonical decomposed work title (e.g. "The Last Olympian", "The Chalice of the Gods", "Harry Potter and the Chamber of Secrets", "Guards! Guards!")
   pushCandidate(decomp.canonicalTitle);
+
+  // Substantive tail if distinct
+  if (decomp.substantiveTail && decomp.canonicalTitle !== decomp.substantiveTail) {
+    pushCandidate(decomp.substantiveTail);
+  }
 
   // 2. Edition-stripped & bracket-stripped full string if distinct (e.g. strips "(Enhanced Edition)" or "(From the World of ...)")
   let strippedFull = stripBracketedGroups(rawTitle, '[', ']');
   strippedFull = stripBracketedGroups(strippedFull, '(', ')').trim();
   strippedFull = stripEditionDescriptors(strippedFull);
   pushCandidate(strippedFull);
+
+  // Extract substantive non-edition parenthetical text (e.g. "The Stranger (L'Etranger)")
+  const parenMatch = rawTitle.match(/\(([^)]+)\)/);
+  if (parenMatch) {
+    const parenContent = parenMatch[1].trim();
+    if (!/^(?:book|vol|volume|part|edition|version|\d+)/i.test(parenContent) && getTokens(parenContent).length >= 1) {
+      pushCandidate(parenContent);
+    }
+  }
 
   // 3. Secondary colon RHS work title for unnumbered "Series Name: Work Title"
   if (decomp.colonRhsWorkCandidate) {
@@ -663,7 +741,7 @@ export function extractSearchTitleCandidates(title, options = {}) {
     if (getTokens(cleanSub).length >= 2) pushCandidate(cleanSub);
   }
 
-  // 5. Known numeric/word title equivalents
+  // 5. Known numeric/word title equivalents and work-level translations
   for (const existing of [...out, rawTitle]) {
     const eqs = KNOWN_TITLE_EQUIVALENTS.get(normalizeString(existing));
     if (eqs) {
@@ -687,6 +765,7 @@ export function isNoiseDerivative(candidateTitle, requestedTitle) {
     'omnibus', 'anthology', 'historias de', 'relatos de', 'cuentos de',
     'obras completas', 'coleccion de', 'and other stories', 'and other writings',
     'other writings', 'selected works', 'selected writings', 'short stories', 'complete collection',
+    'trivia', 'supersummary', 'fastreads', 'adaptation', '4 vols', 'box-set', 'boxed-set',
   ];
   for (const marker of noiseMarkers) {
     if (normCand.includes(marker) && !normReq.includes(marker)) return true;
@@ -1023,6 +1102,11 @@ export function titleMatchDecision(candidateTitle, requestedTitle, options = {})
     evidence.push({ field: 'title', value: coreReq, level: 'work', status: 'verified' });
     return { outcome: 'match', workConfidence: 'high', editionConfidence: 'medium', evidence, conflicts, reasonCodes };
   }
+  const reqSeries = normalizeString(reqDecomp.seriesPrefix || options?.reqSeriesName || options?.seriesName || '');
+  if (!candDecomp.hasExplicitPrefix && reqSeries && coreReq && normCand.includes(coreReq) && normCand.includes(reqSeries) && getTokens(coreReq).length >= 2) {
+    evidence.push({ field: 'title', value: coreReq, level: 'work', status: 'verified' });
+    return { outcome: 'match', workConfidence: 'high', editionConfidence: 'medium', evidence, conflicts, reasonCodes };
+  }
   if (!reqDecomp.hasExplicitPrefix && coreCand && sameCanonicalWorkPhrase(coreCand, normReq)) {
     evidence.push({ field: 'title', value: coreCand, level: 'work', status: 'verified' });
     return { outcome: 'match', workConfidence: 'high', editionConfidence: 'medium', evidence, conflicts, reasonCodes };
@@ -1112,6 +1196,11 @@ export function authorMatchDecision(candidateAuthors, requestedAuthor) {
     const candTokens = getTokens(cand);
     if (candTokens.length === 0) continue;
     if (candNorm === reqNorm) {
+      evidence.push({ field: 'author', value: candNorm, level: 'work', status: 'verified' });
+      return { outcome: 'match', workConfidence: 'high', editionConfidence: 'medium', evidence, conflicts, reasonCodes };
+    }
+    const eqsReq = KNOWN_AUTHOR_EQUIVALENTS.get(reqNorm) || [];
+    if (eqsReq.some((eq) => normalizeString(eq) === candNorm || cand.includes(eq))) {
       evidence.push({ field: 'author', value: candNorm, level: 'work', status: 'verified' });
       return { outcome: 'match', workConfidence: 'high', editionConfidence: 'medium', evidence, conflicts, reasonCodes };
     }
@@ -1393,4 +1482,117 @@ export function collectMetadataIsbns(obj, out = new Set()) {
     if (nb.length === 10 || nb.length === 13) out.add(nb);
   }
   return out;
+}
+
+export function scoreBookMatch(book, searchTitle, searchAuthor) {
+  if (!book) return -100;
+  const bookTitle = book.title || book.name || book.search_title || '';
+  const normQueryTitle = normalizeString(searchTitle);
+  const normBookTitle = normalizeString(bookTitle);
+  const normQueryCore = normalizeString(extractCoreTitle(searchTitle, { author: searchAuthor }));
+  const normBookCore = normalizeString(extractCoreTitle(bookTitle, { author: searchAuthor }));
+
+  // Immediate heavy penalty for noise derivatives, summaries, study guides, trivia, or box sets
+  // when the search is for an individual book
+  if (isNoiseDerivative(bookTitle, searchTitle) || hasCompilationIndicator(bookTitle)) {
+    return -60;
+  }
+
+  // Check if candidate title is just the author's name or a generic 1-word series/character name
+  if (searchAuthor && isAuthorMatch(bookTitle, searchAuthor)) {
+    return -40;
+  }
+  const decompReq = decomposeTitleStructure(searchTitle, { author: searchAuthor });
+  if (decompReq.hasExplicitPrefix || decompReq.substantiveTail || decompReq.colonRhsWorkCandidate) {
+    const genericPrefixNorm = normalizeString(decompReq.rawCore || decompReq.seriesPrefix || '');
+    const specificCoreNorm = normalizeString(decompReq.colonRhsWorkCandidate || decompReq.canonicalTitle || '');
+    if (genericPrefixNorm && normBookTitle !== specificCoreNorm && (normBookTitle === genericPrefixNorm || stripLeadingArticle(normBookTitle) === stripLeadingArticle(genericPrefixNorm))) {
+      // The candidate is just the generic series/franchise prefix (e.g. "Sherlock Holmes" or "Discworld")
+      return -40;
+    }
+  }
+
+  let titleScore = 0;
+  if (normBookTitle && normQueryTitle && normBookTitle === normQueryTitle) {
+    titleScore = 60;
+  } else if (normQueryCore && normBookCore && (
+    normBookCore === normQueryCore ||
+    stripLeadingArticle(normBookCore) === stripLeadingArticle(normQueryCore) ||
+    sameCanonicalWorkPhrase(normBookCore, normQueryCore)
+  )) {
+    titleScore = 55;
+  } else if (isTitleMatch(bookTitle, searchTitle, { reqAuthor: searchAuthor })) {
+    titleScore = 45;
+  } else if (normQueryCore && getTokens(normQueryCore).length >= 2 && normBookTitle.includes(normQueryCore)) {
+    titleScore = 45;
+  } else if (normBookCore && getTokens(normBookCore).length >= 2 && normQueryTitle.includes(normBookCore)) {
+    titleScore = 45;
+  } else if (safePrefix(normBookTitle, normQueryTitle) || safePrefix(normQueryTitle, normBookTitle)) {
+    titleScore = 30;
+  } else {
+    // Check known equivalents / translations
+    const queryEqs = KNOWN_TITLE_EQUIVALENTS.get(normQueryCore || normQueryTitle);
+    if (queryEqs && queryEqs.some((eq) => normalizeString(eq) === normBookCore || normalizeString(eq) === normBookTitle)) {
+      titleScore = 50;
+    } else {
+      const bookEqs = KNOWN_TITLE_EQUIVALENTS.get(normBookCore || normBookTitle);
+      if (bookEqs && bookEqs.some((eq) => normalizeString(eq) === normQueryCore || normalizeString(eq) === normQueryTitle)) {
+        titleScore = 50;
+      }
+    }
+  }
+
+  // Token containment fallback (only if > 1 token and boundaries ok)
+  if (titleScore === 0) {
+    const qTokens = getTokens(normQueryTitle);
+    const bTokens = getTokens(normBookTitle);
+    if (qTokens.length > 1 && qTokens.every((t) => bTokens.includes(t))) {
+      titleScore = 20;
+    }
+  }
+
+  // CRUCIAL: Title compatibility is a strict prerequisite for author points!
+  // If titleScore is 0, this candidate represents an unrelated title. Author points must NEVER elevate it.
+  if (titleScore === 0) {
+    return 0;
+  }
+
+  let authorScore = 0;
+  if (searchAuthor) {
+    const normQueryAuthor = normalizeString(toNaturalAuthor(searchAuthor));
+    const authors = Array.isArray(book.authors) ? book.authors : (book.author ? [book.author] : []);
+    if (authors.length === 0) {
+      // Author missing in metadata (neutral, e.g. Count of Monte Cristo OpenLibrary record)
+      authorScore = 5;
+    } else {
+      let matchedAuthor = false;
+      for (const a of authors) {
+        if (!a) continue;
+        if (isAuthorMatch(a, searchAuthor)) {
+          matchedAuthor = true;
+          authorScore = 50;
+          break;
+        }
+        const normA = normalizeString(toNaturalAuthor(a));
+        if (normA === normQueryAuthor) {
+          matchedAuthor = true;
+          authorScore = 50;
+          break;
+        }
+        const aTokens = getTokens(normA);
+        const qTokens = getTokens(normQueryAuthor);
+        if (qTokens.length > 0 && qTokens.every((t) => aTokens.includes(t)) && aTokens.length <= qTokens.length + 2) {
+          matchedAuthor = true;
+          authorScore = 30;
+          break;
+        }
+      }
+      if (!matchedAuthor) {
+        // Known conflicting author: penalize heavily
+        authorScore = -30;
+      }
+    }
+  }
+
+  return titleScore + authorScore;
 }

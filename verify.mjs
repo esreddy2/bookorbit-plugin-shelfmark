@@ -72,6 +72,11 @@ import {
   identifyReadingLanguage,
   MAGIC_BYTES,
   sanitizeLog,
+  scoreBookMatch,
+  KNOWN_TITLE_EQUIVALENTS,
+  hasCompilationIndicator,
+  extractSearchTitleCandidates,
+  decomposeTitleStructure,
 } from './bridge/bridge.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -4445,6 +4450,118 @@ test('WORK+LANG: DEFLATE-compressed EPUB chapters and FlateDecode PDF streams ve
   assert.equal(scanPdfVer.ok, false);
   assert.equal(scanPdfVer.outcome, 'review');
   assert.ok(scanPdfVer.conflicts.includes('insufficient_language_evidence'));
+});
+
+test('CANDIDATE-ORDERING: prefers specific work title over wrong book by same author (ACOTAR)', async () => {
+  const reqTitle = 'A Court of Wings and Ruin';
+  const reqAuthor = 'Sarah J. Maas';
+  const wrongBook = { title: 'House of Flame and Shadow', authors: ['Sarah J. Maas'] };
+  const rightBook = { title: 'A Court of Wings and Ruin', authors: ['Sarah J. Maas'] };
+
+  const scoreWrong = scoreBookMatch(wrongBook, reqTitle, reqAuthor);
+  const scoreRight = scoreBookMatch(rightBook, reqTitle, reqAuthor);
+
+  assert.ok(scoreRight > 80, `Expected right book to score high, got ${scoreRight}`);
+  assert.ok(scoreWrong <= 0, `Expected wrong book by same author to score <= 0 without title match, got ${scoreWrong}`);
+});
+
+test('CANDIDATE-ORDERING: prefers specific work title over generic franchise or wrong volume (Discworld)', async () => {
+  const reqTitle = 'Discworld - Guards! Guards! (Book 8)';
+  const reqAuthor = 'Terry Pratchett';
+  const wrongVol = { title: 'The Colour of Magic', authors: ['Terry Pratchett'] };
+  const rightBook = { title: 'Guards! Guards!', authors: ['Terry Pratchett'] };
+
+  const scoreWrong = scoreBookMatch(wrongVol, reqTitle, reqAuthor);
+  const scoreRight = scoreBookMatch(rightBook, reqTitle, reqAuthor);
+
+  assert.ok(scoreRight > scoreWrong, 'Expected Guards! Guards! to outrank The Colour of Magic');
+  assert.ok(scoreWrong <= 0, `Expected wrong volume to score <= 0, got ${scoreWrong}`);
+});
+
+test('CANDIDATE-ORDERING: prefers specific work title over collection/compilation (Sherlock Holmes)', async () => {
+  const reqTitle = 'Sherlock Holmes: A Study in Scarlet';
+  const reqAuthor = 'Arthur Conan Doyle';
+  const collection = { title: 'The Adventures of Sherlock Holmes [12 stories]', authors: ['Arthur Conan Doyle'] };
+  const rightBook = { title: 'A Study in Scarlet', authors: ['Arthur Conan Doyle'] };
+
+  const scoreColl = scoreBookMatch(collection, reqTitle, reqAuthor);
+  const scoreRight = scoreBookMatch(rightBook, reqTitle, reqAuthor);
+
+  assert.ok(scoreRight > scoreColl, 'Expected A Study in Scarlet to outrank multi-story collection');
+  assert.ok(scoreColl < 0, `Expected collection to receive negative penalty, got ${scoreColl}`);
+});
+
+test('CANDIDATE-ORDERING: prefers specific work title over unrelated book by same author (Agatha Christie)', async () => {
+  const reqTitle = 'Agatha Christie - Murder on the Orient Express';
+  const reqAuthor = 'Agatha Christie';
+  const wrongBook = { title: 'Cards on the Table', authors: ['Agatha Christie'] };
+  const rightBook = { title: 'Murder on the Orient Express', authors: ['Agatha Christie'] };
+
+  const scoreWrong = scoreBookMatch(wrongBook, reqTitle, reqAuthor);
+  const scoreRight = scoreBookMatch(rightBook, reqTitle, reqAuthor);
+
+  assert.ok(scoreRight > scoreWrong, 'Expected Murder on the Orient Express to outrank Cards on the Table');
+  assert.ok(scoreWrong <= 0, `Expected wrong book to score <= 0, got ${scoreWrong}`);
+});
+
+test('CANDIDATE-ORDERING: prefers individual book over boxed set / compilation (Time Quartet)', async () => {
+  const reqTitle = 'A Wind in the Door';
+  const reqAuthor = 'Madeleine L\'Engle';
+  const boxSet = { title: 'Madeleine L\'Engle\'s Time Quartet-Boxed Set 4 Vols', authors: ['Madeleine L\'Engle'] };
+  const rightBook = { title: 'A Wind in the Door (Time Quintet #2)', authors: ['Madeleine L\'Engle'] };
+
+  const scoreBox = scoreBookMatch(boxSet, reqTitle, reqAuthor);
+  const scoreRight = scoreBookMatch(rightBook, reqTitle, reqAuthor);
+
+  assert.ok(scoreRight > scoreBox, 'Expected individual volume to outrank 4 Vols boxed set');
+  assert.ok(scoreBox < 0, `Expected boxed set to receive penalty, got ${scoreBox}`);
+});
+
+test('CANDIDATE-ORDERING: derivative publications (trivia, study guide, summaries) receive heavy penalties', async () => {
+  const trivia = { title: 'Trivia : a Man Called Ove', authors: ['Trivion Books'] };
+  const studyGuide = { title: 'Study Guide', authors: ['SuperSummary'] };
+  const summary = { title: 'Summary of A Man Called Ove', authors: ['FastReads'] };
+
+  assert.ok(scoreBookMatch(trivia, 'A Man Called Ove: A Novel', 'Fredrik Backman') < 0);
+  assert.ok(scoreBookMatch(studyGuide, 'Auggie & Me', 'R. J. Palacio') < 0);
+  assert.ok(scoreBookMatch(summary, 'A Man Called Ove', 'Fredrik Backman') < 0);
+});
+
+test('CANDIDATE-ORDERING: handles missing author in metadata without failing valid title match (Count of Monte Cristo)', async () => {
+  const bookNoAuthor = { title: 'The Count of Monte Cristo', authors: [] };
+  const score = scoreBookMatch(bookNoAuthor, 'The Count of Monte Cristo - Unabridged', 'Alexandre Dumas');
+  assert.ok(score > 50, `Expected valid book with missing author to score positive, got ${score}`);
+});
+
+test('CANDIDATE-ORDERING: work-level equivalence recognizes canonical translations', async () => {
+  const witcher = { title: 'Ostatnie Życzenie', authors: ['Andrzej Sapkowski'] };
+  const scoreWitcher = scoreBookMatch(witcher, 'The Witcher 1 - The Last Wish', 'Andrzej Sapkowski');
+  assert.ok(scoreWitcher > 80, `Expected canonical Polish translation to match work, got ${scoreWitcher}`);
+
+  const dragonTattoo = { title: 'Män som hatar kvinnor', authors: ['Stieg Larsson'] };
+  const scoreDragon = scoreBookMatch(dragonTattoo, 'The Girl with the Dragon Tattoo', 'Stieg Larsson');
+  assert.ok(scoreDragon > 80, `Expected canonical Swedish translation to match work, got ${scoreDragon}`);
+
+  const camus = { title: 'L\'étranger', authors: ['Albert Camus'] };
+  const scoreCamus = scoreBookMatch(camus, 'The Stranger', 'Albert Camus');
+  assert.ok(scoreCamus > 80, `Expected French title L'étranger to match The Stranger, got ${scoreCamus}`);
+});
+
+test('CANDIDATE-ORDERING: search title candidate extraction orders specific work titles ahead of generic franchise/author names', async () => {
+  const sherlockCands = extractSearchTitleCandidates('Sherlock Holmes: A Study in Scarlet');
+  assert.equal(sherlockCands[0], 'A Study in Scarlet');
+
+  const acotarCands = extractSearchTitleCandidates('ACOTAR 3 - A Court of Wings and Ruin');
+  assert.equal(acotarCands[0], 'A Court of Wings and Ruin');
+
+  const discworldCands = extractSearchTitleCandidates('Discworld - Guards! Guards! (Book 8)');
+  assert.equal(discworldCands[0], 'Guards! Guards!');
+
+  const christieCands = extractSearchTitleCandidates('Agatha Christie - Murder on the Orient Express', { author: 'Agatha Christie' });
+  assert.equal(christieCands[0], 'Murder on the Orient Express');
+
+  const camusCands = extractSearchTitleCandidates('The Stranger (L\'Etranger)');
+  assert.ok(camusCands.includes('L\'Etranger'));
 });
 
 
