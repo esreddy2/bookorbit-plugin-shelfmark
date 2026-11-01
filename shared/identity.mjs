@@ -211,6 +211,7 @@ export function normalizeString(str) {
   return String(str)
     .normalize('NFKC')
     .toLowerCase()
+    .replace(/[şŞ]/g, 'sh')
     .normalize('NFKD')
     .replace(/[\u0300-\u036f\u1ab0-\u1aff\u1dc0-\u1dff\u20d0-\u20ff\ufe20-\ufe2f]/g, '')
     .replace(/&/g, ' and ')
@@ -458,7 +459,7 @@ const MULTI_VOLUME_RANGE_RE = new RegExp(
   'i'
 );
 const HASH_VOLUME_RANGE_RE = /(?:^|[\s([,])#\s*0*\d{1,2}\s*[-–—]\s*#?\s*0*\d{1,2}\b/i;
-const MULTI_BOOK_PACK_RE = /\b(?:\d{1,2}\s*[-–—]?\s*books?\s+(?:set|pack|bundle|collection|series|omnibus|in\s+1|in\s+one)|\d{1,2}\s*-\s*in\s*-\s*1|complete\s+series|series\s+collection|\d{1,3}\s+(?:short\s+)?stories|\d{1,2}\s+novels|\d{1,3}\s+tales)\b/i;
+const MULTI_BOOK_PACK_RE = /\b(?:\d{1,2}\s*[-–—]?\s*books?\s+(?:set|pack|bundle|collection|series|omnibus|in\s+1|in\s+one)|\d{1,2}\s*-\s*in\s*-\s*1|complete\s+(?:series|collection|works|stories)|\bcomplete\b|\bomnibus\b|\banthology\b|series\s+collection|\d{1,3}\s+(?:short\s+)?stories|\d{1,2}\s+novels|\d{1,3}\s+tales)\b/i;
 
 export function hasMultiVolumeIndicator(title) {
   if (!title) return false;
@@ -469,8 +470,32 @@ export function hasMultiVolumeIndicator(title) {
   }
   // Slash-separated multi-title compilations (e.g. "The Lightning Thief / The Sea of Monsters")
   if (/\s+\/\s+/.test(s)) {
-    const slashParts = s.split(/\s+\/\s+/).filter((p) => (p.match(/\p{L}/gu) || []).length >= 3);
-    if (slashParts.length >= 2) return true;
+    const slashParts = s.split(/\s+\/\s+/).map(p => p.trim()).filter(Boolean);
+    if (slashParts.length >= 2) {
+      // Check if it's a bilingual title (e.g. "Amor en Juego / The Long Game")
+      // If one side has very similar length/tokens or matches, or if it's just two language variants of the same title, do not treat as multi-volume anthology.
+      // Specifically, if there are exactly 2 parts and one part is clearly a translation/equivalent or has substantial token overlap, or if we check common bilingual patterns.
+      // Let's implement a robust check: if slashParts.length === 2 and one part contains the other's core tokens or if they are both translations (e.g. Spanish/English), skip multi-volume.
+      // Even simpler: if slashParts.length === 2, check if any token from part 1 appears in part 2 or vice versa, or if one is a translation.
+      const p0Norm = normalizeString(slashParts[0]);
+      const p1Norm = normalizeString(slashParts[1]);
+      const t0 = getTokens(p0Norm);
+      const t1 = getTokens(p1Norm);
+      const overlap = t0.filter(t => t1.includes(t));
+      // If there's token overlap or if one side has common bilingual indicators or similar length without distinct volume numbers/different book names (e.g. different proper nouns)
+      // Actually, standard bilingual titles often share at least one word or are translations. But if they share no words (e.g. "Book A / Book B"), it's an anthology.
+      // If overlap.length > 0 or (t0.length <= 3 && t1.length <= 3), or if they are bilingual. Let's check if overlap.length === 0 and both have >= 2 distinct substantive tokens (like "Lightning Thief / Sea of Monsters").
+      const substantive0 = t0.filter(t => t.length > 3);
+      const substantive1 = t1.filter(t => t.length > 3);
+      const hasDistinctSubstantiveOverlap = substantive0.some(t => substantive1.includes(t));
+      if (slashParts.length === 2 && !hasDistinctSubstantiveOverlap && substantive0.length >= 2 && substantive1.length >= 2) {
+        // Distinct books like "Lightning Thief / Sea of Monsters"
+        return true;
+      }
+      if (slashParts.length > 2) {
+        return true;
+      }
+    }
   }
   return false;
 }
@@ -950,7 +975,12 @@ export function isNoiseDerivative(candidateTitle, requestedTitle) {
     if (normCand.includes(marker) && !normReq.includes(marker) && !reqHasCompilation) return true;
   }
   if (/\b(?:stage|level)\s*[1-6]\b/i.test(candidateTitle) && !/\b(?:stage|level)\s*[1-6]\b/i.test(requestedTitle)) return true;
-  if (hasMultiVolumeIndicator(candidateTitle) && !reqHasCompilation) return true;
+  const isSlashBilingual = /\s+\/\s+/.test(candidateTitle) &&
+    candidateTitle.split(/\s+\/\s+/).some((p) => {
+      const pNorm = normalizeString(p);
+      return pNorm === normReq || stripLeadingArticle(pNorm) === stripLeadingArticle(normReq);
+    });
+  if (hasMultiVolumeIndicator(candidateTitle) && !reqHasCompilation && !isSlashBilingual) return true;
   return false;
 }
 
@@ -1223,6 +1253,18 @@ export function titleMatchDecision(candidateTitle, requestedTitle, options = {})
     return { outcome: 'match', workConfidence: 'high', editionConfidence: 'medium', evidence, conflicts, reasonCodes };
   }
 
+  // Bilingual slash title: if one side of a slash matches requestedTitle
+  if (/\s+\/\s+/.test(candidateTitle)) {
+    const slashParts = candidateTitle.split(/\s+\/\s+/);
+    for (const part of slashParts) {
+      const pNorm = normalizeString(part);
+      if (pNorm === normReq || stripLeadingArticle(pNorm) === stripLeadingArticle(normReq)) {
+        evidence.push({ field: 'title', value: pNorm, level: 'work', status: 'verified' });
+        return { outcome: 'match', workConfidence: 'high', editionConfidence: 'medium', evidence, conflicts, reasonCodes };
+      }
+    }
+  }
+
   const coreCand = normalizeString(candDecomp.canonicalTitle);
   const coreReq = normalizeString(reqDecomp.canonicalTitle);
 
@@ -1370,6 +1412,19 @@ export function authorMatchDecision(candidateAuthors, requestedAuthor) {
   if (reqTokens.length === 0) {
     return { outcome: 'unknown', workConfidence: 'none', editionConfidence: 'none', evidence, conflicts, reasonCodes };
   }
+  // Check co-authors if requestedAuthor has "and", "&" or ","
+  const subReqs = /\s+(?:and|&)\s+|\s*,\s*/.test(requestedAuthor) 
+    ? String(requestedAuthor).split(/\s+(?:and|&)\s+|\s*,\s*/).map(a => toNaturalAuthor(a)).filter(Boolean)
+    : [requestedAuthor];
+
+  for (const subReq of subReqs) {
+    if (subReq === requestedAuthor) continue;
+    const subD = authorMatchDecision(candidateAuthors, subReq);
+    if (subD.outcome === 'match') {
+      return subD;
+    }
+  }
+
   for (const cand of authorList) {
     const candNorm = normalizeString(cand);
     const candTokens = getTokens(cand);
@@ -1382,6 +1437,17 @@ export function authorMatchDecision(candidateAuthors, requestedAuthor) {
     if (matchingTokens.length === reqTokens.length && reqTokens.length > 0) {
       evidence.push({ field: 'author', value: candNorm, level: 'work', status: 'verified' });
       return { outcome: 'match', workConfidence: 'high', editionConfidence: 'medium', evidence, conflicts, reasonCodes };
+    }
+    // Check if candTokens matches one of the sub-authors
+    if (subReqs.length > 1) {
+      const matchesAnySub = subReqs.some(sub => {
+        const subTokens = getTokens(normalizeString(toNaturalAuthor(sub)));
+        return subTokens.length > 0 && subTokens.every(t => candTokens.includes(t)) && candTokens.length <= subTokens.length + 2;
+      });
+      if (matchesAnySub) {
+        evidence.push({ field: 'author', value: candNorm, level: 'work', status: 'verified' });
+        return { outcome: 'match', workConfidence: 'high', editionConfidence: 'medium', evidence, conflicts, reasonCodes };
+      }
     }
     const reqSurname = reqTokens[reqTokens.length - 1];
     if (candTokens.includes(reqSurname) && reqTokens.length > 1) {
@@ -1409,6 +1475,27 @@ export function authorMatchDecision(candidateAuthors, requestedAuthor) {
         return { outcome: 'match', workConfidence: 'high', editionConfidence: 'medium', evidence, conflicts, reasonCodes };
       }
       if ((candFirst.length === 1 || reqFirst.length === 1) && (candFirst.startsWith(reqFirst[0]) || reqFirst.startsWith(candFirst[0]))) {
+        evidence.push({ field: 'author', value: candNorm, level: 'work', status: 'verified' });
+        return { outcome: 'match', workConfidence: 'high', editionConfidence: 'medium', evidence, conflicts, reasonCodes };
+      }
+    }
+    // Single-token mononym / classical name with Latin stem or minor spelling variant (e.g. Virgil vs Publius Vergilius Maro)
+    if (reqTokens.length === 1 && reqTokens[0].length >= 4) {
+      const srt = reqTokens[0].replace(/(?:ius|us|is|es)$/, '');
+      const hasStemMatch = candTokens.some((ct) => {
+        const sct = ct.replace(/(?:ius|us|is|es)$/, '');
+        if (sct === srt) return true;
+        if (srt.length >= 4 && sct.length >= 4 && Math.abs(sct.length - srt.length) <= 1) {
+          let diffs = 0;
+          const minLen = Math.min(sct.length, srt.length);
+          for (let i = 0; i < minLen; i++) {
+            if (sct[i] !== srt[i]) diffs++;
+          }
+          if (diffs + Math.abs(sct.length - srt.length) <= 1) return true;
+        }
+        return false;
+      });
+      if (hasStemMatch) {
         evidence.push({ field: 'author', value: candNorm, level: 'work', status: 'verified' });
         return { outcome: 'match', workConfidence: 'high', editionConfidence: 'medium', evidence, conflicts, reasonCodes };
       }
@@ -1669,7 +1756,12 @@ export function scoreBookMatch(book, searchTitle, searchAuthor) {
   // Immediate heavy penalty for noise derivatives, summaries, study guides, trivia, or box sets
   // when the search is for an individual book
   const reqHasCompilation = hasCompilationIndicator(searchTitle) || /\b(?:complete|collection|set|omnibus|stories|anthology|adventures)\b/i.test(searchTitle);
-  if (isNoiseDerivative(bookTitle, searchTitle) || (hasCompilationIndicator(bookTitle) && !reqHasCompilation)) {
+  const isSlashBilingual = /\s+\/\s+/.test(bookTitle) &&
+    bookTitle.split(/\s+\/\s+/).some((p) => {
+      const pNorm = normalizeString(p);
+      return pNorm === normQueryTitle || pNorm === normQueryCore || stripLeadingArticle(pNorm) === stripLeadingArticle(normQueryTitle) || stripLeadingArticle(pNorm) === stripLeadingArticle(normQueryCore);
+    });
+  if (isNoiseDerivative(bookTitle, searchTitle) || (hasCompilationIndicator(bookTitle) && !reqHasCompilation && !isSlashBilingual)) {
     return -60;
   }
 
@@ -1754,11 +1846,13 @@ export function scoreBookMatch(book, searchTitle, searchAuthor) {
 
   let authorScore = 0;
   if (searchAuthor) {
+    const isGenericAuthor = /\b(?:traditional|anonymous|unknown|various|uncredited)\b/i.test(searchAuthor);
     const normQueryAuthor = normalizeString(toNaturalAuthor(searchAuthor));
     const authors = Array.isArray(book.authors) ? book.authors : (book.author ? [book.author] : []);
-    if (authors.length === 0) {
+    if (authors.length === 0 || isGenericAuthor) {
       // Author missing in metadata (neutral, e.g. Count of Monte Cristo OpenLibrary record)
-      authorScore = 5;
+      // or generic/traditional author placeholder where candidate author is translator/compiler
+      authorScore = isGenericAuthor ? 10 : 5;
     } else {
       let matchedAuthor = false;
       for (const a of authors) {

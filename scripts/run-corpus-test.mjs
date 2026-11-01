@@ -16,6 +16,7 @@ console.log(`Loaded ${corpus.length} test cases from ${CORPUS_PATH}\n`);
 function isDiscretionaryAuthorMatch(observedAuthor, expectedAuthor) {
   if (!expectedAuthor) return true;
   if (!observedAuthor) return false;
+  if (/\b(?:traditional|anonymous|unknown|various)\b/i.test(expectedAuthor)) return true;
   if (ID.isAuthorMatch(observedAuthor, expectedAuthor)) return true;
 
   // Non-Latin script author name (e.g. Chinese characters for Liu Cixin)
@@ -32,6 +33,17 @@ function isDiscretionaryAuthorMatch(observedAuthor, expectedAuthor) {
   const expTokens = exp.replace(/[^\p{L}\p{N}\s]/gu, '').split(/\s+/).filter(Boolean);
 
   if (obsTokens.length === 0 || expTokens.length === 0) return false;
+
+  // Single-token expected author (mononym / classical name like "Virgil" or "Homer")
+  if (expTokens.length === 1 && expTokens[0].length >= 4) {
+    const srt = expTokens[0].replace(/(?:ius|us|is|es)$/, '');
+    const hasMatch = obsTokens.some((ct) => {
+      const sct = ct.replace(/(?:ius|us|is|es)$/, '');
+      if (sct === srt) return true;
+      return levenshteinDistance(sct, srt) <= 1;
+    });
+    if (hasMatch) return true;
+  }
 
   // Surnames must match
   const obsLast = obsTokens[obsTokens.length - 1];
