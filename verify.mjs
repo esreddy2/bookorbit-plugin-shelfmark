@@ -4533,18 +4533,18 @@ test('CANDIDATE-ORDERING: handles missing author in metadata without failing val
   assert.ok(score > 50, `Expected valid book with missing author to score positive, got ${score}`);
 });
 
-test('CANDIDATE-ORDERING: work-level equivalence recognizes canonical translations', async () => {
-  const witcher = { title: 'Ostatnie Życzenie', authors: ['Andrzej Sapkowski'] };
-  const scoreWitcher = scoreBookMatch(witcher, 'The Witcher 1 - The Last Wish', 'Andrzej Sapkowski');
-  assert.ok(scoreWitcher > 80, `Expected canonical Polish translation to match work, got ${scoreWitcher}`);
-
-  const dragonTattoo = { title: 'Män som hatar kvinnor', authors: ['Stieg Larsson'] };
-  const scoreDragon = scoreBookMatch(dragonTattoo, 'The Girl with the Dragon Tattoo', 'Stieg Larsson');
-  assert.ok(scoreDragon > 80, `Expected canonical Swedish translation to match work, got ${scoreDragon}`);
-
+test('CANDIDATE-ORDERING: parenthetical alternate titles and orthographic variants match algorithmically', async () => {
   const camus = { title: 'L\'étranger', authors: ['Albert Camus'] };
-  const scoreCamus = scoreBookMatch(camus, 'The Stranger', 'Albert Camus');
-  assert.ok(scoreCamus > 80, `Expected French title L'étranger to match The Stranger, got ${scoreCamus}`);
+  const scoreCamus = scoreBookMatch(camus, 'The Stranger (L\'Etranger)', 'Albert Camus');
+  assert.ok(scoreCamus > 80, `Expected parenthetical alternate title L'Etranger to match algorithmically, got ${scoreCamus}`);
+
+  const colourOfMagic = { title: 'The Colour of Magic', authors: ['Terry Pratchett'] };
+  const scoreColour = scoreBookMatch(colourOfMagic, 'Discworld #1 Color of Magic', 'Terry Pratchett');
+  assert.ok(scoreColour > 80, `Expected British/American orthographic variant Color/Colour to match, got ${scoreColour}`);
+
+  const catch22 = { title: 'Catch-22', authors: ['Joseph Heller'] };
+  const scoreCatch = scoreBookMatch(catch22, 'Catch 22 - Joseph Heller', 'Joseph Heller');
+  assert.ok(scoreCatch > 80, `Expected author-stripped punctuated Catch-22 to match, got ${scoreCatch}`);
 });
 
 test('CANDIDATE-ORDERING: search title candidate extraction orders specific work titles ahead of generic franchise/author names', async () => {

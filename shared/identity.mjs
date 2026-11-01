@@ -14,41 +14,6 @@ export const KNOWN_TITLE_EQUIVALENTS = new Map([
   ['nineteen eighty-four', ['1984']],
   ['2001', ['two thousand and one']],
   ['two thousand and one', ['2001']],
-  ['the last wish', ['ostatnie zyczenie']],
-  ['ostatnie zyczenie', ['the last wish']],
-  ['blood of elves', ['krew elfow']],
-  ['krew elfow', ['blood of elves']],
-  ['the girl who kicked the hornets nest', ['luftslottet som sprangdes']],
-  ['luftslottet som sprangdes', ['the girl who kicked the hornets nest']],
-  ['the girl with the dragon tattoo', ['man som hatar kvinnor']],
-  ['man som hatar kvinnor', ['the girl with the dragon tattoo']],
-  ['the girl who played with fire', ['flickan som lekte med elden']],
-  ['flickan som lekte med elden', ['the girl who played with fire']],
-  ['a man called ove', ['en man som heter ove']],
-  ['en man som heter ove', ['a man called ove']],
-  ['the stranger', ['l etranger', 'letranger']],
-  ['l etranger', ['the stranger']],
-  ['letranger', ['the stranger']],
-  ['the count of monte cristo', ['le comte de monte cristo', 'le comte de monte-cristo']],
-  ['le comte de monte cristo', ['the count of monte cristo']],
-  ['le comte de monte-cristo', ['the count of monte cristo']],
-  ['sorcerers stone', ['philosophers stone']],
-  ['philosophers stone', ['sorcerers stone']],
-  ['harry potter and the sorcerers stone', ['harry potter and the philosophers stone']],
-  ['harry potter and the philosophers stone', ['harry potter and the sorcerers stone']],
-  ['unfinished tales of numenor and middle earth', ['unfinished tales of numenor and middle-earth', 'unfinished tales']],
-  ['unfinished tales of numenor and middle-earth', ['unfinished tales of numenor and middle earth', 'unfinished tales']],
-  ['the color of magic', ['the colour of magic']],
-  ['the colour of magic', ['the color of magic']],
-  ['color of magic', ['colour of magic']],
-  ['colour of magic', ['color of magic']],
-  ['catch 22', ['catch-22']],
-  ['catch-22', ['catch 22']],
-]);
-
-export const KNOWN_AUTHOR_EQUIVALENTS = new Map([
-  ['liu cixin', ['刘慈欣', 'cixin liu']],
-  ['刘慈欣', ['liu cixin', 'cixin liu']],
 ]);
 
 export function normalizeString(str) {
@@ -60,6 +25,7 @@ export function normalizeString(str) {
     .replace(/[\u0300-\u036f\u1ab0-\u1aff\u1dc0-\u1dff\u20d0-\u20ff\ufe20-\ufe2f]/g, '')
     .replace(/&/g, ' and ')
     .replace(/[^\p{L}\p{N}\s]/gu, ' ')
+    .replace(/\b([a-z]{2,})our([a-z]*)\b/g, '$1or$2')
     .replace(/\s+/g, ' ')
     .trim();
 }
@@ -1199,11 +1165,6 @@ export function authorMatchDecision(candidateAuthors, requestedAuthor) {
       evidence.push({ field: 'author', value: candNorm, level: 'work', status: 'verified' });
       return { outcome: 'match', workConfidence: 'high', editionConfidence: 'medium', evidence, conflicts, reasonCodes };
     }
-    const eqsReq = KNOWN_AUTHOR_EQUIVALENTS.get(reqNorm) || [];
-    if (eqsReq.some((eq) => normalizeString(eq) === candNorm || cand.includes(eq))) {
-      evidence.push({ field: 'author', value: candNorm, level: 'work', status: 'verified' });
-      return { outcome: 'match', workConfidence: 'high', editionConfidence: 'medium', evidence, conflicts, reasonCodes };
-    }
     const matchingTokens = reqTokens.filter((t) => candTokens.includes(t));
     if (matchingTokens.length === reqTokens.length && reqTokens.length > 0) {
       evidence.push({ field: 'author', value: candNorm, level: 'work', status: 'verified' });
@@ -1548,6 +1509,15 @@ export function scoreBookMatch(book, searchTitle, searchAuthor) {
     const bTokens = getTokens(normBookTitle);
     if (qTokens.length > 1 && qTokens.every((t) => bTokens.includes(t))) {
       titleScore = 20;
+    }
+  }
+
+  // Parenthetical alias inside search title (e.g. "The Stranger (L'Etranger)")
+  const parenMatch = searchTitle.match(/\(([^)]+)\)/);
+  if (parenMatch && titleScore === 0) {
+    const parenNorm = normalizeString(parenMatch[1]);
+    if (parenNorm && getTokens(parenNorm).length >= 1 && (normBookTitle === parenNorm || safePrefix(normBookTitle, parenNorm) || safePrefix(parenNorm, normBookTitle))) {
+      titleScore = 55;
     }
   }
 

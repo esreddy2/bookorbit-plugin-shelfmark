@@ -22,9 +22,6 @@ function isDiscretionaryAuthorMatch(observedAuthor, expectedAuthor) {
   const exp = ID.toNaturalAuthor(expectedAuthor).toLowerCase();
   if (obs === exp) return true;
 
-  const eqsExp = ID.KNOWN_AUTHOR_EQUIVALENTS.get(ID.normalizeString(expectedAuthor)) || [];
-  if (eqsExp.some((eq) => ID.normalizeString(eq) === ID.normalizeString(observedAuthor) || observedAuthor.includes(eq))) return true;
-
   // Split into tokens
   const obsTokens = obs.replace(/[^\p{L}\p{N}\s]/gu, '').split(/\s+/).filter(Boolean);
   const expTokens = exp.replace(/[^\p{L}\p{N}\s]/gu, '').split(/\s+/).filter(Boolean);
