@@ -4571,6 +4571,41 @@ test('CANDIDATE-ORDERING: search title candidate extraction orders specific work
 
   const camusCands = extractSearchTitleCandidates('The Stranger (L\'Etranger)');
   assert.ok(camusCands.includes('L\'Etranger'));
+
+  // Comma-separated clauses followed by by <Author>
+  const exileCands = extractSearchTitleCandidates('Planet of Exile, The Hainish Cycle by Ursula K. Le Guin', { author: 'Ursula K. Le Guin' });
+  assert.ok(exileCands.includes('Planet of Exile'));
+  const rappCands = extractSearchTitleCandidates('American Assassin, Mitch Rapp by Vince Flynn', { author: 'Vince Flynn' });
+  assert.ok(rappCands.includes('American Assassin'));
+  const pernCands = extractSearchTitleCandidates('Dragonsong, Pern by Anne McCaffrey', { author: 'Anne McCaffrey' });
+  assert.ok(pernCands.includes('Dragonsong'));
+
+  // Single-letter titles before by <Author>
+  const xCore = extractCoreTitle('X by Sue Grafton', { author: 'Sue Grafton' });
+  assert.equal(xCore, 'X');
+  const xCands = extractSearchTitleCandidates('X by Sue Grafton', { author: 'Sue Grafton' });
+  assert.ok(xCands.includes('X'));
+
+  // Volume-name equivalence when series title equals volume 1
+  const wimpyCore = extractCoreTitle('Diary of a Wimpy Kid Book 1');
+  assert.equal(wimpyCore, 'Diary of a Wimpy Kid');
+  const wimpyCands = extractSearchTitleCandidates('Diary of a Wimpy Kid Book 1');
+  assert.ok(wimpyCands.includes('Diary of a Wimpy Kid'));
+
+  const giverCore = extractCoreTitle('The Giver Quartet Book 1');
+  assert.equal(giverCore, 'The Giver');
+  const giverCands = extractSearchTitleCandidates('The Giver Quartet Book 1');
+  assert.ok(giverCands.includes('The Giver'));
+
+  // Surname-only author attribution after by
+  const orwellCore = extractCoreTitle('Nineteen Eighty Four by Orwell', { author: 'George Orwell' });
+  assert.equal(orwellCore, 'Nineteen Eighty Four');
+  const orwellCands = extractSearchTitleCandidates('Nineteen Eighty Four by Orwell', { author: 'George Orwell' });
+  assert.ok(orwellCands.includes('1984'));
+
+  // Article-agnostic canonical title equivalents (UK / US titles)
+  const hpCands = extractSearchTitleCandidates('The 1st Harry Potter (UK title) - Philosopher\'s Stone');
+  assert.ok(hpCands.some((c) => c.toLowerCase().includes('sorcerer')));
 });
 
 test('CANDIDATE-ORDERING: purely algorithmic numeric title equivalences handle arbitrary numbers', async () => {

@@ -1294,9 +1294,9 @@ export function normalizeLanguageCode(lang) { return ID.normalizeLanguageCode(la
 export function stripLeadingArticle(str) { return ID.stripLeadingArticle(str); }
 export function getTokens(str) { return ID.getTokens(str); }
 export function toNaturalAuthor(author) { return ID.toNaturalAuthor(author); }
-export function extractCoreTitle(title) { return ID.extractCoreTitle(title); }
+export function extractCoreTitle(title, options) { return ID.extractCoreTitle(title, options); }
 export function isNoiseDerivative(candidateTitle, requestedTitle) { return ID.isNoiseDerivative(candidateTitle, requestedTitle); }
-export function isTitleMatch(candidateTitle, requestedTitle) { return ID.isTitleMatch(candidateTitle, requestedTitle); }
+export function isTitleMatch(candidateTitle, requestedTitle, options) { return ID.isTitleMatch(candidateTitle, requestedTitle, options); }
 export function isAuthorMatch(candidateAuthors, requestedAuthor) { return ID.isAuthorMatch(candidateAuthors, requestedAuthor); }
 
 export function parsePositiveInt(val) {

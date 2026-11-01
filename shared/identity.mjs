@@ -219,10 +219,25 @@ const CANONICAL_TITLE_EQUIVALENTS_MAP = new Map();
 for (const [a, b] of CANONICAL_TITLE_EQUIVALENT_PAIRS) {
   const normA = normalizeString(a);
   const normB = normalizeString(b);
-  if (!CANONICAL_TITLE_EQUIVALENTS_MAP.has(normA)) CANONICAL_TITLE_EQUIVALENTS_MAP.set(normA, []);
-  if (!CANONICAL_TITLE_EQUIVALENTS_MAP.get(normA).includes(b)) CANONICAL_TITLE_EQUIVALENTS_MAP.get(normA).push(b);
-  if (!CANONICAL_TITLE_EQUIVALENTS_MAP.has(normB)) CANONICAL_TITLE_EQUIVALENTS_MAP.set(normB, []);
-  if (!CANONICAL_TITLE_EQUIVALENTS_MAP.get(normB).includes(a)) CANONICAL_TITLE_EQUIVALENTS_MAP.get(normB).push(a);
+  const addEquiv = (x, y) => {
+    if (!CANONICAL_TITLE_EQUIVALENTS_MAP.has(x)) CANONICAL_TITLE_EQUIVALENTS_MAP.set(x, []);
+    if (!CANONICAL_TITLE_EQUIVALENTS_MAP.get(x).includes(y)) CANONICAL_TITLE_EQUIVALENTS_MAP.get(x).push(y);
+  };
+  addEquiv(normA, b);
+  addEquiv(normB, a);
+
+  const noArtA = stripLeadingArticle(normA);
+  const noArtB = stripLeadingArticle(normB);
+  const aNoArt = stripLeadingArticle(a);
+  const bNoArt = stripLeadingArticle(b);
+  if (noArtA !== normA) {
+    addEquiv(noArtA, b);
+    if (bNoArt !== b) addEquiv(noArtA, bNoArt);
+  }
+  if (noArtB !== normB) {
+    addEquiv(noArtB, a);
+    if (aNoArt !== a) addEquiv(noArtB, aNoArt);
+  }
 }
 
 // Algorithmic numeric and canonical title equivalences
@@ -632,6 +647,7 @@ const SERIES_WITH_EXPLICIT_VOLUME_SEGMENT_RE = new RegExp(
 const SERIES_WITH_BARE_NUMBER_SEGMENT_RE = /^([\p{L}][\p{L}\s'’&.-]{2,}?)\s+0*([1-9]|[12]\d|30)$/u;
 const ATTRIBUTION_PREFIX_SEGMENT_RE = /^from\s+(?:the\s+(?:files|world|pages|journals?|chronicles|universe|desk|archives)\s+of\s+)?[\p{L}\p{N}][\p{L}\p{N}\s'’&.-]{1,70}$/iu;
 const UNPUNCTUATED_SERIES_VOLUME_RE = /^(.+?)\s+(?:(?:series|trilogy|duology|saga|chronicles?)\s+)?(?:(?:book|vol\.?|volume|part|tome)\s+#?0*([1-9]\d?)|#\s*0*([1-9]\d?)|0*([1-9]\d?))\s+(?=[A-Za-z\p{L}])(.+)$/iu;
+const SERIES_DESCRIPTOR_SUFFIX_RE = /\s+(?:quartet|trilogy|series|saga|chronicles?|duology|cycle|sequence|quintet|septet)\b/i;
 
 const NON_PERSON_TITLE_WORDS = new Set([
   'the', 'a', 'an', 'and', 'or', 'of', 'in', 'on', 'at', 'to', 'for', 'with', 'from', 'by', 'into', 'about',
@@ -671,6 +687,18 @@ function looksLikeAuthorPrefix(seg, optAuthor, s) {
     if (looksLikePersonNamePrefix(seg)) return true;
     const subAuthors = seg.split(/\s*(?:,|and|&)\s+/).filter(Boolean);
     if (subAuthors.length >= 2 && subAuthors.every((p) => looksLikePersonNamePrefix(p))) return true;
+  }
+  return false;
+}
+
+function looksLikeAuthorSuffix(seg) {
+  if (!seg) return false;
+  if (/^by\s+/i.test(seg)) return true;
+  const s = String(seg).trim();
+  if (/^[\p{Lu}][\p{L}'’-]+,\s*[\p{Lu}][\p{L}.'’\s-]{0,30}$/u.test(s)) return true;
+  const parts = s.split(/\s+/).filter(Boolean);
+  if (parts.length >= 2 && parts.length <= 5 && parts.slice(0, -1).some((p) => /^(?:[\p{Lu}]\.?){1,2}$/u.test(p))) {
+    return true;
   }
   return false;
 }
@@ -779,18 +807,28 @@ export function decomposeTitleStructure(title, options = {}) {
 
   const optAuthor = options?.author || '';
   const byIdx = s.toLowerCase().lastIndexOf(' by ');
+  let byAuthorWorkCandidate = null;
   if (byIdx > 0) {
     const prefix = s.slice(0, byIdx).trim();
     const suffix = s.slice(byIdx + 4).trim();
-    if (prefix.length >= 2 && !/[:;\-–—|]$/.test(prefix) && !/(?:\s+[-–—]\s+|[:;|–—])/.test(suffix)) {
+    if (prefix.length >= 1 && !/[:;\-–—|]$/.test(prefix) && !/(?:\s+[-–—]\s+|[:;|–—])/.test(suffix)) {
       const suffixTokens = getTokens(suffix);
       const startsWithArticle = /^(?:the|an)\s+|^a\s+(?![A-Z]\b)/i.test(suffix);
       const subAuthors = suffix.split(/\s*(?:,|and|&)\s+/).filter(Boolean);
-      const isKnownAuthor = Boolean(optAuthor && (isAuthorMatch(suffix, optAuthor) || subAuthors.some((a) => isAuthorMatch(a, optAuthor))));
+      const isKnownAuthor = Boolean(optAuthor && (isAuthorMatch(suffix, optAuthor) || isAuthorMatch(optAuthor, suffix) || subAuthors.some((a) => isAuthorMatch(a, optAuthor) || isAuthorMatch(optAuthor, a))));
       const isPersonName = looksLikePersonNamePrefix(suffix) || (subAuthors.length >= 2 && subAuthors.every((a) => looksLikePersonNamePrefix(a)));
       const isTokenAuthor = !optAuthor && suffixTokens.length >= 2 && suffixTokens.length <= 4 && suffixTokens.filter((t) => t.length > 1).every((t) => !NON_PERSON_TITLE_WORDS.has(t));
       const looksAuthor = !startsWithArticle && (isKnownAuthor || isPersonName || isTokenAuthor);
-      if (looksAuthor) s = prefix;
+      if (looksAuthor) {
+        s = prefix;
+        const commaParts = prefix.split(/\s*,\s*/);
+        if (commaParts.length >= 2) {
+          const lead = stripEditionDescriptors(commaParts[0].trim());
+          if (lead && lead.length >= 1) {
+            byAuthorWorkCandidate = lead;
+          }
+        }
+      }
     }
   }
 
@@ -836,7 +874,7 @@ export function decomposeTitleStructure(title, options = {}) {
 
   if (cleanedSegments.length > 1) {
     const lastSeg = cleanedSegments[cleanedSegments.length - 1];
-    if ((optAuthor && isAuthorMatch(lastSeg, optAuthor)) || (!optAuthor && /\s+[-–—]\s+/.test(s) && looksLikePersonNamePrefix(lastSeg))) {
+    if ((optAuthor && (isAuthorMatch(lastSeg, optAuthor) || isAuthorMatch(optAuthor, lastSeg))) || (!optAuthor && /\s+[-–—]\s+/.test(s) && looksLikeAuthorSuffix(lastSeg))) {
       cleanedSegments.pop();
     }
   } else if (cleanedSegments.length === 1 && optAuthor && cleanedSegments[0].includes(',')) {
@@ -995,19 +1033,46 @@ export function decomposeTitleStructure(title, options = {}) {
     }
   }
 
-  let canonicalTitle = (workSeg && workSeg.length >= 2) ? workSeg : (rawCore && rawCore.length >= 2 ? rawCore : s);
+  let canonicalTitle = (workSeg && workSeg.length >= 1) ? workSeg : (rawCore && rawCore.length >= 1 ? rawCore : s);
   if (idx === 0 && substantiveTail && volumeNumber !== null) {
     if (isVolumeOrSeriesSeg(substantiveTail)) {
       if (!seriesPrefix) seriesPrefix = substantiveTail;
       canonicalTitle = workSeg;
+      if (volumeNumber === 1) {
+        const strippedWork = workSeg.replace(SERIES_DESCRIPTOR_SUFFIX_RE, '').trim();
+        if (strippedWork && strippedWork.length >= 1) {
+          canonicalTitle = strippedWork;
+        }
+      }
     } else {
       if (!seriesPrefix) seriesPrefix = workSeg;
       hasExplicitPrefix = true;
       canonicalTitle = substantiveTail;
     }
+  } else if (idx === 0 && !substantiveTail) {
+    const explicitSeriesVol = workSeg.match(SERIES_WITH_EXPLICIT_VOLUME_SEGMENT_RE);
+    if (explicitSeriesVol) {
+      const parsedV = parseVolumeToken(
+        explicitSeriesVol[2] || explicitSeriesVol[3] || explicitSeriesVol[4],
+        Boolean(explicitSeriesVol[2])
+      );
+      if (volumeNumber === null && parsedV !== null) volumeNumber = parsedV;
+      if (parsedV === 1) {
+        const pre = explicitSeriesVol[1].trim();
+        const strippedPre = pre.replace(SERIES_DESCRIPTOR_SUFFIX_RE, '').trim();
+        if (strippedPre && strippedPre.length >= 1) {
+          if (!seriesPrefix) seriesPrefix = pre;
+          hasExplicitPrefix = true;
+          canonicalTitle = strippedPre;
+        }
+      }
+    }
   }
 
   const slidingWindows = generateDelimiterSlidingWindows(cleanedSegments, idx);
+  if (byAuthorWorkCandidate && !slidingWindows.includes(byAuthorWorkCandidate)) {
+    slidingWindows.push(byAuthorWorkCandidate);
+  }
   let forwardSegment = null;
   let fwdIdx = idx + 1;
   while (fwdIdx < cleanedSegments.length && PURE_VOLUME_SEGMENT_RE.test(cleanedSegments[fwdIdx])) {
@@ -1033,6 +1098,7 @@ export function decomposeTitleStructure(title, options = {}) {
     seriesPrefix,
     substantiveTail,
     colonRhsWorkCandidate,
+    byAuthorWorkCandidate,
     volumeNumber,
     workIndex: idx,
     segments: cleanedSegments,
@@ -1054,7 +1120,7 @@ export function extractSearchTitleCandidates(title, options = {}) {
     if (!val) return;
     const trimmed = String(val).trim();
     const norm = normalizeString(trimmed);
-    if (!norm || norm.length < 2 || seen.has(norm)) return;
+    if (!norm || seen.has(norm)) return;
     seen.add(norm);
     out.push(trimmed);
   };
@@ -1068,8 +1134,39 @@ export function extractSearchTitleCandidates(title, options = {}) {
     pushCandidate(decomp.colonRhsWorkCandidate);
   }
   pushCandidate(decomp.canonicalTitle);
+  if (decomp.byAuthorWorkCandidate && decomp.canonicalTitle !== decomp.byAuthorWorkCandidate) {
+    pushCandidate(decomp.byAuthorWorkCandidate);
+  }
   if (decomp.rawCore && decomp.canonicalTitle !== decomp.rawCore) {
     pushCandidate(decomp.rawCore);
+  }
+
+  // Peeling comma-separated clauses followed by `by <Author>`
+  const rawByIdx = rawTitle.toLowerCase().lastIndexOf(' by ');
+  if (rawByIdx > 0) {
+    const rawPre = rawTitle.slice(0, rawByIdx).trim();
+    const rawParts = rawPre.split(/\s*,\s*/);
+    if (rawParts.length >= 2) {
+      const lead = stripEditionDescriptors(rawParts[0].trim());
+      if (lead) pushCandidate(lead);
+    }
+  }
+
+  // Volume-name equivalence when series title equals volume 1
+  if (decomp.volumeNumber === 1 && decomp.seriesPrefix) {
+    const strippedSeries = decomp.seriesPrefix.replace(SERIES_DESCRIPTOR_SUFFIX_RE, '').trim();
+    if (strippedSeries) pushCandidate(strippedSeries);
+    pushCandidate(decomp.seriesPrefix);
+  }
+  const rawVol1Match = rawTitle.match(SERIES_WITH_EXPLICIT_VOLUME_SEGMENT_RE);
+  if (rawVol1Match) {
+    const pV = parseVolumeToken(rawVol1Match[2] || rawVol1Match[3] || rawVol1Match[4], Boolean(rawVol1Match[2]));
+    if (pV === 1) {
+      const pPre = rawVol1Match[1].trim();
+      const pStripped = pPre.replace(SERIES_DESCRIPTOR_SUFFIX_RE, '').trim();
+      if (pStripped) pushCandidate(pStripped);
+      pushCandidate(pPre);
+    }
   }
 
   // --- Tier 2: Full Raw Metadata Title ---

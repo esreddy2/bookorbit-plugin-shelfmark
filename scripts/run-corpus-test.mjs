@@ -542,7 +542,7 @@ async function main() {
     },
   };
 
-  const outPath = '/home/dev/tmp/kilo/personal/bookorbit-plugin-shelfmark/work/corpus-test-report.json';
+  const outPath = process.env.REPORT_PATH || '/home/dev/tmp/kilo/personal/bookorbit-plugin-shelfmark/work/corpus-test-report.json';
   writeFileSync(outPath, JSON.stringify(report, null, 2), 'utf8');
   console.log(`\nFull report written to: ${outPath}`);
 }
