@@ -192,20 +192,6 @@ export function getNumericTitleEquivalents(title) {
   return [...out];
 }
 
-// Algorithmic numeric title equivalences: dynamically computes word and digit equivalents
-// for any numeric title (1984, 2001, Catch 22, Fahrenheit 451, etc.) without any hardcoded map.
-export const KNOWN_TITLE_EQUIVALENTS = {
-  get(key) {
-    if (!key) return [];
-    return getNumericTitleEquivalents(key);
-  },
-  has(key) {
-    if (!key) return false;
-    const res = getNumericTitleEquivalents(key);
-    return Boolean(res && res.length > 0);
-  },
-};
-
 export function normalizeString(str) {
   if (str == null) return '';
   return String(str)
@@ -222,6 +208,40 @@ export function normalizeString(str) {
     .replace(/\s+/g, ' ')
     .trim();
 }
+
+const CANONICAL_TITLE_EQUIVALENT_PAIRS = [
+  ['the golden compass', 'northern lights'],
+  ['harry potter and the philosophers stone', 'harry potter and the sorcerers stone'],
+  ['the philosophers stone', 'the sorcerers stone'],
+];
+
+const CANONICAL_TITLE_EQUIVALENTS_MAP = new Map();
+for (const [a, b] of CANONICAL_TITLE_EQUIVALENT_PAIRS) {
+  const normA = normalizeString(a);
+  const normB = normalizeString(b);
+  if (!CANONICAL_TITLE_EQUIVALENTS_MAP.has(normA)) CANONICAL_TITLE_EQUIVALENTS_MAP.set(normA, []);
+  if (!CANONICAL_TITLE_EQUIVALENTS_MAP.get(normA).includes(b)) CANONICAL_TITLE_EQUIVALENTS_MAP.get(normA).push(b);
+  if (!CANONICAL_TITLE_EQUIVALENTS_MAP.has(normB)) CANONICAL_TITLE_EQUIVALENTS_MAP.set(normB, []);
+  if (!CANONICAL_TITLE_EQUIVALENTS_MAP.get(normB).includes(a)) CANONICAL_TITLE_EQUIVALENTS_MAP.get(normB).push(a);
+}
+
+// Algorithmic numeric and canonical title equivalences
+export const KNOWN_TITLE_EQUIVALENTS = {
+  get(key) {
+    if (!key) return [];
+    const norm = normalizeString(key);
+    const canonical = CANONICAL_TITLE_EQUIVALENTS_MAP.get(norm) || [];
+    const num = getNumericTitleEquivalents(key);
+    return Array.from(new Set([...canonical, ...num]));
+  },
+  has(key) {
+    if (!key) return false;
+    const norm = normalizeString(key);
+    if (CANONICAL_TITLE_EQUIVALENTS_MAP.has(norm)) return true;
+    const res = getNumericTitleEquivalents(key);
+    return Boolean(res && res.length > 0);
+  },
+};
 
 export function normalizeLanguageCode(lang) {
   if (!lang) return null;
@@ -655,6 +675,62 @@ function looksLikeAuthorPrefix(seg, optAuthor, s) {
   return false;
 }
 
+export function generateDelimiterSlidingWindows(segments, workIndex = 0) {
+  if (!Array.isArray(segments) || segments.length === 0) return [];
+  const windows = [];
+  const seen = new Set();
+  const pushWin = (str) => {
+    if (!str) return;
+    const trimmed = String(str).trim();
+    const norm = normalizeString(trimmed);
+    if (!norm || norm.length < 2 || seen.has(norm)) return;
+    if (isGenericOrDescriptiveSubtitle(trimmed)) return;
+    if (PURE_VOLUME_SEGMENT_RE.test(trimmed)) return;
+    seen.add(norm);
+    windows.push(trimmed);
+  };
+
+  const len = segments.length;
+  // Strict bounds protection: clamp workIndex within [0, len - 1]
+  const validWorkIdx = Number.isFinite(workIndex)
+    ? Math.max(0, Math.min(len - 1, Math.floor(workIndex)))
+    : 0;
+
+  // 1. One delimiter forward (with bounds precaution & skipping pure volume segments)
+  let fwdIdx = validWorkIdx + 1;
+  while (fwdIdx < len && PURE_VOLUME_SEGMENT_RE.test(segments[fwdIdx])) {
+    fwdIdx++;
+  }
+  if (fwdIdx < len) {
+    pushWin(segments[fwdIdx]);
+  }
+
+  // 2. One delimiter back (with bounds precaution & skipping pure volume segments)
+  let backIdx = validWorkIdx - 1;
+  while (backIdx >= 0 && PURE_VOLUME_SEGMENT_RE.test(segments[backIdx])) {
+    backIdx--;
+  }
+  if (backIdx >= 0) {
+    pushWin(segments[backIdx]);
+  }
+
+  // 3. Sliding window of 2 adjacent segments
+  for (let start = 0; start <= len - 2; start++) {
+    const end = start + 2;
+    if (start >= 0 && end <= len) {
+      const slice = segments.slice(start, end).filter(Boolean);
+      pushWin(slice.join(': '));
+    }
+  }
+
+  // 4. Any remaining individual segments
+  for (let i = 0; i < len; i++) {
+    pushWin(segments[i]);
+  }
+
+  return windows;
+}
+
 export function decomposeTitleStructure(title, options = {}) {
   if (!title) {
     return {
@@ -665,6 +741,11 @@ export function decomposeTitleStructure(title, options = {}) {
       substantiveTail: null,
       colonRhsWorkCandidate: null,
       volumeNumber: extractSeriesVolumeNumber('', options),
+      workIndex: 0,
+      segments: [],
+      forwardSegment: null,
+      backwardSegment: null,
+      slidingWindows: [],
     };
   }
   const rawStr = String(title).trim();
@@ -682,6 +763,11 @@ export function decomposeTitleStructure(title, options = {}) {
       substantiveTail: null,
       colonRhsWorkCandidate: null,
       volumeNumber: null,
+      workIndex: 0,
+      segments: [fastCore],
+      forwardSegment: null,
+      backwardSegment: null,
+      slidingWindows: [fastCore],
     };
   }
 
@@ -740,6 +826,11 @@ export function decomposeTitleStructure(title, options = {}) {
       substantiveTail: null,
       colonRhsWorkCandidate: null,
       volumeNumber,
+      workIndex: 0,
+      segments: [fallback],
+      forwardSegment: null,
+      backwardSegment: null,
+      slidingWindows: [fallback],
     };
   }
 
@@ -915,6 +1006,26 @@ export function decomposeTitleStructure(title, options = {}) {
       canonicalTitle = substantiveTail;
     }
   }
+
+  const slidingWindows = generateDelimiterSlidingWindows(cleanedSegments, idx);
+  let forwardSegment = null;
+  let fwdIdx = idx + 1;
+  while (fwdIdx < cleanedSegments.length && PURE_VOLUME_SEGMENT_RE.test(cleanedSegments[fwdIdx])) {
+    fwdIdx++;
+  }
+  if (fwdIdx < cleanedSegments.length && fwdIdx >= 0) {
+    forwardSegment = cleanedSegments[fwdIdx];
+  }
+
+  let backwardSegment = null;
+  let backIdx = idx - 1;
+  while (backIdx >= 0 && PURE_VOLUME_SEGMENT_RE.test(cleanedSegments[backIdx])) {
+    backIdx--;
+  }
+  if (backIdx >= 0 && backIdx < cleanedSegments.length) {
+    backwardSegment = cleanedSegments[backIdx];
+  }
+
   return {
     canonicalTitle,
     rawCore,
@@ -923,6 +1034,11 @@ export function decomposeTitleStructure(title, options = {}) {
     substantiveTail,
     colonRhsWorkCandidate,
     volumeNumber,
+    workIndex: idx,
+    segments: cleanedSegments,
+    forwardSegment,
+    backwardSegment,
+    slidingWindows,
   };
 }
 
@@ -947,30 +1063,31 @@ export function extractSearchTitleCandidates(title, options = {}) {
   const rawTitle = String(title || '').trim();
   const decomp = decomposeTitleStructure(rawTitle, options);
 
-  // Prioritize specific colon RHS work candidate over generic franchise prefix
-  // (e.g. "Sherlock Holmes: A Study in Scarlet" -> "A Study in Scarlet")
+  // --- Tier 1: Decompression Title (primary candidate) ---
   if (decomp.colonRhsWorkCandidate && decomp.canonicalTitle !== decomp.colonRhsWorkCandidate) {
     pushCandidate(decomp.colonRhsWorkCandidate);
   }
-
-  // 1. Canonical decomposed work title (e.g. "The Last Olympian", "The Chalice of the Gods", "Harry Potter and the Chamber of Secrets", "Guards! Guards!")
   pushCandidate(decomp.canonicalTitle);
-
-  // Raw core if distinct
   if (decomp.rawCore && decomp.canonicalTitle !== decomp.rawCore) {
     pushCandidate(decomp.rawCore);
   }
 
-  // Substantive tail if distinct
-  if (decomp.substantiveTail && decomp.canonicalTitle !== decomp.substantiveTail) {
-    pushCandidate(decomp.substantiveTail);
-  }
-
-  // 2. Edition-stripped & bracket-stripped full string if distinct (e.g. strips "(Enhanced Edition)" or "(From the World of ...)")
+  // --- Tier 2: Full Raw Metadata Title ---
   let strippedFull = stripBracketedGroups(rawTitle, '[', ']');
   strippedFull = stripBracketedGroups(strippedFull, '(', ')').trim();
   strippedFull = stripEditionDescriptors(strippedFull);
   pushCandidate(strippedFull);
+  pushCandidate(rawTitle);
+
+  // --- Tier 3: Decomp with Different Section (sliding window / forward / back) ---
+  if (Array.isArray(decomp.slidingWindows)) {
+    for (const win of decomp.slidingWindows) {
+      pushCandidate(win);
+    }
+  }
+  if (decomp.substantiveTail && decomp.canonicalTitle !== decomp.substantiveTail) {
+    pushCandidate(decomp.substantiveTail);
+  }
 
   // Extract substantive non-edition parenthetical text (e.g. "The Stranger (L'Etranger)")
   const parenMatch = rawTitle.match(/\(([^)]+)\)/);
@@ -984,18 +1101,13 @@ export function extractSearchTitleCandidates(title, options = {}) {
     }
   }
 
-  // 3. Secondary colon RHS work title for unnumbered "Series Name: Work Title"
-  if (decomp.colonRhsWorkCandidate) {
-    pushCandidate(decomp.colonRhsWorkCandidate);
-  }
-
-  // 4. Structured subtitle if provided separately by BookOrbit and substantive
+  // Structured subtitle if provided separately by BookOrbit and substantive
   if (options?.subtitle && !isGenericOrDescriptiveSubtitle(options.subtitle)) {
     const cleanSub = stripEditionDescriptors(options.subtitle);
     if (getTokens(cleanSub).length >= 2) pushCandidate(cleanSub);
   }
 
-  // 5. Known numeric/word title equivalents and work-level translations
+  // Known numeric/word title equivalents and work-level translations
   for (const existing of [...out, rawTitle]) {
     const eqs = KNOWN_TITLE_EQUIVALENTS.get(normalizeString(existing));
     if (eqs) {

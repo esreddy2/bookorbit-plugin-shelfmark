@@ -351,34 +351,6 @@ export default {
         .slice(0, maxResults);
     };
 
-    // Step 1: Query Shelfmark metadata search
-    let books = [];
-    let providerError = null;
-
-    const metadataUrl = new URL(`${baseUrl}/api/metadata/search`);
-    metadataUrl.searchParams.set('query', metadataQuery);
-    metadataUrl.searchParams.set('content_type', 'ebook');
-    metadataUrl.searchParams.set('limit', '25');
-
-    try {
-      const metaRes = await safeHostFetch(host, metadataUrl.href, { headers }, signal);
-      if (metaRes.ok) {
-        const metaData = await metaRes.json().catch(() => ({ books: [] }));
-        books = Array.isArray(metaData.books) ? metaData.books : (Array.isArray(metaData.items) ? metaData.items : (Array.isArray(metaData.results) ? metaData.results : []));
-      } else if (metaRes.status === 401 || metaRes.status === 403) {
-        throw host.fail('error', 'Shelfmark rejected authentication. Verify API key.');
-      } else {
-        providerError = `Metadata search returned HTTP ${metaRes.status}`;
-      }
-    } catch (err) {
-      if (signal?.aborted) {
-        if (releases.length > 0) return rankAndSlice();
-        throw classifyAbort(signal, host, 'Search was cancelled.');
-      }
-      if (err && err.code) throw err;
-      providerError = (err && err.message) ? err.message : String(err ?? 'unknown error');
-    }
-
     const extractBookSeriesHint = (b) => {
       if (b?.series || b?.series_name || b?.seriesName) return String(b.series || b.series_name || b.seriesName).trim();
       if (Array.isArray(b?.genres)) {
@@ -405,66 +377,121 @@ export default {
       return isAuthorMatch(authorsList, searchAuthor);
     };
 
-    // Step 1 Fallback A: Canonical decomposed work titles, edition-stripped titles, and known title equivalents
     const hasValidCandidates = (bs) => Array.isArray(bs) && bs.some(isBookCandidateValid);
-    if (searchTitle && (!books.length || !hasValidCandidates(books))) {
-      const queriedMetaNorms = new Set([normalizeString(metadataQuery)]);
-      const rawCandidates = extractSearchTitleCandidates(searchTitle, decompOpts);
-      const fallbackMetaQueries = [];
-      for (const cand of rawCandidates) {
-        fallbackMetaQueries.push(cand);
-        if (searchAuthor) {
-          const natAuthor = toNaturalAuthor(searchAuthor);
-          fallbackMetaQueries.push(`${cand} ${natAuthor}`);
-        }
+
+    // Step 1: Query Shelfmark metadata search
+    // Providers to query: iterate through configured providers, or use default provider
+    const metadataProviders = (Array.isArray(config.settings?.providers) && config.settings.providers.length > 0)
+      ? config.settings.providers
+      : (config.settings?.provider ? [config.settings.provider] : (config.settings?.metadataProvider ? [config.settings.metadataProvider] : [null]));
+
+    // Query sequence:
+    // 1. First query the decompression title iterating through all providers
+    // 2. Then try the full raw metadata title iterating through all providers
+    // 3. Then decomp with a different section (forward/back delimiter sliding window) iterating through all providers
+    // 4. Then ISBN search if available
+    const decomp = searchTitle ? decomposeTitleStructure(searchTitle, decompOpts) : null;
+    const decompTitle = decomp?.colonRhsWorkCandidate || decomp?.canonicalTitle || (searchTitle ? extractCoreTitle(searchTitle, decompOpts) : '');
+    const natAuthor = searchAuthor ? toNaturalAuthor(searchAuthor) : '';
+
+    const tier1Queries = []; // Decompression title
+    const tier2Queries = []; // Full raw metadata title
+    const tier3Queries = []; // Different sections / sliding windows
+    const tier4Queries = []; // ISBN
+
+    // 1. Decompression title: title-only first (matches Shelfmark conventions), then with author
+    if (decompTitle) {
+      tier1Queries.push(decompTitle);
+      if (natAuthor) tier1Queries.push(`${decompTitle} ${natAuthor}`);
+    }
+
+    // 2. Full raw metadata title: if distinct from decomp title
+    if (searchTitle && normalizeString(searchTitle) !== normalizeString(decompTitle)) {
+      tier2Queries.push(searchTitle);
+      if (natAuthor) tier2Queries.push(`${searchTitle} ${natAuthor}`);
+    }
+
+    // 3. Decomp with a different section: delimiter sliding windows (forward/back) and equivalents
+    if (decomp?.slidingWindows) {
+      for (const win of decomp.slidingWindows) {
+        tier3Queries.push(win);
+        if (natAuthor) tier3Queries.push(`${win} ${natAuthor}`);
       }
-      if (searchAuthor) {
-        const natAuthor = toNaturalAuthor(searchAuthor);
-        fallbackMetaQueries.push(`${searchTitle} ${natAuthor}`);
-      }
-      for (const altQuery of fallbackMetaQueries) {
-        if (signal?.aborted || Date.now() - searchStartTime >= SEARCH_BUDGET_MS) break;
-        const normAlt = normalizeString(altQuery);
-        if (!normAlt || queriedMetaNorms.has(normAlt)) continue;
-        queriedMetaNorms.add(normAlt);
-        const altMetaUrl = new URL(`${baseUrl}/api/metadata/search`);
-        altMetaUrl.searchParams.set('query', altQuery);
-        altMetaUrl.searchParams.set('content_type', 'ebook');
-        altMetaUrl.searchParams.set('limit', '25');
-        try {
-          const altRes = await safeHostFetch(host, altMetaUrl.href, { headers }, signal);
-          if (altRes.ok) {
-            const altData = await altRes.json().catch(() => ({ books: [] }));
-            const altBooks = Array.isArray(altData.books) ? altData.books : (Array.isArray(altData.items) ? altData.items : (Array.isArray(altData.results) ? altData.results : []));
-            if (altBooks.length > 0) {
-              books = [...books, ...altBooks];
-              if (hasValidCandidates(books)) {
-                break;
-              }
-            }
-          }
-        } catch (_) {
-          // Continue fallback
-        }
+    }
+    if (searchTitle) {
+      const extraCands = extractSearchTitleCandidates(searchTitle, decompOpts);
+      for (const ec of extraCands) {
+        tier3Queries.push(ec);
+        if (natAuthor) tier3Queries.push(`${ec} ${natAuthor}`);
       }
     }
 
-    // Step 1 Fallback B: ISBN search when title search returned empty
-    if (searchIsbn && searchIsbn !== metadataQuery && (!books.length || !hasValidCandidates(books))) {
-      const isbnMetaUrl = new URL(`${baseUrl}/api/metadata/search`);
-      isbnMetaUrl.searchParams.set('query', searchIsbn);
-      isbnMetaUrl.searchParams.set('content_type', 'ebook');
-      isbnMetaUrl.searchParams.set('limit', '10');
-      try {
-        const isbnRes = await safeHostFetch(host, isbnMetaUrl.href, { headers }, signal);
-        if (isbnRes.ok) {
-          const isbnData = await isbnRes.json().catch(() => ({ books: [] }));
-          if (Array.isArray(isbnData.books) && isbnData.books.length > 0) {
-            books = [...books, ...isbnData.books];
+    // 4. ISBN fallback
+    if (searchIsbn) {
+      tier4Queries.push(searchIsbn);
+    }
+
+    const queryTiers = [
+      { name: 'decompression', queries: tier1Queries },
+      { name: 'raw_title', queries: tier2Queries },
+      { name: 'sections', queries: tier3Queries },
+      { name: 'isbn', queries: tier4Queries },
+    ];
+
+    let books = [];
+    let providerError = null;
+    const queriedMetaKeys = new Set();
+
+    queryLoop:
+    for (const tier of queryTiers) {
+      if (signal?.aborted || Date.now() - searchStartTime >= SEARCH_BUDGET_MS) break;
+
+      for (const q of tier.queries) {
+        if (signal?.aborted || Date.now() - searchStartTime >= SEARCH_BUDGET_MS) break;
+        const normQ = normalizeString(q);
+        if (!normQ) continue;
+
+        for (const prov of metadataProviders) {
+          if (signal?.aborted || Date.now() - searchStartTime >= SEARCH_BUDGET_MS) break;
+          const dedupKey = `${prov || 'default'}:${normQ}`;
+          if (queriedMetaKeys.has(dedupKey)) continue;
+          queriedMetaKeys.add(dedupKey);
+
+          const metaUrl = new URL(`${baseUrl}/api/metadata/search`);
+          metaUrl.searchParams.set('query', q);
+          metaUrl.searchParams.set('content_type', 'ebook');
+          metaUrl.searchParams.set('limit', '25');
+          if (prov) {
+            metaUrl.searchParams.set('provider', prov);
+          }
+
+          try {
+            const metaRes = await safeHostFetch(host, metaUrl.href, { headers }, signal);
+            if (metaRes.ok) {
+              const metaData = await metaRes.json().catch(() => ({ books: [] }));
+              const newBooks = Array.isArray(metaData.books) ? metaData.books : (Array.isArray(metaData.items) ? metaData.items : (Array.isArray(metaData.results) ? metaData.results : []));
+              if (newBooks.length > 0) {
+                books = [...books, ...newBooks];
+              }
+            } else if (metaRes.status === 401 || metaRes.status === 403) {
+              throw host.fail('error', 'Shelfmark rejected authentication. Verify API key.');
+            } else {
+              providerError = `Metadata search returned HTTP ${metaRes.status}`;
+            }
+          } catch (err) {
+            if (signal?.aborted) {
+              if (releases.length > 0) return rankAndSlice();
+              throw classifyAbort(signal, host, 'Search was cancelled.');
+            }
+            if (err && err.code) throw err;
+            providerError = (err && err.message) ? err.message : String(err ?? 'unknown error');
           }
         }
-      } catch (_) {
-        // Continue fallback
+
+        // Iterate through all providers for this query before checking candidate sufficiency
+        if (hasValidCandidates(books)) {
+          break queryLoop;
+        }
       }
     }
 
@@ -485,8 +512,19 @@ export default {
       // Sort valid books by match quality: prioritize best metadata match
       validBooks.sort((a, b) => scoreBookMatch(b, searchTitle, searchAuthor) - scoreBookMatch(a, searchTitle, searchAuthor));
 
+      // Derive dynamic book search count based on title complexity, delimiters, and match quality.
+      const delimiterCount = (searchTitle.match(/(?:\s+[-–—]\s+|[:;|]|\s*[–—]\s*)/g) || []).length;
+      const isLongTitle = searchTitle.length > 35;
+      const topScore = validBooks.length > 0 ? scoreBookMatch(validBooks[0], searchTitle, searchAuthor) : 0;
+      let bookSearchQuota = 3;
+      if (delimiterCount >= 1) bookSearchQuota += Math.min(delimiterCount, 2);
+      if (isLongTitle) bookSearchQuota += 1;
+      if (topScore < 100) bookSearchQuota += 1;
+      const MAX_SEARCH_COUNT = 6;
+      const maxBooksToSearch = Math.min(MAX_SEARCH_COUNT, Math.max(3, bookSearchQuota));
+
       // Loop through top books (prioritizing the best match), breaking early as soon as sufficient results found
-      for (const book of validBooks.slice(0, 3)) {
+      for (const book of validBooks.slice(0, maxBooksToSearch)) {
         if (hasSufficientResults()) break;
         if (signal?.aborted || Date.now() - searchStartTime >= SEARCH_BUDGET_MS) break;
 
@@ -517,7 +555,8 @@ export default {
           addTitleQuery(eq);
         }
 
-        for (const queryTitle of titlesToQuery) {
+        const maxTitlesPerBook = Math.min(6, Math.max(3, 3 + (delimiterCount >= 1 ? 1 : 0) + (isLongTitle ? 1 : 0)));
+        for (const queryTitle of titlesToQuery.slice(0, maxTitlesPerBook)) {
           if (hasSufficientResults()) break;
           if (signal?.aborted || Date.now() - searchStartTime >= SEARCH_BUDGET_MS) break;
 
@@ -1553,20 +1592,6 @@ function getNumericTitleEquivalents(title) {
   return [...out];
 }
 
-// Algorithmic numeric title equivalences: dynamically computes word and digit equivalents
-// for any numeric title (1984, 2001, Catch 22, Fahrenheit 451, etc.) without any hardcoded map.
-const KNOWN_TITLE_EQUIVALENTS = {
-  get(key) {
-    if (!key) return [];
-    return getNumericTitleEquivalents(key);
-  },
-  has(key) {
-    if (!key) return false;
-    const res = getNumericTitleEquivalents(key);
-    return Boolean(res && res.length > 0);
-  },
-};
-
 function normalizeString(str) {
   if (str == null) return '';
   return String(str)
@@ -1583,6 +1608,40 @@ function normalizeString(str) {
     .replace(/\s+/g, ' ')
     .trim();
 }
+
+const CANONICAL_TITLE_EQUIVALENT_PAIRS = [
+  ['the golden compass', 'northern lights'],
+  ['harry potter and the philosophers stone', 'harry potter and the sorcerers stone'],
+  ['the philosophers stone', 'the sorcerers stone'],
+];
+
+const CANONICAL_TITLE_EQUIVALENTS_MAP = new Map();
+for (const [a, b] of CANONICAL_TITLE_EQUIVALENT_PAIRS) {
+  const normA = normalizeString(a);
+  const normB = normalizeString(b);
+  if (!CANONICAL_TITLE_EQUIVALENTS_MAP.has(normA)) CANONICAL_TITLE_EQUIVALENTS_MAP.set(normA, []);
+  if (!CANONICAL_TITLE_EQUIVALENTS_MAP.get(normA).includes(b)) CANONICAL_TITLE_EQUIVALENTS_MAP.get(normA).push(b);
+  if (!CANONICAL_TITLE_EQUIVALENTS_MAP.has(normB)) CANONICAL_TITLE_EQUIVALENTS_MAP.set(normB, []);
+  if (!CANONICAL_TITLE_EQUIVALENTS_MAP.get(normB).includes(a)) CANONICAL_TITLE_EQUIVALENTS_MAP.get(normB).push(a);
+}
+
+// Algorithmic numeric and canonical title equivalences
+const KNOWN_TITLE_EQUIVALENTS = {
+  get(key) {
+    if (!key) return [];
+    const norm = normalizeString(key);
+    const canonical = CANONICAL_TITLE_EQUIVALENTS_MAP.get(norm) || [];
+    const num = getNumericTitleEquivalents(key);
+    return Array.from(new Set([...canonical, ...num]));
+  },
+  has(key) {
+    if (!key) return false;
+    const norm = normalizeString(key);
+    if (CANONICAL_TITLE_EQUIVALENTS_MAP.has(norm)) return true;
+    const res = getNumericTitleEquivalents(key);
+    return Boolean(res && res.length > 0);
+  },
+};
 
 function normalizeLanguageCode(lang) {
   if (!lang) return null;
@@ -2016,6 +2075,62 @@ function looksLikeAuthorPrefix(seg, optAuthor, s) {
   return false;
 }
 
+function generateDelimiterSlidingWindows(segments, workIndex = 0) {
+  if (!Array.isArray(segments) || segments.length === 0) return [];
+  const windows = [];
+  const seen = new Set();
+  const pushWin = (str) => {
+    if (!str) return;
+    const trimmed = String(str).trim();
+    const norm = normalizeString(trimmed);
+    if (!norm || norm.length < 2 || seen.has(norm)) return;
+    if (isGenericOrDescriptiveSubtitle(trimmed)) return;
+    if (PURE_VOLUME_SEGMENT_RE.test(trimmed)) return;
+    seen.add(norm);
+    windows.push(trimmed);
+  };
+
+  const len = segments.length;
+  // Strict bounds protection: clamp workIndex within [0, len - 1]
+  const validWorkIdx = Number.isFinite(workIndex)
+    ? Math.max(0, Math.min(len - 1, Math.floor(workIndex)))
+    : 0;
+
+  // 1. One delimiter forward (with bounds precaution & skipping pure volume segments)
+  let fwdIdx = validWorkIdx + 1;
+  while (fwdIdx < len && PURE_VOLUME_SEGMENT_RE.test(segments[fwdIdx])) {
+    fwdIdx++;
+  }
+  if (fwdIdx < len) {
+    pushWin(segments[fwdIdx]);
+  }
+
+  // 2. One delimiter back (with bounds precaution & skipping pure volume segments)
+  let backIdx = validWorkIdx - 1;
+  while (backIdx >= 0 && PURE_VOLUME_SEGMENT_RE.test(segments[backIdx])) {
+    backIdx--;
+  }
+  if (backIdx >= 0) {
+    pushWin(segments[backIdx]);
+  }
+
+  // 3. Sliding window of 2 adjacent segments
+  for (let start = 0; start <= len - 2; start++) {
+    const end = start + 2;
+    if (start >= 0 && end <= len) {
+      const slice = segments.slice(start, end).filter(Boolean);
+      pushWin(slice.join(': '));
+    }
+  }
+
+  // 4. Any remaining individual segments
+  for (let i = 0; i < len; i++) {
+    pushWin(segments[i]);
+  }
+
+  return windows;
+}
+
 function decomposeTitleStructure(title, options = {}) {
   if (!title) {
     return {
@@ -2026,6 +2141,11 @@ function decomposeTitleStructure(title, options = {}) {
       substantiveTail: null,
       colonRhsWorkCandidate: null,
       volumeNumber: extractSeriesVolumeNumber('', options),
+      workIndex: 0,
+      segments: [],
+      forwardSegment: null,
+      backwardSegment: null,
+      slidingWindows: [],
     };
   }
   const rawStr = String(title).trim();
@@ -2043,6 +2163,11 @@ function decomposeTitleStructure(title, options = {}) {
       substantiveTail: null,
       colonRhsWorkCandidate: null,
       volumeNumber: null,
+      workIndex: 0,
+      segments: [fastCore],
+      forwardSegment: null,
+      backwardSegment: null,
+      slidingWindows: [fastCore],
     };
   }
 
@@ -2101,6 +2226,11 @@ function decomposeTitleStructure(title, options = {}) {
       substantiveTail: null,
       colonRhsWorkCandidate: null,
       volumeNumber,
+      workIndex: 0,
+      segments: [fallback],
+      forwardSegment: null,
+      backwardSegment: null,
+      slidingWindows: [fallback],
     };
   }
 
@@ -2276,6 +2406,26 @@ function decomposeTitleStructure(title, options = {}) {
       canonicalTitle = substantiveTail;
     }
   }
+
+  const slidingWindows = generateDelimiterSlidingWindows(cleanedSegments, idx);
+  let forwardSegment = null;
+  let fwdIdx = idx + 1;
+  while (fwdIdx < cleanedSegments.length && PURE_VOLUME_SEGMENT_RE.test(cleanedSegments[fwdIdx])) {
+    fwdIdx++;
+  }
+  if (fwdIdx < cleanedSegments.length && fwdIdx >= 0) {
+    forwardSegment = cleanedSegments[fwdIdx];
+  }
+
+  let backwardSegment = null;
+  let backIdx = idx - 1;
+  while (backIdx >= 0 && PURE_VOLUME_SEGMENT_RE.test(cleanedSegments[backIdx])) {
+    backIdx--;
+  }
+  if (backIdx >= 0 && backIdx < cleanedSegments.length) {
+    backwardSegment = cleanedSegments[backIdx];
+  }
+
   return {
     canonicalTitle,
     rawCore,
@@ -2284,6 +2434,11 @@ function decomposeTitleStructure(title, options = {}) {
     substantiveTail,
     colonRhsWorkCandidate,
     volumeNumber,
+    workIndex: idx,
+    segments: cleanedSegments,
+    forwardSegment,
+    backwardSegment,
+    slidingWindows,
   };
 }
 
@@ -2308,30 +2463,31 @@ function extractSearchTitleCandidates(title, options = {}) {
   const rawTitle = String(title || '').trim();
   const decomp = decomposeTitleStructure(rawTitle, options);
 
-  // Prioritize specific colon RHS work candidate over generic franchise prefix
-  // (e.g. "Sherlock Holmes: A Study in Scarlet" -> "A Study in Scarlet")
+  // --- Tier 1: Decompression Title (primary candidate) ---
   if (decomp.colonRhsWorkCandidate && decomp.canonicalTitle !== decomp.colonRhsWorkCandidate) {
     pushCandidate(decomp.colonRhsWorkCandidate);
   }
-
-  // 1. Canonical decomposed work title (e.g. "The Last Olympian", "The Chalice of the Gods", "Harry Potter and the Chamber of Secrets", "Guards! Guards!")
   pushCandidate(decomp.canonicalTitle);
-
-  // Raw core if distinct
   if (decomp.rawCore && decomp.canonicalTitle !== decomp.rawCore) {
     pushCandidate(decomp.rawCore);
   }
 
-  // Substantive tail if distinct
-  if (decomp.substantiveTail && decomp.canonicalTitle !== decomp.substantiveTail) {
-    pushCandidate(decomp.substantiveTail);
-  }
-
-  // 2. Edition-stripped & bracket-stripped full string if distinct (e.g. strips "(Enhanced Edition)" or "(From the World of ...)")
+  // --- Tier 2: Full Raw Metadata Title ---
   let strippedFull = stripBracketedGroups(rawTitle, '[', ']');
   strippedFull = stripBracketedGroups(strippedFull, '(', ')').trim();
   strippedFull = stripEditionDescriptors(strippedFull);
   pushCandidate(strippedFull);
+  pushCandidate(rawTitle);
+
+  // --- Tier 3: Decomp with Different Section (sliding window / forward / back) ---
+  if (Array.isArray(decomp.slidingWindows)) {
+    for (const win of decomp.slidingWindows) {
+      pushCandidate(win);
+    }
+  }
+  if (decomp.substantiveTail && decomp.canonicalTitle !== decomp.substantiveTail) {
+    pushCandidate(decomp.substantiveTail);
+  }
 
   // Extract substantive non-edition parenthetical text (e.g. "The Stranger (L'Etranger)")
   const parenMatch = rawTitle.match(/\(([^)]+)\)/);
@@ -2345,18 +2501,13 @@ function extractSearchTitleCandidates(title, options = {}) {
     }
   }
 
-  // 3. Secondary colon RHS work title for unnumbered "Series Name: Work Title"
-  if (decomp.colonRhsWorkCandidate) {
-    pushCandidate(decomp.colonRhsWorkCandidate);
-  }
-
-  // 4. Structured subtitle if provided separately by BookOrbit and substantive
+  // Structured subtitle if provided separately by BookOrbit and substantive
   if (options?.subtitle && !isGenericOrDescriptiveSubtitle(options.subtitle)) {
     const cleanSub = stripEditionDescriptors(options.subtitle);
     if (getTokens(cleanSub).length >= 2) pushCandidate(cleanSub);
   }
 
-  // 5. Known numeric/word title equivalents and work-level translations
+  // Known numeric/word title equivalents and work-level translations
   for (const existing of [...out, rawTitle]) {
     const eqs = KNOWN_TITLE_EQUIVALENTS.get(normalizeString(existing));
     if (eqs) {

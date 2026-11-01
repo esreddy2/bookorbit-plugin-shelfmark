@@ -5945,6 +5945,7 @@ export {
   extractSearchTitleCandidates,
   extractSeriesVolumeNumber,
   decomposeTitleStructure,
+  generateDelimiterSlidingWindows,
   stripEditionDescriptors,
   hasMultiVolumeIndicator,
   hasCompilationIndicator,

@@ -77,6 +77,7 @@ import {
   hasCompilationIndicator,
   extractSearchTitleCandidates,
   decomposeTitleStructure,
+  generateDelimiterSlidingWindows,
 } from './bridge/bridge.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -4750,6 +4751,94 @@ test('DIAGNOSTICS: retains associated task information after verification failur
   assert.equal(diag.task.id, taskId);
   assert.equal(diag.task.title, 'Camp Half-Blood');
   assert.deepEqual(diag.verificationConflicts, ['incompatible_title']);
+});
+
+test('SLIDING WINDOW DECOMPOSITION: generateDelimiterSlidingWindows safely extracts forward/back sections without out-of-bounds', async () => {
+  // Empty inputs must never throw
+  assert.deepEqual(generateDelimiterSlidingWindows([]), []);
+  assert.deepEqual(generateDelimiterSlidingWindows(null), []);
+
+  // Single segment has no forward or backward delimiters
+  const single = generateDelimiterSlidingWindows(['Dune'], 0);
+  assert.deepEqual(single, ['Dune']);
+
+  // Multi-segment with workIndex in the middle (index 1)
+  const segments = ['Star Wars', 'The High Republic', 'Light of the Jedi'];
+  const windowsMid = generateDelimiterSlidingWindows(segments, 1);
+  // Forward segment (index 2: "Light of the Jedi")
+  assert.ok(windowsMid.includes('Light of the Jedi'));
+  // Backward segment (index 0: "Star Wars")
+  assert.ok(windowsMid.includes('Star Wars'));
+  // 2-segment windows
+  assert.ok(windowsMid.includes('Star Wars: The High Republic'));
+  assert.ok(windowsMid.includes('The High Republic: Light of the Jedi'));
+
+  // Out-of-bounds workIndex precautions
+  const windowsUnder = generateDelimiterSlidingWindows(segments, -5);
+  assert.ok(windowsUnder.length > 0);
+  const windowsOver = generateDelimiterSlidingWindows(segments, 99);
+  assert.ok(windowsOver.length > 0);
+
+  // DecomposeTitleStructure provides sliding windows and forward/backward segments
+  const decomp = decomposeTitleStructure('Percy Jackson and the Olympians, Book One: The Lightning Thief');
+  assert.equal(decomp.canonicalTitle, 'The Lightning Thief');
+  assert.ok(Array.isArray(decomp.slidingWindows));
+  assert.ok(decomp.slidingWindows.length > 0);
+});
+
+test('TIERED METADATA SEARCH: plugin.search queries decompression title first, then full raw metadata title, then sliding window sections', async () => {
+  const queriedQueries = [];
+  const fake = apiScenarios({
+    'sm.metadata': ({ query }) => {
+      const q = query.get('query');
+      queriedQueries.push(q);
+      // Only match on sliding window section to verify tier progression
+      if (q === 'The High Republic') {
+        return response({
+          books: [metadata('The High Republic', 'Charles Soule', { provider_id: 'thr-1' })],
+        });
+      }
+      return response({ books: [] });
+    },
+    'sm.releases': () => {
+      return response({
+        releases: [release('The High Republic', 'Charles Soule', {
+          source: 'oceanofpdf',
+          source_id: 'thr-epub-1',
+          format: 'epub',
+        })],
+      });
+    },
+  });
+
+  const fullTitle = 'Star Wars: The High Republic: Light of the Jedi';
+  await plugin.search({
+    title: fullTitle,
+    author: 'Charles Soule',
+  }, config(), hostWith(fake.fetch));
+
+  // Tier 1 (decompression title: "Light of the Jedi") must precede Tier 2 (full raw title: "Star Wars: The High Republic: Light of the Jedi")
+  const idxDecomp = queriedQueries.findIndex((q) => q.includes('Light of the Jedi'));
+  const idxRaw = queriedQueries.findIndex((q) => q === fullTitle || q.startsWith(fullTitle));
+  const idxSection = queriedQueries.findIndex((q) => q === 'The High Republic');
+
+  assert.ok(idxDecomp !== -1, 'decompression title was queried');
+  assert.ok(idxRaw !== -1, 'full raw metadata title was queried');
+  assert.ok(idxSection !== -1, 'sliding window section was queried');
+  assert.ok(idxDecomp < idxRaw, `decompression title (${idxDecomp}) queried before raw title (${idxRaw})`);
+  assert.ok(idxRaw < idxSection, `raw title (${idxRaw}) queried before section (${idxSection})`);
+});
+
+test('CANONICAL TITLE EQUIVALENTS: KNOWN_TITLE_EQUIVALENTS resolves canonical work title equivalents bidirectionally without confusing translations', async () => {
+  const compass = KNOWN_TITLE_EQUIVALENTS.get('the golden compass');
+  assert.ok(compass.includes('northern lights'), 'The Golden Compass to Northern Lights');
+
+  const philStone = KNOWN_TITLE_EQUIVALENTS.get('the philosophers stone');
+  assert.ok(philStone.includes('the sorcerers stone'), 'Philosophers Stone to Sorcerers Stone');
+
+  // Adherence to AGENTS.md Section 5: "Do not confuse canonical title equivalents with translated editions."
+  const threeMusketeers = KNOWN_TITLE_EQUIVALENTS.get('les trois mousquetaires');
+  assert.ok(!threeMusketeers.includes('the three musketeers'), 'Translated foreign editions are not canonical title equivalents');
 });
 
 

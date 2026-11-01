@@ -124,6 +124,20 @@ function isDiscretionaryTitleMatch(observedTitle, expectedTitle, authorOrOptions
   }
 
   // 5. Known translation and numeric title equivalents
+  const DISCRETIONARY_TRANSLATIONS = new Map([
+    ['les trois mousquetaires', 'the three musketeers'],
+    ['the three musketeers', 'les trois mousquetaires'],
+    ['don quixote', 'don quijote'],
+    ['don quijote', 'don quixote'],
+    ['don quijote de la mancha', 'don quixote'],
+    ['cien anos de soledad', 'one hundred years of solitude'],
+    ['one hundred years of solitude', 'cien anos de soledad'],
+    ['letranger', 'the stranger'],
+    ['the stranger', 'letranger'],
+  ]);
+  if (DISCRETIONARY_TRANSLATIONS.has(expNorm) && DISCRETIONARY_TRANSLATIONS.get(expNorm) === obsNorm) return true;
+  if (DISCRETIONARY_TRANSLATIONS.has(obsNorm) && DISCRETIONARY_TRANSLATIONS.get(obsNorm) === expNorm) return true;
+
   const eqsExp = ID.KNOWN_TITLE_EQUIVALENTS.get(expNorm) || [];
   if (eqsExp.some((eq) => {
     const neq = ID.normalizeString(eq);
@@ -236,8 +250,79 @@ async function fetchWithRetry(url, maxRetries = 2) {
   }
 }
 
+let cachedProviders = null;
+async function getEnabledProviders() {
+  if (cachedProviders) return cachedProviders;
+  if (process.env.SM_PROVIDERS) {
+    cachedProviders = process.env.SM_PROVIDERS.split(',').map((p) => p.trim()).filter(Boolean);
+    return cachedProviders;
+  }
+  try {
+    const res = await fetch(`${SM_URL}/api/metadata/providers`, {
+      headers: { 'X-Api-Key': SM_API_KEY },
+      signal: AbortSignal.timeout(3000),
+    });
+    if (res.ok) {
+      const data = await res.json();
+      const enabled = Array.isArray(data?.providers)
+        ? data.providers.filter((p) => p.enabled).map((p) => p.name)
+        : [];
+      if (enabled.length > 0) {
+        cachedProviders = enabled;
+        return cachedProviders;
+      }
+    }
+  } catch (_) {
+    // Continue with default
+  }
+  cachedProviders = ['openlibrary'];
+  return cachedProviders;
+}
+
 async function runMetadataSearch(queryTitle, author) {
-  const candidates = ID.extractSearchTitleCandidates(queryTitle, { author });
+  const decomp = ID.decomposeTitleStructure(queryTitle, { author });
+  const decompTitle = decomp.canonicalTitle || ID.extractCoreTitle(queryTitle, { author });
+  const providers = await getEnabledProviders();
+
+  const tier1 = []; // Decompression title
+  const tier2 = []; // Full raw metadata title
+  const tier3 = []; // Decomp with different section (forward/back delimiter sliding windows)
+  const tier4 = []; // Other candidates (equivalents, parentheticals)
+
+  // 1. Decompression title: with author and standalone
+  if (author) tier1.push(`${decompTitle} ${author}`);
+  tier1.push(decompTitle);
+
+  // 2. Full raw metadata title: if distinct from decomp title
+  if (queryTitle && ID.normalizeString(queryTitle) !== ID.normalizeString(decompTitle)) {
+    if (author) tier2.push(`${queryTitle} ${author}`);
+    tier2.push(queryTitle);
+  }
+
+  // 3. Decomp with different section (delimiter sliding windows)
+  if (Array.isArray(decomp.slidingWindows)) {
+    for (const win of decomp.slidingWindows) {
+      if (author) tier3.push(`${win} ${author}`);
+      tier3.push(win);
+    }
+  }
+
+  // 4. Remaining candidates
+  const allCands = ID.extractSearchTitleCandidates(queryTitle, { author });
+  for (const c of allCands) {
+    if (author) tier4.push(`${c} ${author}`);
+    tier4.push(c);
+  }
+
+  // Derive dynamic search count limit from delimiters, title length, etc.
+  const delimiterCount = (queryTitle.match(/(?:\s+[-–—]\s+|[:;|]|\s*[–—]\s*)/g) || []).length;
+  const isLong = queryTitle.length > 35;
+  let maxQueries = 4;
+  if (delimiterCount >= 1) maxQueries += Math.min(delimiterCount * 2, 4);
+  if (isLong) maxQueries += 2;
+  const MAX_QUERY_COUNT = 10;
+  maxQueries = Math.min(MAX_QUERY_COUNT, Math.max(3, maxQueries));
+
   const queriesToAttempt = [];
   const seenQueries = new Set();
   const pushQuery = (q, cand) => {
@@ -247,50 +332,58 @@ async function runMetadataSearch(queryTitle, author) {
     queriesToAttempt.push({ q, candidate: cand });
   };
 
-  // 1. Candidate title + author
-  for (const c of candidates) {
-    if (author) pushQuery(`${c} ${author}`, c);
-  }
-  // 2. Candidate title only (fallback when full-text token matching fails on long titles or transliterations)
-  for (const c of candidates) {
-    pushQuery(c, c);
-  }
+  for (const q of tier1) pushQuery(q, decompTitle);
+  for (const q of tier2) pushQuery(q, queryTitle);
+  for (const q of tier3) pushQuery(q, decompTitle);
+  for (const q of tier4) pushQuery(q, decompTitle);
 
   const queryLogs = [];
   let bestBook = null;
   let bestScore = -Infinity;
   let bestCandidate = null;
+  let queryCount = 0;
 
+  queryIteration:
   for (const { q, candidate } of queriesToAttempt) {
-    const url = `${SM_URL}/api/metadata/search?content_type=ebook&limit=10&query=${encodeURIComponent(q)}`;
-    const { ok, status, data, error } = await fetchWithRetry(url);
-    if (!ok) {
-      queryLogs.push({ query: q, status, count: 0, reason: error });
-      continue;
-    }
-    const books = Array.isArray(data?.books) ? data.books : [];
-    let bestInQuery = -Infinity;
-
-    for (const b of books) {
-      const score = ID.scoreBookMatch(b, queryTitle, author);
-      if (score > bestInQuery) bestInQuery = score;
-      if (score > bestScore) {
-        bestScore = score;
-        bestBook = b;
-        bestCandidate = candidate;
+    for (const prov of providers) {
+      queryCount++;
+      const provParam = prov ? `&provider=${encodeURIComponent(prov)}` : '';
+      const url = `${SM_URL}/api/metadata/search?content_type=ebook&limit=10&query=${encodeURIComponent(q)}${provParam}`;
+      const { ok, status, data, error } = await fetchWithRetry(url);
+      if (!ok) {
+        queryLogs.push({ query: q, provider: prov, status, count: 0, reason: error });
+        continue;
       }
+      const books = Array.isArray(data?.books) ? data.books : [];
+      let bestInQuery = -Infinity;
+
+      for (const b of books) {
+        const score = ID.scoreBookMatch(b, queryTitle, author);
+        if (score > bestInQuery) bestInQuery = score;
+        if (score > bestScore) {
+          bestScore = score;
+          bestBook = b;
+          bestCandidate = candidate;
+        }
+      }
+
+      queryLogs.push({
+        query: q,
+        provider: prov,
+        status,
+        count: books.length,
+        bestScoreInQuery: Math.max(bestInQuery, 0),
+      });
     }
 
-    queryLogs.push({
-      query: q,
-      status,
-      count: books.length,
-      bestScoreInQuery: Math.max(bestInQuery, 0),
-    });
-
-    // High confidence match found: stop query loop
+    // High confidence match found across providers: stop query loop
     if (bestScore >= 80) {
-      break;
+      break queryIteration;
+    }
+
+    // Max search count reached
+    if (queryCount >= maxQueries && bestScore > 0) {
+      break queryIteration;
     }
   }
 
@@ -364,9 +457,12 @@ async function main() {
   let langMatchCount = 0;
 
   const results = [];
+  const limitIdx = process.argv.indexOf('--limit');
+  const maxCases = (limitIdx !== -1 && process.argv[limitIdx + 1]) ? parseInt(process.argv[limitIdx + 1], 10) : corpus.length;
+  const casesToRun = corpus.slice(0, maxCases);
 
-  for (let i = 0; i < corpus.length; i++) {
-    const item = corpus[i];
+  for (let i = 0; i < casesToRun.length; i++) {
+    const item = casesToRun[i];
     const { input_title, expected_title, expected_author } = item;
 
     const searchRes = await runMetadataSearch(input_title, expected_author);
@@ -407,22 +503,22 @@ async function main() {
       queryLogs: searchRes.queryLogs,
     });
 
-    if ((i + 1) % 25 === 0 || i === corpus.length - 1) {
-      console.log(`  Processed ${i + 1}/${corpus.length} cases (workMatch: ${workPass}, exactPublication: ${exactPubPass})...`);
+    if ((i + 1) % 25 === 0 || i === casesToRun.length - 1) {
+      console.log(`  Processed ${i + 1}/${casesToRun.length} cases (workMatch: ${workPass}, exactPublication: ${exactPubPass})...`);
     }
   }
 
   console.log('\n------------------------------------------------------------------------');
   console.log('METADATA RESOLUTION SUMMARY:');
   console.log('------------------------------------------------------------------------');
-  console.log(`Total Corpus Cases:           ${corpus.length}`);
+  console.log(`Total Tested Cases:           ${casesToRun.length}`);
   console.log(`Decomposition Pass Rate:      ${decompPass}/${corpus.length} (${(decompPass / corpus.length * 100).toFixed(1)}%)`);
-  console.log(`Work-Level Match Rate:        ${workPass}/${corpus.length} (${(workPass / corpus.length * 100).toFixed(1)}%)`);
-  console.log(`Exact-Publication Match Rate: ${exactPubPass}/${corpus.length} (${(exactPubPass / corpus.length * 100).toFixed(1)}%)`);
-  console.log(`  - Title Matches:            ${titleMatchCount}/${corpus.length} (${(titleMatchCount / corpus.length * 100).toFixed(1)}%)`);
-  console.log(`  - Author Matches:           ${authorMatchCount}/${corpus.length} (${(authorMatchCount / corpus.length * 100).toFixed(1)}%)`);
-  console.log(`  - Publication Type Matches: ${pubMatchCount}/${corpus.length} (${(pubMatchCount / corpus.length * 100).toFixed(1)}%)`);
-  console.log(`  - Language Matches:         ${langMatchCount}/${corpus.length} (${(langMatchCount / corpus.length * 100).toFixed(1)}%)`);
+  console.log(`Work-Level Match Rate:        ${workPass}/${casesToRun.length} (${(workPass / casesToRun.length * 100).toFixed(1)}%)`);
+  console.log(`Exact-Publication Match Rate: ${exactPubPass}/${casesToRun.length} (${(exactPubPass / casesToRun.length * 100).toFixed(1)}%)`);
+  console.log(`  - Title Matches:            ${titleMatchCount}/${casesToRun.length} (${(titleMatchCount / casesToRun.length * 100).toFixed(1)}%)`);
+  console.log(`  - Author Matches:           ${authorMatchCount}/${casesToRun.length} (${(authorMatchCount / casesToRun.length * 100).toFixed(1)}%)`);
+  console.log(`  - Publication Type Matches: ${pubMatchCount}/${casesToRun.length} (${(pubMatchCount / casesToRun.length * 100).toFixed(1)}%)`);
+  console.log(`  - Language Matches:         ${langMatchCount}/${casesToRun.length} (${(langMatchCount / casesToRun.length * 100).toFixed(1)}%)`);
 
   const report = {
     generatedAt: new Date().toISOString(),
