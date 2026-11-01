@@ -1366,6 +1366,7 @@ function normalizeString(str) {
     .toLowerCase()
     .normalize('NFKD')
     .replace(/[\u0300-\u036f\u1ab0-\u1aff\u1dc0-\u1dff\u20d0-\u20ff\ufe20-\ufe2f]/g, '')
+    .replace(/&/g, ' and ')
     .replace(/[^\p{L}\p{N}\s]/gu, ' ')
     .replace(/\s+/g, ' ')
     .trim();
@@ -1733,6 +1734,7 @@ const SERIES_WITH_EXPLICIT_VOLUME_SEGMENT_RE = new RegExp(
 );
 const SERIES_WITH_BARE_NUMBER_SEGMENT_RE = /^([\p{L}][\p{L}\s'’&.-]{2,}?)\s+0*([1-9]|[12]\d|30)$/u;
 const ATTRIBUTION_PREFIX_SEGMENT_RE = /^from\s+(?:the\s+(?:files|world|pages|journals?|chronicles|universe|desk|archives)\s+of\s+)?[\p{L}\p{N}][\p{L}\p{N}\s'’&.-]{1,70}$/iu;
+const UNPUNCTUATED_SERIES_VOLUME_RE = /^(.+?)\s+(?:(?:series|trilogy|duology|saga|chronicles?)\s+)?(?:(?:book|vol\.?|volume|part|tome)\s+#?0*([1-9]\d?)|#\s*0*([1-9]\d?)|0*([1-9]\d?))\s+(?=[A-Za-z\p{L}])(.+)$/iu;
 
 const NON_PERSON_TITLE_WORDS = new Set([
   'the', 'a', 'an', 'and', 'or', 'of', 'in', 'on', 'at', 'to', 'for', 'with', 'from', 'by', 'into', 'about',
@@ -1804,8 +1806,19 @@ function decomposeTitleStructure(title, options = {}) {
 
   // Note: '/' is intentionally NOT a core-truncation delimiter so "Title A / Title B" omnibuses never collapse to "Title A".
   const rawSegments = s.split(/(?:\s+[-–—]\s+|[:;|]|\s*[–—]\s*)/).map((p) => p.trim()).filter(Boolean);
-  const cleanedSegments = [];
+  const unpunctSegments = [];
   for (const seg of rawSegments) {
+    const m = seg.match(UNPUNCTUATED_SERIES_VOLUME_RE);
+    if (m && m[1].length >= 2 && m[5].length >= 2 && !/\b(?:edition|anniversary|version|no|nr)\.?$/i.test(m[1].trim())) {
+      const vol = m[2] || m[3] || m[4];
+      unpunctSegments.push(`${m[1]} #${vol}`.trim(), m[5].trim());
+    } else {
+      unpunctSegments.push(seg);
+    }
+  }
+
+  const cleanedSegments = [];
+  for (const seg of unpunctSegments) {
     const strippedSeg = stripEditionDescriptors(seg);
     if (strippedSeg) cleanedSegments.push(strippedSeg);
   }
