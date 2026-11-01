@@ -4564,6 +4564,30 @@ test('CANDIDATE-ORDERING: search title candidate extraction orders specific work
   assert.ok(camusCands.includes('L\'Etranger'));
 });
 
+test('CANDIDATE-ORDERING: purely algorithmic numeric title equivalences handle arbitrary numbers', async () => {
+  // Test pure 4-digit years
+  assert.ok(KNOWN_TITLE_EQUIVALENTS.get('1984').includes('nineteen eighty-four'));
+  assert.ok(KNOWN_TITLE_EQUIVALENTS.get('1984').includes('nineteen eighty four'));
+  assert.ok(KNOWN_TITLE_EQUIVALENTS.get('nineteen eighty-four').includes('1984'));
+  assert.ok(KNOWN_TITLE_EQUIVALENTS.get('2001').includes('two thousand and one'));
+  assert.ok(KNOWN_TITLE_EQUIVALENTS.get('two thousand and one').includes('2001'));
+
+  // Test arbitrary years & numbers (1776, 451, 22, 20000, 300)
+  assert.ok(KNOWN_TITLE_EQUIVALENTS.get('1776').includes('seventeen seventy-six'));
+  assert.ok(KNOWN_TITLE_EQUIVALENTS.get('seventeen seventy-six').includes('1776'));
+  assert.ok(KNOWN_TITLE_EQUIVALENTS.get('451').some((w) => w.includes('four hundred') || w.includes('four fifty-one')));
+  assert.ok(KNOWN_TITLE_EQUIVALENTS.get('22').includes('twenty-two'));
+  assert.ok(KNOWN_TITLE_EQUIVALENTS.get('twenty-two').includes('22'));
+  assert.ok(KNOWN_TITLE_EQUIVALENTS.get('20000').includes('twenty thousand'));
+  assert.ok(KNOWN_TITLE_EQUIVALENTS.get('twenty thousand').includes('20000'));
+
+  // Test embedded numbers in titles
+  const f451Eqs = KNOWN_TITLE_EQUIVALENTS.get('Fahrenheit 451');
+  assert.ok(f451Eqs.some((eq) => /four hundred|four fifty-one/i.test(eq)));
+  const catch22Eqs = KNOWN_TITLE_EQUIVALENTS.get('Catch 22');
+  assert.ok(catch22Eqs.some((eq) => /twenty-two|twenty two/i.test(eq)));
+});
+
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Test runner — keep executing after failures so one bad release is diagnosed

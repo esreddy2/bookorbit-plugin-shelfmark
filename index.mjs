@@ -1356,13 +1356,203 @@ function isValidOceanofPdfPageUrl(url, source) {
  * Dependency-free. ESM.
  */
 
-const KNOWN_TITLE_EQUIVALENTS = new Map([
-  ['1984', ['nineteen eighty four', 'nineteen eighty-four']],
-  ['nineteen eighty four', ['1984']],
-  ['nineteen eighty-four', ['1984']],
-  ['2001', ['two thousand and one']],
-  ['two thousand and one', ['2001']],
-]);
+const NUMBER_ONES = [
+  'zero', 'one', 'two', 'three', 'four', 'five', 'six', 'seven', 'eight', 'nine',
+  'ten', 'eleven', 'twelve', 'thirteen', 'fourteen', 'fifteen', 'sixteen', 'seventeen', 'eighteen', 'nineteen',
+];
+const NUMBER_TENS = [
+  '', '', 'twenty', 'thirty', 'forty', 'fifty', 'sixty', 'seventy', 'eighty', 'ninety',
+];
+const NUMBER_WORD_VALUES = {
+  zero: 0, one: 1, two: 2, three: 3, four: 4, five: 5, six: 6, seven: 7, eight: 8, nine: 9,
+  ten: 10, eleven: 11, twelve: 12, thirteen: 13, fourteen: 14, fifteen: 15, sixteen: 16,
+  seventeen: 17, eighteen: 18, nineteen: 19,
+  twenty: 20, thirty: 30, forty: 40, fifty: 50, sixty: 60, seventy: 70, eighty: 80, ninety: 90,
+  hundred: 100, thousand: 1000,
+};
+
+function numberToWordsUnder100(n) {
+  if (n < 20) return [NUMBER_ONES[n]];
+  const ten = NUMBER_TENS[Math.floor(n / 10)];
+  const rem = n % 10;
+  if (rem === 0) return [ten];
+  return [`${ten}-${NUMBER_ONES[rem]}`, `${ten} ${NUMBER_ONES[rem]}`];
+}
+
+function numberToWords(n) {
+  if (n < 0 || n > 999999 || !Number.isInteger(n)) return [];
+  const results = new Set();
+
+  if (n < 100) {
+    for (const w of numberToWordsUnder100(n)) results.add(w);
+  } else if (n >= 1100 && n <= 1999) {
+    // 4-digit year format (e.g. 1984 -> "nineteen eighty-four", "nineteen eighty four")
+    const century = Math.floor(n / 100);
+    const rem = n % 100;
+    const centuryWords = NUMBER_ONES[century];
+    if (rem === 0) {
+      results.add(`${centuryWords} hundred`);
+    } else {
+      for (const rw of numberToWordsUnder100(rem)) {
+        results.add(`${centuryWords} ${rw}`);
+      }
+    }
+    // Also cardinal format (e.g. "one thousand nine hundred eighty-four")
+    for (const rw of numberToWordsUnder100(rem)) {
+      results.add(`one thousand ${NUMBER_ONES[century - 10]} hundred and ${rw}`);
+      results.add(`one thousand ${NUMBER_ONES[century - 10]} hundred ${rw}`);
+    }
+  } else if (n >= 2000 && n <= 2099) {
+    // Millennium/year format (e.g. 2001 -> "two thousand and one", "two thousand one")
+    const rem = n % 100;
+    if (rem === 0) {
+      results.add('two thousand');
+    } else {
+      for (const rw of numberToWordsUnder100(rem)) {
+        results.add(`two thousand and ${rw}`);
+        results.add(`two thousand ${rw}`);
+      }
+    }
+  } else if (n >= 100 && n < 1000) {
+    const h = Math.floor(n / 100);
+    const rem = n % 100;
+    if (rem === 0) {
+      results.add(`${NUMBER_ONES[h]} hundred`);
+    } else {
+      for (const rw of numberToWordsUnder100(rem)) {
+        results.add(`${NUMBER_ONES[h]} hundred and ${rw}`);
+        results.add(`${NUMBER_ONES[h]} hundred ${rw}`);
+        results.add(`${NUMBER_ONES[h]} ${rw}`);
+      }
+    }
+  } else if (n >= 1000) {
+    const th = Math.floor(n / 1000);
+    const rem = n % 1000;
+    const thWords = numberToWords(th);
+    for (const tw of thWords) {
+      if (rem === 0) {
+        results.add(`${tw} thousand`);
+      } else {
+        const remWords = numberToWords(rem);
+        for (const rw of remWords) {
+          results.add(`${tw} thousand ${rw}`);
+          results.add(`${tw} thousand and ${rw}`);
+        }
+      }
+    }
+  }
+
+  return [...results];
+}
+
+function parseNumberWords(str) {
+  if (!str) return null;
+  const tokens = String(str).toLowerCase().replace(/[-]/g, ' ').split(/\s+/).filter((t) => t && t !== 'and');
+  if (tokens.length === 0) return null;
+  if (!tokens.every((t) => Object.prototype.hasOwnProperty.call(NUMBER_WORD_VALUES, t))) return null;
+
+  // Year format: two 2-digit groups, e.g. "nineteen eighty four" (1984)
+  if (tokens.length >= 2) {
+    const t0Val = NUMBER_WORD_VALUES[tokens[0]];
+    if (t0Val >= 11 && t0Val <= 19) {
+      let remVal = 0;
+      let validYear = true;
+      for (let i = 1; i < tokens.length; i++) {
+        const v = NUMBER_WORD_VALUES[tokens[i]];
+        if (v === 100 || v === 1000) { validYear = false; break; }
+        remVal += v;
+      }
+      if (validYear && remVal >= 0 && remVal < 100) {
+        return t0Val * 100 + remVal;
+      }
+    }
+  }
+
+  // Colloquial 3-digit format: e.g. "four fifty one" (451)
+  if (tokens.length >= 2) {
+    const t0Val = NUMBER_WORD_VALUES[tokens[0]];
+    if (t0Val >= 1 && t0Val <= 9) {
+      let remVal = 0;
+      let valid3Digit = true;
+      for (let i = 1; i < tokens.length; i++) {
+        const v = NUMBER_WORD_VALUES[tokens[i]];
+        if (v === 100 || v === 1000) { valid3Digit = false; break; }
+        remVal += v;
+      }
+      if (valid3Digit && remVal >= 10 && remVal < 100) {
+        return t0Val * 100 + remVal;
+      }
+    }
+  }
+
+  // General cardinal parsing
+  let total = 0;
+  let current = 0;
+  for (const t of tokens) {
+    const val = NUMBER_WORD_VALUES[t];
+    if (val === 1000) {
+      current = (current === 0 ? 1 : current) * 1000;
+      total += current;
+      current = 0;
+    } else if (val === 100) {
+      current = (current === 0 ? 1 : current) * 100;
+    } else {
+      current += val;
+    }
+  }
+  total += current;
+  return total;
+}
+
+function getNumericTitleEquivalents(title) {
+  if (!title) return [];
+  const str = String(title).trim();
+  const out = new Set();
+  const lower = str.toLowerCase();
+
+  // 1. Pure digits: "1984", "2001", "451"
+  if (/^\d+$/.test(str)) {
+    const n = parseInt(str, 10);
+    for (const w of numberToWords(n)) out.add(w);
+    return [...out];
+  }
+
+  // 2. Pure number words: "nineteen eighty four", "two thousand and one"
+  const pureNum = parseNumberWords(str);
+  if (pureNum !== null && pureNum >= 0 && pureNum <= 999999) {
+    out.add(String(pureNum));
+    for (const w of numberToWords(pureNum)) {
+      if (w.toLowerCase() !== lower) out.add(w);
+    }
+    return [...out];
+  }
+
+  // 3. Embedded digits in title: "Catch 22", "Fahrenheit 451"
+  const digitMatch = str.match(/\b\d+\b/);
+  if (digitMatch) {
+    const n = parseInt(digitMatch[0], 10);
+    const words = numberToWords(n);
+    for (const w of words) {
+      out.add(str.replace(digitMatch[0], w));
+    }
+  }
+
+  return [...out];
+}
+
+// Algorithmic numeric title equivalences: dynamically computes word and digit equivalents
+// for any numeric title (1984, 2001, Catch 22, Fahrenheit 451, etc.) without any hardcoded map.
+const KNOWN_TITLE_EQUIVALENTS = {
+  get(key) {
+    if (!key) return [];
+    return getNumericTitleEquivalents(key);
+  },
+  has(key) {
+    if (!key) return false;
+    const res = getNumericTitleEquivalents(key);
+    return Boolean(res && res.length > 0);
+  },
+};
 
 function normalizeString(str) {
   if (str == null) return '';
