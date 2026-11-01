@@ -2156,6 +2156,8 @@ export class BridgeService {
        requestReleaseCandidateCounts: {}, // requestId -> number
        requestCandidateRejectionReasons: {}, // requestId -> { reason: count }
        requestVerification: {}, // requestId -> { ok, taskId, releaseKey, stage, errorType, primaryConflict, conflicts, evidence, error, verifiedAt }
+       requestTasks: {},        // requestId -> taskId (historical task association preserved across failures)
+       rejectedRequests: {},    // requestId -> { rejectedAt, decisionNote, reason }
      };
 
     this.reconcileTimer = null;
@@ -2215,6 +2217,8 @@ export class BridgeService {
            requestReleaseCandidateCounts: parsed.requestReleaseCandidateCounts || {},
            requestCandidateRejectionReasons: parsed.requestCandidateRejectionReasons || {},
            requestVerification: parsed.requestVerification || {},
+           requestTasks: parsed.requestTasks || {},
+           rejectedRequests: parsed.rejectedRequests || {},
          };
       }
     } catch (err) {
@@ -2661,6 +2665,80 @@ export class BridgeService {
   }
 
   /**
+   * Terminal rejection in BookOrbit when a request completely exhausts all attempts.
+   * Calls POST /api/v1/admin/book-requests/:id/reject with diagnostic decisionNote.
+   */
+  async rejectBookOrbitRequest(requestId, details = {}, fetchFn = globalThis.fetch) {
+    const reqIdStr = String(requestId);
+    if (!reqIdStr || this.state.rejectedRequests?.[reqIdStr]) return false;
+    let token = '';
+    try { token = await this.authManager.getValidToken(); } catch {}
+    token = token || this.bookorbitToken || this.bookorbitApiKey;
+
+    const headers = {
+      'Content-Type': 'application/json',
+      ...(token && isJwt(token) ? { 'Authorization': `Bearer ${token}` } : {}),
+      ...(this.bookorbitApiKey ? { 'X-Api-Key': this.bookorbitApiKey } : {}),
+    };
+
+    const attempts = this.state.requestSourceAttempts[reqIdStr] || details.attempts || this.maxSourceAttempts;
+    const stage = details.stage || this.state.requestProgress[reqIdStr]?.stage || 'failed';
+    const reason = details.reason || this.state.requestErrors[reqIdStr]?.error || 'max_attempts_exhausted';
+    const reqTitle = details.req?.title || details.requestTitle || 'Unknown';
+    const reqAuthor = details.req?.author || details.requestAuthor || 'Unknown';
+    const searchTitle = details.searchTitle || reqTitle;
+    const observedTitle = details.observedTitle || details.task?.title || null;
+    const observedAuthor = details.observedAuthor || details.task?.author || null;
+    const conflicts = Array.isArray(details.conflicts) ? details.conflicts : (this.state.requestVerification?.[reqIdStr]?.conflicts || []);
+
+    let note = `[Shelfmark] Automated request failed after ${attempts}/${this.maxSourceAttempts} attempts.\n`;
+    note += `Stage: ${stage}\n`;
+    note += `Reason: ${reason}\n`;
+    note += `Requested: "${reqTitle}" by "${reqAuthor}"\n`;
+    if (searchTitle !== reqTitle) {
+      note += `Search Title: "${searchTitle}"\n`;
+    }
+    if (observedTitle || observedAuthor) {
+      note += `Observed Download: "${observedTitle || 'Unknown'}" by "${observedAuthor || 'Unknown'}"\n`;
+    }
+    if (conflicts.length > 0) {
+      note += `Verification Conflicts: ${conflicts.join(', ')}\n`;
+    }
+    if (details.exhaustionReason) {
+      note += `Exhaustion Reason: ${details.exhaustionReason}\n`;
+    }
+    if (note.length > 2000) {
+      note = note.slice(0, 1997) + '...';
+    }
+
+    const url = `${this.bookorbitUrl}/api/v1/admin/book-requests/${encodeURIComponent(reqIdStr)}/reject`;
+    try {
+      const res = await fetchFn(url, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({ decisionNote: note }),
+      });
+      if (res && res.ok) {
+        this.state.rejectedRequests = this.state.rejectedRequests || {};
+        this.state.rejectedRequests[reqIdStr] = {
+          rejectedAt: new Date().toISOString(),
+          decisionNote: note,
+          reason,
+        };
+        this.setRequestProgress(reqIdStr, 'rejected', { reason: 'rejected_in_bookorbit', decisionNote: note });
+        this.saveState();
+        console.log(`[Bridge] Successfully rejected BookOrbit request ${reqIdStr} with diagnostic note.`);
+        return true;
+      } else {
+        console.warn(`[Bridge] BookOrbit reject request returned HTTP ${res?.status} for request ${reqIdStr}`);
+      }
+    } catch (err) {
+      console.warn(`[Bridge] Failed to send rejection to BookOrbit for request ${reqIdStr}: ${sanitizeLog(err.message)}`);
+    }
+    return false;
+  }
+
+  /**
    * Fetches approved ebook requests from BookOrbit admin API and processes them.
    * Serialized with an async mutex lock to prevent duplicate runs.
    */
@@ -2745,8 +2823,21 @@ export class BridgeService {
             continue;
           }
 
-          // 3b. Stop retry if request reached max attempts (never retry indefinitely)
+          // 3a. Skip if currently holding in cooldown_wait and cooldown has not expired
+          const curProgress = this.state.requestProgress[reqId];
+          if (curProgress?.stage === 'cooldown_wait' && curProgress.cooldownUntil) {
+            if (Date.now() < new Date(curProgress.cooldownUntil).getTime()) {
+              continue;
+            }
+          }
+
+          // 3b. Stop retry if request reached max attempts (reject in BookOrbit and halt)
           if ((this.state.requestSourceAttempts[reqId] || 0) >= this.maxSourceAttempts) {
+            await this.rejectBookOrbitRequest(reqId, {
+              stage: this.state.requestProgress[reqId]?.stage || 'exhausted',
+              reason: this.state.requestErrors[reqId]?.error || 'max_attempts_exhausted',
+              req,
+            }, fetchFn);
             continue;
           }
 
@@ -2820,11 +2911,12 @@ export class BridgeService {
             const errorMessage = err instanceof Error ? err.message : String(err ?? 'unknown error');
             console.warn(`[Bridge] Plugin search error for "${query.title}": ${sanitizeLog(errorMessage)}`);
             this.setRequestProgress(reqId, 'search_failed', { reason: 'search_failed', error: errorMessage });
-            const attemptIdSf = `search_failed:${reqId}:${new Date().toISOString().slice(0,10)}`;
+            const nextAttemptSf = (this.state.requestSourceAttempts[reqId] || 0) + 1;
+            const attemptIdSf = `search_failed:${reqId}:${nextAttemptSf}`;
             this.state.requestAttempts[reqId] = this.state.requestAttempts[reqId] || [];
             if (!this.state.requestAttempts[reqId].some((a) => a.attemptId === attemptIdSf)) {
               this.state.requestAttempts[reqId].push({ attemptId: attemptIdSf, timestamp: new Date().toISOString(), error: errorMessage });
-              this.state.requestSourceAttempts[reqId] = (this.state.requestSourceAttempts[reqId] || 0) + 1;
+              this.state.requestSourceAttempts[reqId] = nextAttemptSf;
             }
             this.state.requestErrors[reqId] = {
               error: errorMessage,
@@ -2833,6 +2925,14 @@ export class BridgeService {
               lastAttemptAt: new Date().toISOString(),
               attempts: this.state.requestSourceAttempts[reqId] || 0,
             };
+            if (this.state.requestSourceAttempts[reqId] >= this.maxSourceAttempts) {
+              await this.rejectBookOrbitRequest(reqId, {
+                stage: 'search_failed',
+                reason: errorMessage,
+                req,
+                searchTitle: query.title,
+              }, fetchFn);
+            }
             this.saveState();
             continue;
           } finally {
@@ -2851,11 +2951,12 @@ export class BridgeService {
              this.state.requestCandidateRejectionReasons[reqId] = {};
              this.setRequestProgress(reqId, 'no_releases', { reason: 'no_releases', ...emptyCounts });
              this.saveState();
-            const attemptIdNr = `no_releases:${reqId}:${new Date().toISOString().slice(0,10)}`;
+            const nextAttemptNr = (this.state.requestSourceAttempts[reqId] || 0) + 1;
+            const attemptIdNr = `no_releases:${reqId}:${nextAttemptNr}`;
             this.state.requestAttempts[reqId] = this.state.requestAttempts[reqId] || [];
             if (!this.state.requestAttempts[reqId].some((a) => a.attemptId === attemptIdNr)) {
               this.state.requestAttempts[reqId].push({ attemptId: attemptIdNr, timestamp: new Date().toISOString(), error: 'No releases found' });
-              this.state.requestSourceAttempts[reqId] = (this.state.requestSourceAttempts[reqId] || 0) + 1;
+              this.state.requestSourceAttempts[reqId] = nextAttemptNr;
             }
             this.state.requestErrors[reqId] = {
               error: 'No releases found',
@@ -2864,6 +2965,14 @@ export class BridgeService {
               lastAttemptAt: new Date().toISOString(),
               attempts: this.state.requestSourceAttempts[reqId] || 0,
             };
+            if (this.state.requestSourceAttempts[reqId] >= this.maxSourceAttempts) {
+              await this.rejectBookOrbitRequest(reqId, {
+                stage: 'no_releases',
+                reason: 'No releases found',
+                req,
+                searchTitle: query.title,
+              }, fetchFn);
+            }
             this.saveState();
             continue;
           }
@@ -2927,6 +3036,19 @@ export class BridgeService {
            this.state.requestStatus[reqId] = progressEntry;
 
           if (eligibleReleases.length === 0) {
+            const hasCooldown = (candidateRejectionReasonCounts.cooldown || 0) > 0;
+            if (hasCooldown && Object.keys(candidateRejectionReasonCounts).length === 1) {
+              const cooldownUntil = new Date(Date.now() + this.releaseFailureCooldownMs).toISOString();
+              console.log(`[Bridge] All candidates in cooldown for request ${reqId}; holding in cooldown_wait until ${cooldownUntil}`);
+              this.setRequestProgress(reqId, 'cooldown_wait', {
+                reason: 'cooldown_wait',
+                cooldownUntil,
+                ...candidateCounts,
+              });
+              this.saveState();
+              continue;
+            }
+
             const reason = ineligibilityReason || 'no_eligible_edition';
             const priorVer = this.state.requestVerification?.[reqId];
             if (priorVer && priorVer.ok === false) {
@@ -2943,16 +3065,27 @@ export class BridgeService {
                 this.state.requestErrors[reqId].exhaustionReason = reason;
                 this.state.requestErrors[reqId].lastAttemptAt = new Date().toISOString();
               }
+              if ((this.state.requestSourceAttempts[reqId] || 0) >= this.maxSourceAttempts) {
+                await this.rejectBookOrbitRequest(reqId, {
+                  stage: priorStage,
+                  reason: priorReason,
+                  req,
+                  searchTitle: query.title,
+                  exhaustionReason: reason,
+                  conflicts: priorVer.conflicts,
+                }, fetchFn);
+              }
               this.saveState();
               continue;
             }
             console.log(`[Bridge] No eligible edition-compatible releases found for approved request ${reqId} ("${query.title}")`);
             this.setRequestProgress(reqId, 'no_eligible_edition', { reason, ...candidateCounts });
-            const attemptIdNe = `no_eligible_edition:${reqId}:${new Date().toISOString().slice(0,10)}`;
+            const nextAttemptNe = (this.state.requestSourceAttempts[reqId] || 0) + 1;
+            const attemptIdNe = `no_eligible_edition:${reqId}:${nextAttemptNe}`;
             this.state.requestAttempts[reqId] = this.state.requestAttempts[reqId] || [];
             if (!this.state.requestAttempts[reqId].some((a) => a.attemptId === attemptIdNe)) {
               this.state.requestAttempts[reqId].push({ attemptId: attemptIdNe, timestamp: new Date().toISOString(), error: reason });
-              this.state.requestSourceAttempts[reqId] = (this.state.requestSourceAttempts[reqId] || 0) + 1;
+              this.state.requestSourceAttempts[reqId] = nextAttemptNe;
             }
             this.state.requestErrors[reqId] = {
               error: reason,
@@ -2961,6 +3094,15 @@ export class BridgeService {
               lastAttemptAt: new Date().toISOString(),
               attempts: this.state.requestSourceAttempts[reqId] || 0,
             };
+            if (this.state.requestSourceAttempts[reqId] >= this.maxSourceAttempts) {
+              await this.rejectBookOrbitRequest(reqId, {
+                stage: 'no_eligible_edition',
+                reason,
+                req,
+                searchTitle: query.title,
+                exhaustionReason: reason,
+              }, fetchFn);
+            }
             this.saveState();
             continue;
           }
@@ -4349,6 +4491,8 @@ export class BridgeService {
     const attemptId = `${errorType}:${task.taskId}`;
     for (const rid of (task.requestIds || [])) {
       if (task.requestFulfillments?.[rid]?.fulfilled) continue;
+      this.state.requestTasks = this.state.requestTasks || {};
+      this.state.requestTasks[rid] = task.taskId || task.id;
       this.state.requestAttempts[rid] = this.state.requestAttempts[rid] || [];
       if (!this.state.requestAttempts[rid].some((a) => a.attemptId === attemptId)) {
         this.state.requestAttempts[rid].push({ attemptId, taskId: task.taskId, releaseKey: task.releaseKey, timestamp: now, error: task.error });
@@ -4562,6 +4706,8 @@ export class BridgeService {
               lastAttemptAt: nowVer,
               attempts: this.state.requestSourceAttempts[rid],
             };
+            this.state.requestTasks = this.state.requestTasks || {};
+            this.state.requestTasks[rid] = task.taskId || task.id;
             if ((this.state.requestSourceAttempts[rid] || 0) < this.maxSourceAttempts) {
               delete this.state.requests[rid];
             }
@@ -5435,18 +5581,20 @@ export class BridgeService {
     const uncertain = this.state.uncertainQueues || {};
     const sourceAttempts = this.state.requestSourceAttempts || {};
     const reqVerification = requestId ? (this.state.requestVerification?.[requestId] || null) : null;
+    const mappedTaskId = (requestId && (requests[requestId] || this.state.requestTasks?.[requestId])) || null;
+    const taskObj = mappedTaskId ? tasks[mappedTaskId] : null;
 
      const report = {
       generatedAt: new Date().toISOString(),
       requestId: requestId || null,
-      request: requestId ? (requests[requestId] ? { taskId: requests[requestId] } : null) : undefined,
+      request: requestId ? (mappedTaskId ? { taskId: mappedTaskId } : null) : undefined,
       stage: requestId ? (progress[requestId] || null) : undefined,
       lastTransitionReason: requestId ? (this.state.requestFailureReasons?.[requestId] || null) : undefined,
       searchAttempts: requestId ? (sourceAttempts[requestId] ?? 0) : sourceAttempts,
       attempts: requestId ? (attempts[requestId] || []) : attempts,
        errors: requestId ? (errors[requestId] || null) : errors,
-       verificationEvidence: requestId ? (tasks[requests[requestId]]?.verificationEvidence || reqVerification?.evidence || null) : undefined,
-       verificationConflicts: requestId ? (tasks[requests[requestId]]?.verificationConflicts || reqVerification?.conflicts || null) : undefined,
+       verificationEvidence: requestId ? (taskObj?.verificationEvidence || reqVerification?.evidence || null) : undefined,
+       verificationConflicts: requestId ? (taskObj?.verificationConflicts || reqVerification?.conflicts || null) : undefined,
        lastVerification: requestId ? reqVerification : undefined,
       retryState: requestId ? { attempts: sourceAttempts[requestId] ?? 0, max: this.maxSourceAttempts } : undefined,
       taskStatuses: Object.fromEntries(Object.entries(tasks).map(([k, v]) => [k, v?.status || v?.state || 'unknown'])),
@@ -5475,7 +5623,7 @@ export class BridgeService {
      }
 
      if (requestId) {
-       const t = requests[requestId] ? tasks[requests[requestId]] : null;
+       const t = taskObj;
        if (t) {
          report.task = {
            id: t.id || t.taskId || t.task_id || null,

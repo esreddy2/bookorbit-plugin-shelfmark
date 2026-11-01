@@ -409,7 +409,19 @@ export default {
     const hasValidCandidates = (bs) => Array.isArray(bs) && bs.some(isBookCandidateValid);
     if (searchTitle && (!books.length || !hasValidCandidates(books))) {
       const queriedMetaNorms = new Set([normalizeString(metadataQuery)]);
-      const fallbackMetaQueries = extractSearchTitleCandidates(searchTitle, decompOpts);
+      const rawCandidates = extractSearchTitleCandidates(searchTitle, decompOpts);
+      const fallbackMetaQueries = [];
+      for (const cand of rawCandidates) {
+        fallbackMetaQueries.push(cand);
+        if (searchAuthor) {
+          const natAuthor = toNaturalAuthor(searchAuthor);
+          fallbackMetaQueries.push(`${cand} ${natAuthor}`);
+        }
+      }
+      if (searchAuthor) {
+        const natAuthor = toNaturalAuthor(searchAuthor);
+        fallbackMetaQueries.push(`${searchTitle} ${natAuthor}`);
+      }
       for (const altQuery of fallbackMetaQueries) {
         if (signal?.aborted || Date.now() - searchStartTime >= SEARCH_BUDGET_MS) break;
         const normAlt = normalizeString(altQuery);
@@ -620,6 +632,7 @@ export default {
       }
 
     }
+
     // Check deadline / cancellation state
     if (signal?.aborted) {
       if (releases.length > 0) return rankAndSlice();

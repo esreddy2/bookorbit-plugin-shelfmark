@@ -132,6 +132,7 @@ const CONTRACT_ROUTES = Object.freeze([
   ['bo.requests',   'GET',  /^\/api\/v1\/admin\/book-requests\/?$/],
   ['bo.request',    'GET',  /^\/api\/v1\/book-requests\/[^/]+\/?$/],
   ['bo.fulfill',    'POST', /^\/api\/v1\/admin\/book-requests\/[^/]+\/fulfill\/?$/],
+  ['bo.reject',     'POST', /^\/api\/v1\/admin\/book-requests\/[^/]+\/reject\/?$/],
   ['bo.upload',     'POST', /^\/api\/v1\/libraries\/[1-9]\d*\/upload\/?$/],
   ['bo.libraryBooks', 'POST', /^\/api\/v1\/libraries\/[1-9]\d*\/books\/?$/],
   ['bo.book',       'GET',  /^\/api\/v1\/books\/[1-9]\d*\/?$/],
@@ -248,6 +249,8 @@ function apiScenarios({ requests = [], details = {}, books = [], releases = [], 
   delete handlers['bo.libraryBooks'];
   const rawFulfill = handlers['bo.fulfill'] ?? onFulfill ?? (() => ({ status: 'AVAILABLE' }));
   delete handlers['bo.fulfill'];
+  const rawReject = handlers['bo.reject'] ?? (() => ({ success: true }));
+  delete handlers['bo.reject'];
 
   return contractFetch({
     'bo.requests': () => response({ items: requests, total: requests.length, page: 1, limit: 50 }),
@@ -301,6 +304,11 @@ function apiScenarios({ requests = [], details = {}, books = [], releases = [], 
     'bo.fulfill': (entry) => {
       onPost(entry);
       const res = typeof rawFulfill === 'function' ? rawFulfill(entry) : rawFulfill;
+      return res instanceof Response ? res : response(res);
+    },
+    'bo.reject': (entry) => {
+      onPost(entry);
+      const res = typeof rawReject === 'function' ? rawReject(entry) : rawReject;
       return res instanceof Response ? res : response(res);
     },
     'sm.metadata': (entry) => response(onMetadata ? onMetadata(entry) : { books }),
@@ -4586,6 +4594,162 @@ test('CANDIDATE-ORDERING: purely algorithmic numeric title equivalences handle a
   assert.ok(f451Eqs.some((eq) => /four hundred|four fifty-one/i.test(eq)));
   const catch22Eqs = KNOWN_TITLE_EQUIVALENTS.get('Catch 22');
   assert.ok(catch22Eqs.some((eq) => /twenty-two|twenty two/i.test(eq)));
+});
+
+test('RETRY & TERMINAL REJECTION: sequential attempt IDs increment on same calendar day without date lock', async () => {
+  const bridge = established(new BridgeService(bridgeOpts()));
+  const req = request('retry-no-date-lock', 'Nonexistent Book XYZ', 'Unknown Author');
+  const fake = apiScenarios({
+    requests: [req],
+    books: [],
+    releases: [],
+  });
+  // Attempt 1: no releases found
+  await bridge.processPendingRequests({ fetchFn: fake.fetch });
+  assert.equal(bridge.state.requestSourceAttempts['retry-no-date-lock'], 1);
+  assert.equal(bridge.state.requestAttempts['retry-no-date-lock'].length, 1);
+  assert.equal(bridge.state.requestAttempts['retry-no-date-lock'][0].attemptId, 'no_releases:retry-no-date-lock:1');
+
+  // Attempt 2: on the same day, another pass should increment to 2
+  await bridge.processPendingRequests({ fetchFn: fake.fetch });
+  assert.equal(bridge.state.requestSourceAttempts['retry-no-date-lock'], 2);
+  assert.equal(bridge.state.requestAttempts['retry-no-date-lock'].length, 2);
+  assert.equal(bridge.state.requestAttempts['retry-no-date-lock'][1].attemptId, 'no_releases:retry-no-date-lock:2');
+});
+
+test('HOLDING STATE: cooldown_wait holds request during candidate cooldown without polling thrash', async () => {
+  const bridge = established(new BridgeService(bridgeOpts({ releaseFailureCooldownMs: 60_000 })));
+  const req = request('cooldown-wait-req', 'The Wild Zone', 'Joy Fielding');
+  const failedKey = 'oceanofpdf:failed-wild-zone';
+  bridge.state.failedReleases[failedKey] = {
+    releaseKey: failedKey,
+    failedAt: new Date().toISOString(),
+    error: 'EPUB title mismatch: expected "The Wild Zone", got "Camp Half-Blood"',
+  };
+
+  let searchCalls = 0;
+  const fake = apiScenarios({
+    requests: [req],
+    books: [metadata('The Wild Zone', 'Joy Fielding')],
+    releases: [release('The Wild Zone', 'Joy Fielding', { source: 'oceanofpdf', source_id: 'failed-wild-zone' })],
+    'sm.metadata': () => {
+      searchCalls++;
+      return response({ books: [metadata('The Wild Zone', 'Joy Fielding')] });
+    },
+  });
+
+  // Pass 1: candidate is in cooldown, eligibleReleases = 0 -> transitions to cooldown_wait
+  await bridge.processPendingRequests({ fetchFn: fake.fetch });
+  assert.equal(bridge.state.requestProgress['cooldown-wait-req']?.stage, 'cooldown_wait');
+  assert.ok(bridge.state.requestProgress['cooldown-wait-req']?.cooldownUntil);
+  const callsAfterPass1 = searchCalls;
+
+  // Pass 2: should be skipped because cooldown has not expired
+  await bridge.processPendingRequests({ fetchFn: fake.fetch });
+  assert.equal(searchCalls, callsAfterPass1, 'search must not be called during cooldown_wait');
+  assert.equal(bridge.state.requestProgress['cooldown-wait-req']?.stage, 'cooldown_wait');
+});
+
+test('TERMINAL REJECTION: exhausts maxSourceAttempts and calls POST /api/v1/admin/book-requests/:id/reject with decisionNote', async () => {
+  const bridge = established(new BridgeService(bridgeOpts()));
+  const req = request('terminal-reject-req', 'Ghost Book 404', 'Phantom Writer');
+  let rejectedBody = null;
+  const fake = apiScenarios({
+    requests: [req],
+    books: [],
+    releases: [],
+    'bo.reject': (entry) => {
+      rejectedBody = expectedJson(entry.options);
+      return response({ success: true });
+    },
+  });
+
+  // Run 3 attempts
+  await bridge.processPendingRequests({ fetchFn: fake.fetch }); // Attempt 1
+  await bridge.processPendingRequests({ fetchFn: fake.fetch }); // Attempt 2
+  await bridge.processPendingRequests({ fetchFn: fake.fetch }); // Attempt 3 -> triggers rejection
+
+  assert.equal(bridge.state.requestSourceAttempts['terminal-reject-req'], 3);
+  assert.ok(rejectedBody, 'rejection endpoint must be called on attempt exhaustion');
+  assert.ok(rejectedBody.decisionNote.includes('3/3 attempts'), 'decisionNote includes attempt count');
+  assert.ok(rejectedBody.decisionNote.includes('Ghost Book 404'), 'decisionNote includes requested title');
+  assert.ok(bridge.state.rejectedRequests['terminal-reject-req'], 'state records rejection');
+  assert.equal(bridge.state.requestProgress['terminal-reject-req']?.stage, 'rejected');
+  fake.assertKnownRoutes();
+});
+
+test('METADATA DISCOVERY FALLBACK: plugin.search queries decomposed title and author when raw full title yields 0 metadata books', async () => {
+  let metaQueries = [];
+  const fake = apiScenarios({
+    'sm.metadata': ({ query }) => {
+      const q = query.get('query');
+      metaQueries.push(q);
+      // Raw full title returns 0 books
+      if (q === 'Percy Jackson and the Olympians, Book One: The Lightning Thief') {
+        return response({ books: [] });
+      }
+      // Decomposed canonical title with or without author returns valid metadata
+      if (q.includes('The Lightning Thief')) {
+        return response({
+          books: [metadata('The Lightning Thief', 'Rick Riordan', { provider_id: 'pj-book-1' })],
+        });
+      }
+      return response({ books: [] });
+    },
+    'sm.releases': () => {
+      return response({
+        releases: [release('The Lightning Thief', 'Rick Riordan', {
+          source: 'oceanofpdf',
+          source_id: 'percy-lightning-thief',
+          format: 'epub',
+        })],
+      });
+    },
+  });
+
+  const results = await plugin.search({
+    title: 'Percy Jackson and the Olympians, Book One: The Lightning Thief',
+    author: 'Rick Riordan',
+  }, config(), hostWith(fake.fetch));
+
+  assert.ok(results.length > 0, 'metadata discovery fallback must discover releases when raw full title yields 0 books');
+  assert.equal(results[0].bookTitle, 'The Lightning Thief');
+  assert.equal(results[0].author, 'Rick Riordan');
+  assert.ok(metaQueries.some((q) => q.includes('The Lightning Thief')), 'canonical decomposed title queried in metadata search');
+});
+
+test('DIAGNOSTICS: retains associated task information after verification failure and unmapping', async () => {
+  const bridge = new BridgeService(bridgeOpts());
+  const reqId = 'diag-unmapped-req';
+  const taskId = 'task-wild-zone-001';
+  bridge.state.tasks[taskId] = {
+    id: taskId,
+    status: 'finalization_failed',
+    title: 'Camp Half-Blood',
+    author: 'Rick Riordan',
+    format: 'epub',
+    source: 'oceanofpdf',
+    verificationEvidence: [{ field: 'title', status: 'mismatch' }],
+    verificationConflicts: ['incompatible_title'],
+    error: 'EPUB title mismatch: expected "The Wild Zone", got "Camp Half-Blood"',
+  };
+  bridge.recordTaskFailureAttempts({
+    taskId,
+    title: 'Camp Half-Blood',
+    error: 'EPUB title mismatch: expected "The Wild Zone", got "Camp Half-Blood"',
+    requestIds: [reqId],
+  }, 'finalization_failed');
+
+  // Verify requests[reqId] was unmapped for retry
+  assert.equal(bridge.state.requests[reqId], undefined);
+  assert.equal(bridge.state.requestTasks[reqId], taskId);
+
+  // diagnose(reqId) must still report the associated task details
+  const diag = bridge.diagnose(reqId);
+  assert.ok(diag.task, 'diagnose must preserve associated task');
+  assert.equal(diag.task.id, taskId);
+  assert.equal(diag.task.title, 'Camp Half-Blood');
+  assert.deepEqual(diag.verificationConflicts, ['incompatible_title']);
 });
 
 
