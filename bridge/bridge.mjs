@@ -3080,6 +3080,7 @@ export class BridgeService {
               apiKey: this.shelfmarkApiKey,
               preferFormat: process.env.PREFER_FORMAT || 'epub',
               releaseSource: process.env.RELEASE_SOURCE || 'all',
+              providers: [null, 'googlebooks', 'hardcover'],
             },
           };
 
@@ -3241,6 +3242,75 @@ export class BridgeService {
            this.state.requestProgress[reqId] = progressEntry;
            this.state.requestStages[reqId] = progressEntry;
            this.state.requestStatus[reqId] = progressEntry;
+
+          // If no eligible releases found in initial search, but candidate(s) are in cooldown or had verification conflict,
+          // actively search alternative release sources before evaluating failure
+          if (eligibleReleases.length === 0) {
+            const hasCooldownInit = (candidateRejectionReasonCounts.cooldown || 0) > 0;
+            const priorVerInit = this.state.requestVerification?.[reqId];
+            const hasUnrecoverableConflictInit = priorVerInit && priorVerInit.ok === false && (
+              priorVerInit.conflicts?.includes('incompatible_title') ||
+              priorVerInit.conflicts?.includes('incompatible_author')
+            );
+            if (hasCooldownInit || hasUnrecoverableConflictInit) {
+              const failedSources = new Set(
+                (searchResults || [])
+                  .filter((rel) => {
+                    const rKey = this.getReleaseKey(rel);
+                    return rKey && this.state.failedReleases?.[rKey];
+                  })
+                  .map((rel) => (rel.extra?.source || rel.source || '').toLowerCase())
+                  .filter(Boolean)
+              );
+              if (priorVerInit?.task?.source) {
+                failedSources.add(priorVerInit.task.source.toLowerCase());
+              }
+              const candidateSources = ['libgen', 'aa-fast', 'aa-slow-nowait', 'zlib', 'oceanofpdf'];
+              const altSources = candidateSources.filter((s) => !failedSources.has(s));
+
+              for (const altSource of altSources) {
+                if (eligibleReleases.length > 0) break;
+                try {
+                  const altConfig = {
+                    ...config,
+                    settings: {
+                      ...config.settings,
+                      releaseSource: altSource,
+                    },
+                  };
+                  const altResults = await plugin.search(query, altConfig, host, searchController.signal);
+                  for (const rel of (altResults || [])) {
+                    const reason = getEditionIncompatibilityReason(reqForCompatibility, rel);
+                    const rKey = this.getReleaseKey(rel);
+                    const inCooldown = rKey && this.state.failedReleases?.[rKey] &&
+                      (Date.now() - new Date(this.state.failedReleases[rKey].failedAt).getTime() < this.releaseFailureCooldownMs);
+                    if (!reason && !inCooldown) {
+                      eligibleReleases.push(rel);
+                    } else if (inCooldown) {
+                      candidateRejectionReasonCounts.cooldown = (candidateRejectionReasonCounts.cooldown || 0) + 1;
+                    }
+                  }
+                } catch (_) {}
+              }
+
+              if (eligibleReleases.length > 0) {
+                eligibleReleases.sort((a, b) => {
+                  const ca = candidateCompatibility(reqForCompatibility, a);
+                  const cb = candidateCompatibility(reqForCompatibility, b);
+                  const langConflictA = ca.languageHint === 'mismatch' ? 1 : 0;
+                  const langConflictB = cb.languageHint === 'mismatch' ? 1 : 0;
+                  if (langConflictA !== langConflictB) return langConflictA - langConflictB;
+                  const isbnBoostA = ca.isbnVerified ? 0 : 1;
+                  const isbnBoostB = cb.isbnVerified ? 0 : 1;
+                  if (isbnBoostA !== isbnBoostB) return isbnBoostA - isbnBoostB;
+                  const langTierA = ca.languageHint === 'match' ? 0 : (ca.languageHint === 'unknown' ? 1 : 2);
+                  const langTierB = cb.languageHint === 'match' ? 0 : (cb.languageHint === 'unknown' ? 1 : 2);
+                  return langTierA - langTierB;
+                });
+                console.log(`[Bridge] Discovered ${eligibleReleases.length} eligible release(s) via alternative release source fallback for request ${reqId}`);
+              }
+            }
+          }
 
           if (eligibleReleases.length === 0) {
             const hasCooldown = (candidateRejectionReasonCounts.cooldown || 0) > 0;
@@ -5018,6 +5088,22 @@ export class BridgeService {
         if (firstFailedVer.errorType === 'finalization_failed') {
           task.status = 'finalization_failed';
           delete task.errorSource;
+
+          // Dismiss completed download task from Shelfmark activity so it does not report complete: 1
+          if (this.shelfmarkUrl && (task.taskId || task.id)) {
+            const smDismissId = task.taskId || task.id;
+            try {
+              const dismissHeaders = {
+                'Content-Type': 'application/json',
+                ...(this.shelfmarkApiKey ? { 'X-Api-Key': this.shelfmarkApiKey, 'Authorization': `Bearer ${this.shelfmarkApiKey}` } : {}),
+              };
+              await fetchFn(`${this.shelfmarkUrl}/api/activity/dismiss`, {
+                method: 'POST',
+                headers: dismissHeaders,
+                body: JSON.stringify({ item_type: 'download', item_key: `download:${smDismissId}` }),
+              }).catch(() => {});
+            } catch (_) {}
+          }
         } else {
           task.status = 'review_required';
           task.errorSource = firstFailedVer.languageReviewRequired
@@ -5668,7 +5754,7 @@ export class BridgeService {
               task.status = 'completed';
             }
             for (const rid of (task.requestIds || [])) {
-              this.setRequestProgress(rid, 'completed', { reason: 'completed' });
+              this.setRequestProgress(rid, 'verifying', { reason: 'download_verifying' });
             }
             task.filePath = verify.safePath;
             task.sizeBytes = verify.sizeBytes;

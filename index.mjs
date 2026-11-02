@@ -26,7 +26,7 @@ const inFlightResolutions = new Map();
 /** Confident bidirectional title equivalents. */
 export default {
   apiVersion: 1,
-  version: '1.8.3',
+  version: '1.8.4',
   update: {
     manifestUrl: 'https://raw.githubusercontent.com/esreddy2/bookorbit-plugin-shelfmark/main/updates/shelfmark.json',
     ed25519PublicKey: '-0aHVhXqg7cGaDchc2p1Y8tDnn8A7cJ0WREKspNv5Bc',
@@ -383,7 +383,7 @@ export default {
     // Providers to query: iterate through configured providers, or use default provider
     const metadataProviders = (Array.isArray(config.settings?.providers) && config.settings.providers.length > 0)
       ? config.settings.providers
-      : (config.settings?.provider ? [config.settings.provider] : (config.settings?.metadataProvider ? [config.settings.metadataProvider] : [null]));
+      : (config.settings?.provider ? [config.settings.provider] : (config.settings?.metadataProvider ? [config.settings.metadataProvider] : [null, 'googlebooks', 'hardcover']));
 
     // Query sequence:
     // 1. First query the decompression title iterating through all providers
@@ -472,6 +472,9 @@ export default {
               const newBooks = Array.isArray(metaData.books) ? metaData.books : (Array.isArray(metaData.items) ? metaData.items : (Array.isArray(metaData.results) ? metaData.results : []));
               if (newBooks.length > 0) {
                 books = [...books, ...newBooks];
+                if (hasValidCandidates(newBooks)) {
+                  break queryLoop;
+                }
               }
             } else if (metaRes.status === 401 || metaRes.status === 403) {
               throw host.fail('error', 'Shelfmark rejected authentication. Verify API key.');

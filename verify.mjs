@@ -82,7 +82,7 @@ import {
 import { inspectTitle } from './scripts/decomp.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
-const EXPECTED_VERSION = '1.8.3';
+const EXPECTED_VERSION = '1.8.4';
 const RELEASE_MODE = process.argv.includes('--release');
 const TEST_TIMEOUT_MS = 10_000;
 const tests = [];
@@ -143,6 +143,7 @@ const CONTRACT_ROUTES = Object.freeze([
   ['sm.metadata',   'GET',  /^\/api\/metadata\/search\/?$/],
   ['sm.releases',   'GET',  /^\/api\/releases\/?$/],
   ['sm.download',   'POST', /^\/api\/releases\/download\/?$/],
+  ['sm.dismiss',    'POST', /^\/api\/activity\/dismiss\/?$/],
   ['sm.local',      'GET',  /^\/api\/localdownload\/?$/],
 ]);
 
@@ -317,6 +318,7 @@ function apiScenarios({ requests = [], details = {}, books = [], releases = [], 
     'sm.releases': (entry) => response(onReleases ? onReleases(entry) : releases),
     'sm.status': () => response({ complete: {}, downloading: {}, queued: {}, error: {} }),
     'sm.download': (entry) => { onPost(entry); return response({ task_id: taskId }); },
+    'sm.dismiss': (entry) => { onPost(entry); return response({ status: 'dismissed', count: 1 }); },
     ...handlers,
   });
 }
@@ -5434,6 +5436,121 @@ test('HEALTH VISIBILITY: /api/status reports active unfulfilled requests in requ
     await closeServer(server);
     bridge.stop();
   }
+});
+
+test('RECONCILE STAGE: raw completed download marks request stage verifying, never completed before edition check', async () => {
+  const bridge = established(new BridgeService(bridgeOpts()));
+  const reqId = 'req-verify-stage';
+  const task = createTask(bridge, {
+    status: 'downloading',
+    filePath: null,
+    requestIds: [reqId],
+    title: 'Frankenstein',
+    author: 'Mary Shelley',
+  });
+  bridge.state.requests[reqId] = task.taskId;
+  bridge.setRequestProgress(reqId, 'downloading');
+
+  let uploaded = false;
+  const fake = apiScenarios({
+    'sm.status': response({
+      complete: {
+        [task.taskId]: { id: task.taskId, title: task.title, format: 'epub', target: FILES.validEpub },
+      },
+      downloading: {},
+      queued: {},
+      error: {},
+    }),
+    requests: [request(reqId, task.title, task.author)],
+    'bo.upload': () => {
+      assert.notEqual(bridge.state.requestProgress[reqId]?.stage, 'completed', 'stage must not be completed before fulfillment');
+      uploaded = true;
+      return response({ id: 1950 });
+    },
+    'bo.fulfill': { status: 'AVAILABLE' },
+  });
+
+  await bridge.reconcile({ fetchFn: fake.fetch });
+  assert.ok(uploaded, 'upload must occur');
+  assert.equal(bridge.state.requestProgress[reqId]?.stage, 'fulfilled');
+});
+
+test('DISMISSAL ON MISMATCH: finalization_failed calls Shelfmark activity dismissal', async () => {
+  const bridge = established(new BridgeService(bridgeOpts()));
+  const reqId = 'req-dismiss-mismatch';
+  const task = createTask(bridge, {
+    status: 'completed',
+    filePath: FILES.validEpub,
+    requestIds: [reqId],
+    title: 'The Wild Zone',
+    author: 'Rick Riordan',
+    releaseKey: 'oceanofpdf:mismatch-key',
+  });
+  bridge.state.requests[reqId] = task.taskId;
+  bridge.setRequestProgress(reqId, 'verifying');
+
+  let dismissedItemKey = null;
+  const fake = apiScenarios({
+    requests: [request(reqId, 'The Wild Zone', 'Rick Riordan')],
+    'sm.dismiss': (entry) => {
+      const body = expectedJson(entry.options);
+      dismissedItemKey = body.item_key;
+      return response({ status: 'dismissed', count: 1 });
+    },
+  });
+
+  const res = await bridge.fulfillBookOrbitRequests(task, fake.fetch);
+  assert.equal(res.fulfilled, false);
+  assert.equal(task.status, 'finalization_failed');
+  assert.equal(dismissedItemKey, `download:${task.taskId}`, 'must dismiss rejected download from Shelfmark activity');
+});
+
+test('SOURCE FALLBACK: queries alternative release source when primary source candidate is in cooldown', async () => {
+  const bridge = established(new BridgeService(bridgeOpts({ releaseFailureCooldownMs: 60_000 })));
+  const reqId = 'req-source-fallback';
+  const req = request(reqId, 'The Wild Zone', 'Rick Riordan');
+  const oopKey = 'oceanofpdf:oop-wild-zone';
+  bridge.state.failedReleases[oopKey] = {
+    releaseKey: oopKey,
+    source: 'oceanofpdf',
+    sourceId: 'oop-wild-zone',
+    failedAt: new Date().toISOString(),
+    error: 'EPUB title mismatch: expected "The Wild Zone", got "Camp Half-Blood"',
+  };
+
+  const oopRel = release('The Wild Zone (Camp Half-Blood #1)', 'Rick Riordan', {
+    source: 'oceanofpdf',
+    source_id: 'oop-wild-zone',
+    format: 'epub',
+  });
+  const libgenRel = release('The Wild Zone', 'Rick Riordan', {
+    source: 'libgen',
+    source_id: 'libgen-wild-zone-valid',
+    format: 'epub',
+  });
+
+  let queuedTaskId = null;
+  const fake = apiScenarios({
+    requests: [req],
+    books: [metadata('The Wild Zone', 'Rick Riordan')],
+    releases: [oopRel],
+    'sm.releases': ({ query }) => {
+      const source = query.get('source');
+      if (source === 'libgen') {
+        return response({ releases: [libgenRel] });
+      }
+      return response({ releases: [oopRel] });
+    },
+    'sm.download': ({ options }) => {
+      const p = expectedJson(options);
+      queuedTaskId = `task-${p.source_id}`;
+      return response({ task_id: queuedTaskId });
+    },
+  });
+
+  await bridge.processPendingRequests({ fetchFn: fake.fetch });
+  assert.equal(queuedTaskId, 'task-libgen-wild-zone-valid', 'must query and queue from alternative release source (libgen) when primary is in cooldown');
+  assert.equal(bridge.state.requestProgress[reqId]?.stage, 'queued');
 });
 
 
