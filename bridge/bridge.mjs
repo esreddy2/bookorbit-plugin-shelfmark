@@ -2791,7 +2791,10 @@ export class BridgeService {
     let token = '';
     try { token = await this.authManager.getValidToken(); } catch {}
     token = token || this.bookorbitToken || this.bookorbitApiKey;
-    const headers = token ? (isJwt(token) ? { 'Authorization': `Bearer ${token}` } : { 'X-Api-Key': token }) : {};
+    const headers = {
+      ...(token && isJwt(token) ? { 'Authorization': `Bearer ${token}` } : {}),
+      ...(this.bookorbitApiKey ? { 'X-Api-Key': this.bookorbitApiKey } : (token && !isJwt(token) ? { 'X-Api-Key': token } : {})),
+    };
 
     // 1. Try BookOrbit v3.5.0's valid individual request endpoint when authorized.
     try {
@@ -2865,7 +2868,7 @@ export class BridgeService {
     const headers = {
       'Content-Type': 'application/json',
       ...(token && isJwt(token) ? { 'Authorization': `Bearer ${token}` } : {}),
-      ...(this.bookorbitApiKey ? { 'X-Api-Key': this.bookorbitApiKey } : {}),
+      ...(this.bookorbitApiKey ? { 'X-Api-Key': this.bookorbitApiKey } : (token && !isJwt(token) ? { 'X-Api-Key': token } : {})),
     };
 
     const attempts = this.state.requestSourceAttempts[reqIdStr] || details.attempts || this.maxSourceAttempts;
@@ -2912,9 +2915,21 @@ export class BridgeService {
           decisionNote: note,
           reason,
         };
+        delete this.state.requests[reqIdStr];
         this.setRequestProgress(reqIdStr, 'rejected', { reason: 'rejected_in_bookorbit', decisionNote: note });
         this.saveState();
         console.log(`[Bridge] Successfully rejected BookOrbit request ${reqIdStr} with diagnostic note.`);
+        return true;
+      } else if (res && (res.status === 404 || res.status === 409)) {
+        this.state.rejectedRequests = this.state.rejectedRequests || {};
+        this.state.rejectedRequests[reqIdStr] = {
+          rejectedAt: new Date().toISOString(),
+          decisionNote: note,
+          reason,
+        };
+        delete this.state.requests[reqIdStr];
+        this.setRequestProgress(reqIdStr, 'rejected', { reason: 'already_settled_in_bookorbit', decisionNote: note });
+        this.saveState();
         return true;
       } else {
         console.warn(`[Bridge] BookOrbit reject request returned HTTP ${res?.status} for request ${reqIdStr}`);
@@ -3031,11 +3046,15 @@ export class BridgeService {
 
           // Cancellation-aware: check request status before queueing/searching
           const requestState = await this.getRequestStatus(reqId, fetchFn);
-          if (requestState === 'cancelled') {
-            this.setRequestProgress(reqId, 'cancelled', { reason: 'cancelled' });
+          if (requestState === 'cancelled' || requestState === 'rejected') {
+            this.setRequestProgress(reqId, requestState === 'rejected' ? 'rejected' : 'cancelled', { reason: requestState });
             continue;
           }
-          if (requestState !== 'active') {
+          if (requestState === 'fulfilled') {
+            this.setRequestProgress(reqId, 'fulfilled', { reason: 'fulfilled' });
+            continue;
+          }
+          if (requestState !== 'active' && req.status !== 'approved') {
             this.setRequestProgress(reqId, 'status_unknown', { reason: 'status_unknown' });
             continue;
           }
@@ -3225,6 +3244,38 @@ export class BridgeService {
 
           if (eligibleReleases.length === 0) {
             const hasCooldown = (candidateRejectionReasonCounts.cooldown || 0) > 0;
+            const priorVer = this.state.requestVerification?.[reqId];
+            const hasUnrecoverableConflict = priorVer && priorVer.ok === false && (
+              priorVer.conflicts?.includes('incompatible_title') ||
+              priorVer.conflicts?.includes('incompatible_author')
+            );
+            const currentAttempts = this.state.requestSourceAttempts[reqId] || 0;
+
+            // Terminal rejection: either maxSourceAttempts reached OR all candidates failed with unrecoverable conflict
+            if (currentAttempts >= this.maxSourceAttempts || (hasUnrecoverableConflict && (searchResults?.length || 0) <= (candidateRejectionReasonCounts.cooldown || 0))) {
+              const stage = priorVer?.stage || (hasUnrecoverableConflict ? 'finalization_failed' : 'exhausted');
+              const reason = priorVer?.error || (hasUnrecoverableConflict ? `Unrecoverable verification conflict: ${priorVer.primaryConflict || priorVer.conflicts?.join(', ')}` : (ineligibilityReason || 'no_eligible_edition'));
+              console.warn(`[Bridge] Terminally rejecting BookOrbit request ${reqId} ("${query.title}"): ${reason}`);
+              this.setRequestProgress(reqId, 'rejected', {
+                reason,
+                exhaustionReason: hasUnrecoverableConflict ? 'unrecoverable_conflict' : 'max_attempts_exhausted',
+                conflicts: priorVer?.conflicts,
+                ...candidateCounts,
+              });
+              await this.rejectBookOrbitRequest(reqId, {
+                stage,
+                reason,
+                req,
+                searchTitle: query.title,
+                exhaustionReason: hasUnrecoverableConflict ? 'unrecoverable_conflict' : 'max_attempts_exhausted',
+                conflicts: priorVer?.conflicts,
+                observedTitle: priorVer?.observedTitle || undefined,
+                observedAuthor: priorVer?.observedAuthor || undefined,
+              }, fetchFn);
+              this.saveState();
+              continue;
+            }
+
             if (hasCooldown) {
               let earliestExpiry = Date.now() + this.releaseFailureCooldownMs;
               for (const rel of (searchResults || [])) {
@@ -3249,7 +3300,6 @@ export class BridgeService {
             }
 
             const reason = ineligibilityReason || 'no_eligible_edition';
-            const priorVer = this.state.requestVerification?.[reqId];
             if (priorVer && priorVer.ok === false) {
               const priorStage = priorVer.stage || 'review_required';
               const priorReason = priorVer.errorType || reason;
@@ -4895,6 +4945,8 @@ export class BridgeService {
             conflicts: ver.conflicts || [],
             evidence: ver.evidence || [],
             error: ver.error || null,
+            observedTitle: ver.opf?.rawTitle || ver.opf?.title || task.title || null,
+            observedAuthor: ver.opf?.author || task.author || null,
             verifiedAt: nowVer,
           };
         }
@@ -5969,6 +6021,52 @@ export class BridgeService {
        report.candidateRejectionReasonCounts = candidateRejectionReasonCounts;
        if (hasMeta) report.metadataCandidateCount = metadataTotal;
        if (hasRel) report.releaseCandidateCount = releaseTotal;
+
+       // Structured listing of all tracked requests for administrative visibility
+       const allRequestIds = new Set([
+         ...Object.keys(progress),
+         ...Object.keys(requests),
+         ...Object.keys(sourceAttempts),
+         ...Object.keys(errors),
+         ...Object.keys(this.state.requestTasks || {}),
+       ]);
+       const tracked = [];
+       for (const rid of allRequestIds) {
+         const p = progress[rid] || {};
+         const tId = requests[rid] || this.state.requestTasks?.[rid] || null;
+         const t = tId ? tasks[tId] : null;
+         tracked.push({
+           requestId: rid,
+           stage: p.stage || p.status || 'unknown',
+           reason: this.state.requestFailureReasons?.[rid] || p.reason || null,
+           attempts: sourceAttempts[rid] ?? 0,
+           maxAttempts: this.maxSourceAttempts,
+           activeTaskId: requests[rid] || null,
+           associatedTaskId: tId,
+           taskStatus: t ? (t.status || t.state || 'unknown') : null,
+           error: errors[rid]?.error || null,
+           rejectedInBookOrbit: !!this.state.rejectedRequests?.[rid],
+           cooldownUntil: p.cooldownUntil || null,
+           updatedAt: p.updatedAt || null,
+         });
+       }
+       report.trackedRequests = tracked;
+
+       const shelfmarkDownloaded = Object.values(tasks).filter(
+         (t) => ['completed', 'awaiting_file', 'imported', 'partially_fulfilled', 'fulfilled', 'finalization_failed', 'review_required'].includes(t.status)
+       ).length;
+       const companionFulfilled = Object.values(tasks).filter((t) => t.status === 'fulfilled').length;
+       const rejectedInBookOrbitCount = Object.keys(this.state.rejectedRequests || {}).length;
+
+       report.fulfillmentStats = {
+         shelfmarkDownloadedTasks: shelfmarkDownloaded,
+         companionFulfilledTasks: companionFulfilled,
+         bookorbitRejectedRequests: rejectedInBookOrbitCount,
+         totalTrackedRequests: allRequestIds.size,
+         activeUnfulfilledRequests: tracked.filter(
+           (r) => !['fulfilled', 'rejected', 'cancelled'].includes(r.stage)
+         ).length,
+       };
      }
 
      return redactSensitive(report);
@@ -6179,10 +6277,15 @@ export class BridgeService {
       if (req.method === 'GET' && url.pathname === '/api/status') {
         await runLocked(async () => {
           res.writeHead(200, { 'Content-Type': 'application/json' });
+          const activeUnfulfilledRequests = Object.values(this.state.requestProgress || {}).filter(
+            (p) => p && !['fulfilled', 'rejected', 'cancelled'].includes(p.stage)
+          ).length;
           res.end(JSON.stringify({
             status: 'healthy',
             tasksCount: Object.keys(this.state.tasks).length,
-            requestsCount: Object.keys(this.state.requests).length,
+            requestsCount: Math.max(Object.keys(this.state.requests).length, activeUnfulfilledRequests),
+            activeRequestsCount: activeUnfulfilledRequests,
+            activeMappingCount: Object.keys(this.state.requests).length,
             baselineCount: Object.keys(this.state.baselineRequestIds || {}).length,
             uncertainCount: Object.keys(this.state.uncertainQueues || {}).length,
             socketConnected: this.socketClient ? this.socketClient.isConnected : false,

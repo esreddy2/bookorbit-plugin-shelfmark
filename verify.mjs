@@ -79,9 +79,10 @@ import {
   decomposeTitleStructure,
   generateDelimiterSlidingWindows,
 } from './bridge/bridge.mjs';
+import { inspectTitle } from './scripts/decomp.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
-const EXPECTED_VERSION = '1.8.2';
+const EXPECTED_VERSION = '1.8.3';
 const RELEASE_MODE = process.argv.includes('--release');
 const TEST_TIMEOUT_MS = 10_000;
 const tests = [];
@@ -470,7 +471,7 @@ test('RELEASE CONTRACT: package version, plugin version and release target agree
   assert.equal(plugin.version, EXPECTED_VERSION);
 });
 if (RELEASE_MODE) {
-  test('RELEASE: signed manifest has declared format and v1.8.2 version', () => {
+  test(`RELEASE: signed manifest has declared format and v${EXPECTED_VERSION} version`, () => {
     const manifest = JSON.parse(readFileSync(join(HERE, 'updates', 'shelfmark.json'), 'utf8'));
     assert.equal(manifest.schemaVersion, 1);
     assert.equal(manifest.type, 'shelfmark');
@@ -4695,6 +4696,24 @@ test('DECOMPOSITION: decomposes unnumbered franchise/series/character prefixes i
   assert.equal(charmedLifeDecomp.canonicalTitle, 'Charmed Life');
 });
 
+test('DECOMPOSITION CLI: inspectTitle provides structured decomposition, candidates, and match evaluation', async () => {
+  const lotr = inspectTitle('The Lord of the Rings: Fellowship of the Ring');
+  assert.equal(lotr.canonicalTitle, 'Fellowship of the Ring');
+  assert.equal(lotr.seriesPrefix, 'The Lord of the Rings');
+  assert.ok(lotr.searchCandidates.includes('Fellowship of the Ring'));
+
+  const percy = inspectTitle('Percy Jackson book 5: The Last Olympian', {
+    author: 'Rick Riordan',
+    expectedTitle: 'The Last Olympian',
+    candidateTitle: 'Summary and Analysis of Percy Jackson',
+  });
+  assert.equal(percy.canonicalTitle, 'The Last Olympian');
+  assert.equal(percy.volumeNumber, 5);
+  assert.equal(percy.expectedEvaluation?.pass, true);
+  assert.equal(percy.candidateEvaluation?.isNoiseDerivative, true);
+  assert.equal(percy.candidateEvaluation?.isMatch, false);
+});
+
 test('CANDIDATE-ORDERING: purely algorithmic numeric title equivalences handle arbitrary numbers', async () => {
   // Test pure 4-digit years
   assert.ok(KNOWN_TITLE_EQUIVALENTS.get('1984').includes('nineteen eighty-four'));
@@ -5270,6 +5289,150 @@ test('COOLDOWN_WAIT: holding state activates when all edition-compatible candida
     assert.ok(bridge.state.requestProgress[reqId]?.cooldownUntil, 'cooldownUntil timestamp is present');
   } finally {
     plugin.search = originalSearch;
+  }
+});
+
+test('BOOKORBIT REJECTION: unrecoverable incompatible_title conflict with all candidates in cooldown rejects in BookOrbit', async () => {
+  const bridge = established(new BridgeService(bridgeOpts()));
+  const reqId = 'req-unrec-mismatch';
+  const req = request(reqId, 'Camp Half-Blood: From the World of Percy Jackson: The Wild Zone', 'Rick Riordan');
+  const releaseKey = 'oceanofpdf:rel-wild-zone';
+
+  // Seed prior verification failure: downloaded EPUB had contradictory main title "Camp Half-Blood"
+  bridge.state.requestVerification[reqId] = {
+    ok: false,
+    taskId: 'oceanofpdf:task-1',
+    releaseKey,
+    stage: 'finalization_failed',
+    errorType: 'finalization_failed',
+    primaryConflict: 'incompatible_title',
+    conflicts: ['incompatible_title'],
+    evidence: [{ field: 'title', status: 'contradictory', expected: req.title, observed: 'Camp Half-Blood' }],
+    error: 'EPUB title mismatch: expected "Camp Half-Blood: From the World of Percy Jackson: The Wild Zone", got "Camp Half-Blood"',
+    observedTitle: 'Camp Half-Blood',
+    observedAuthor: 'Rick Riordan',
+    verifiedAt: new Date().toISOString(),
+  };
+
+  // Release is in cooldown
+  bridge.state.failedReleases[releaseKey] = {
+    releaseKey,
+    source: 'oceanofpdf',
+    sourceId: 'rel-wild-zone',
+    failedAt: new Date().toISOString(),
+    error: bridge.state.requestVerification[reqId].error,
+  };
+
+  const soleRel = {
+    guid: JSON.stringify({ source: 'oceanofpdf', source_id: 'rel-wild-zone' }),
+    source: 'oceanofpdf',
+    sourceId: 'rel-wild-zone',
+    title: 'The Wild Zone (Camp Half-Blood #1)',
+    author: 'Rick Riordan',
+    format: 'epub',
+  };
+
+  let rejectedNote = null;
+  const originalSearch = plugin.search;
+  plugin.search = async () => [soleRel];
+
+  try {
+    const fake = apiScenarios({
+      requests: [req],
+      'bo.reject': (entry) => {
+        const body = expectedJson(entry.options);
+        rejectedNote = body.decisionNote;
+        return response({ success: true });
+      },
+    });
+
+    await bridge.processPendingRequests({ fetchFn: fake.fetch });
+
+    assert.ok(rejectedNote, 'rejectBookOrbitRequest must be called immediately for unrecoverable verification conflicts');
+    assert.ok(rejectedNote.includes('incompatible_title'), 'decision note must include incompatible_title conflict');
+    assert.ok(rejectedNote.includes('Camp Half-Blood'), 'decision note must include observed title');
+    assert.equal(bridge.state.requestProgress[reqId]?.stage, 'rejected', 'companion stage transitions to rejected');
+    assert.ok(bridge.state.rejectedRequests[reqId], 'rejection is durably recorded in state');
+  } finally {
+    plugin.search = originalSearch;
+    bridge.stop();
+  }
+});
+
+test('APPROVED STATUS PRESERVATION: approved request from admin list is not downgraded to status_unknown by auxiliary check', async () => {
+  const bridge = established(new BridgeService(bridgeOpts()));
+  const reqId = 'req-preserve-approved';
+  const req = request(reqId, 'The Great Gatsby', 'F. Scott Fitzgerald');
+
+  let searchCalled = false;
+  const originalSearch = plugin.search;
+  plugin.search = async () => {
+    searchCalled = true;
+    return [];
+  };
+
+  try {
+    const fake = apiScenarios({
+      requests: [req],
+      // Single-request lookup fails with 404 (simulating unowned request / service account limitation)
+      'bo.request': failResponse(404, 'Not Found'),
+    });
+
+    await bridge.processPendingRequests({ fetchFn: fake.fetch });
+
+    assert.ok(searchCalled, 'plugin search must proceed for approved requests even if bo.request returns 404');
+    assert.notEqual(bridge.state.requestProgress[reqId]?.stage, 'status_unknown', 'stage must not be set to status_unknown');
+  } finally {
+    plugin.search = originalSearch;
+    bridge.stop();
+  }
+});
+
+test('DIAGNOSTICS VISIBILITY: global diagnose lists all tracked requests and fulfillment stats', async () => {
+  const bridge = new BridgeService(bridgeOpts());
+  bridge.state.tasks['task-done'] = { id: 'task-done', status: 'fulfilled', title: 'Book 1', author: 'Author 1' };
+  bridge.state.tasks['task-failed'] = { id: 'task-failed', status: 'finalization_failed', title: 'Book 2', author: 'Author 2' };
+  bridge.state.requestProgress['req-101'] = { stage: 'searching', status: 'searching', updatedAt: new Date().toISOString() };
+  bridge.state.requestProgress['req-102'] = { stage: 'cooldown_wait', status: 'cooldown_wait', cooldownUntil: new Date().toISOString() };
+  bridge.state.requestTasks['req-102'] = 'task-failed';
+  bridge.state.requestErrors['req-102'] = { error: 'EPUB title mismatch' };
+
+  const diag = bridge.diagnose();
+  assert.ok(Array.isArray(diag.trackedRequests), 'trackedRequests must be an array');
+  assert.equal(diag.trackedRequests.length, 2);
+
+  const req102 = diag.trackedRequests.find((r) => r.requestId === 'req-102');
+  assert.ok(req102);
+  assert.equal(req102.stage, 'cooldown_wait');
+  assert.equal(req102.associatedTaskId, 'task-failed');
+  assert.equal(req102.error, 'EPUB title mismatch');
+
+  assert.ok(diag.fulfillmentStats, 'fulfillmentStats must be present');
+  assert.equal(diag.fulfillmentStats.shelfmarkDownloadedTasks, 2);
+  assert.equal(diag.fulfillmentStats.companionFulfilledTasks, 1);
+  assert.equal(diag.fulfillmentStats.activeUnfulfilledRequests, 2);
+});
+
+test('HEALTH VISIBILITY: /api/status reports active unfulfilled requests in requestsCount even when unmapped', async () => {
+  const bridge = new BridgeService(bridgeOpts({ secret: 'test-secret' }));
+  bridge.state.requestProgress['req-active-1'] = { stage: 'searching', status: 'searching' };
+  bridge.state.requestProgress['req-active-2'] = { stage: 'cooldown_wait', status: 'cooldown_wait' };
+  bridge.state.requestProgress['req-done'] = { stage: 'fulfilled', status: 'fulfilled' };
+  // state.requests is empty (no active in-flight task)
+  assert.equal(Object.keys(bridge.state.requests).length, 0);
+
+  const server = bridge.createServer(0, '127.0.0.1');
+  const url = await listen(server);
+  try {
+    const res = await fetch(`${url}/api/status`, { signal: AbortSignal.timeout(1000) });
+    assert.equal(res.status, 200);
+    const body = await res.json();
+    assert.equal(body.requestsCount, 2, 'requestsCount must reflect active unfulfilled requests');
+    assert.equal(body.activeRequestsCount, 2);
+    assert.equal(body.activeMappingCount, 0);
+  } finally {
+    await closeServer(server);
+    bridge.stop();
   }
 });
 
