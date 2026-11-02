@@ -1581,8 +1581,20 @@ export function verifyDownloadedEdition(task, reqSpec = {}) {
         }
       }
       if (opf.title && !candidateTitles.includes(opf.title)) candidateTitles.push(opf.title);
+      if (opf.subtitle && !candidateTitles.includes(opf.subtitle)) candidateTitles.push(opf.subtitle);
+      if (Array.isArray(opf.subtitles)) {
+        for (const s of opf.subtitles) {
+          if (s && !candidateTitles.includes(s)) candidateTitles.push(s);
+        }
+      }
       if (opf.series && opf.rawTitle && !candidateTitles.includes(`${opf.series}: ${opf.rawTitle}`)) {
         candidateTitles.push(`${opf.series}: ${opf.rawTitle}`);
+      }
+      if (opf.series && opf.subtitle && !candidateTitles.includes(`${opf.series}: ${opf.subtitle}`)) {
+        candidateTitles.push(`${opf.series}: ${opf.subtitle}`);
+      }
+      if (opf.rawTitle && opf.subtitle && !candidateTitles.includes(`${opf.rawTitle}: ${opf.subtitle}`)) {
+        candidateTitles.push(`${opf.rawTitle}: ${opf.subtitle}`);
       }
 
       const matchOpts = {
@@ -3213,8 +3225,19 @@ export class BridgeService {
 
           if (eligibleReleases.length === 0) {
             const hasCooldown = (candidateRejectionReasonCounts.cooldown || 0) > 0;
-            if (hasCooldown && Object.keys(candidateRejectionReasonCounts).length === 1) {
-              const cooldownUntil = new Date(Date.now() + this.releaseFailureCooldownMs).toISOString();
+            if (hasCooldown) {
+              let earliestExpiry = Date.now() + this.releaseFailureCooldownMs;
+              for (const rel of (searchResults || [])) {
+                const rKey = this.getReleaseKey(rel);
+                const failedRecord = rKey && this.state.failedReleases?.[rKey];
+                if (failedRecord && failedRecord.failedAt) {
+                  const expiry = new Date(failedRecord.failedAt).getTime() + this.releaseFailureCooldownMs;
+                  if (expiry > Date.now() && expiry < earliestExpiry) {
+                    earliestExpiry = expiry;
+                  }
+                }
+              }
+              const cooldownUntil = new Date(earliestExpiry).toISOString();
               console.log(`[Bridge] All candidates in cooldown for request ${reqId}; holding in cooldown_wait until ${cooldownUntil}`);
               this.setRequestProgress(reqId, 'cooldown_wait', {
                 reason: 'cooldown_wait',
@@ -4671,6 +4694,19 @@ export class BridgeService {
   recordTaskFailureAttempts(task, errorType = 'finalization_failed', fetchFn = globalThis.fetch) {
     const now = new Date().toISOString();
     const attemptId = `${errorType}:${task.taskId}`;
+    if (task.releaseKey) {
+      if (this.state.releases && this.state.releases[task.releaseKey] === (task.taskId || task.id)) {
+        delete this.state.releases[task.releaseKey];
+      }
+      this.state.failedReleases = this.state.failedReleases || {};
+      this.state.failedReleases[task.releaseKey] = {
+        releaseKey: task.releaseKey,
+        source: task.source,
+        sourceId: task.sourceId,
+        failedAt: now,
+        error: task.error || errorType,
+      };
+    }
     for (const rid of (task.requestIds || [])) {
       if (task.requestFulfillments?.[rid]?.fulfilled) continue;
       this.state.requestTasks = this.state.requestTasks || {};
@@ -4679,8 +4715,8 @@ export class BridgeService {
       if (!this.state.requestAttempts[rid].some((a) => a.attemptId === attemptId)) {
         this.state.requestAttempts[rid].push({ attemptId, taskId: task.taskId, releaseKey: task.releaseKey, timestamp: now, error: task.error });
       }
-      const attempts = this.state.requestAttempts[rid].length;
-      this.state.requestSourceAttempts[rid] = Math.max(this.state.requestSourceAttempts[rid] || 0, attempts);
+      const attempts = Math.max(this.state.requestAttempts[rid].length, (this.state.requestSourceAttempts[rid] || 0) + 1);
+      this.state.requestSourceAttempts[rid] = attempts;
       this.state.requestErrors[rid] = { error: task.error, errorType, lastAttemptAt: now, attempts: this.state.requestSourceAttempts[rid] };
       delete this.state.requests[rid];
       if ((this.state.requestSourceAttempts[rid] || 0) < this.maxSourceAttempts) {
@@ -4822,7 +4858,7 @@ export class BridgeService {
       if (!task.filePath) {
         task.status = 'finalization_failed';
         task.error = 'Task filePath is missing';
-        this.recordTaskFailureAttempts(task, 'finalization_failed');
+        this.recordTaskFailureAttempts(task, 'finalization_failed', fetchFn);
         this.saveState();
         if ((task.requestIds || []).some((rid) => (this.state.requestSourceAttempts[rid] || 0) < this.maxSourceAttempts)) {
           this.triggerProcessPendingRequests(100);
@@ -4889,8 +4925,8 @@ export class BridgeService {
                 error: ver.error,
               });
             }
-            const attempts = this.state.requestAttempts[rid].length;
-            this.state.requestSourceAttempts[rid] = Math.max(this.state.requestSourceAttempts[rid] || 0, attempts);
+            const attempts = Math.max(this.state.requestAttempts[rid].length, (this.state.requestSourceAttempts[rid] || 0) + 1);
+            this.state.requestSourceAttempts[rid] = attempts;
             this.state.requestErrors[rid] = {
               error: ver.error,
               errorType: ver.errorType || 'edition_verification_failed',
@@ -5002,7 +5038,7 @@ export class BridgeService {
           } else if (directResult.conflict) {
             task.status = 'finalization_failed';
             task.error = directResult.error;
-            this.recordTaskFailureAttempts(task, 'finalization_failed');
+            this.recordTaskFailureAttempts(task, 'finalization_failed', fetchFn);
             this.saveState();
             if ((task.requestIds || []).some((rid) => (this.state.requestSourceAttempts[rid] || 0) < this.maxSourceAttempts)) {
               this.triggerProcessPendingRequests(100);
@@ -5011,7 +5047,7 @@ export class BridgeService {
           } else if (directResult.notFound) {
             task.status = 'finalization_failed';
             task.error = directResult.error || 'Direct library upload endpoint not available';
-            this.recordTaskFailureAttempts(task, 'finalization_failed');
+            this.recordTaskFailureAttempts(task, 'finalization_failed', fetchFn);
             this.saveState();
             if ((task.requestIds || []).some((rid) => (this.state.requestSourceAttempts[rid] || 0) < this.maxSourceAttempts)) {
               this.triggerProcessPendingRequests(100);
@@ -5031,7 +5067,7 @@ export class BridgeService {
           } else {
             task.status = 'finalization_failed';
             task.error = directResult.error;
-            this.recordTaskFailureAttempts(task, 'finalization_failed');
+            this.recordTaskFailureAttempts(task, 'finalization_failed', fetchFn);
             this.saveState();
             if ((task.requestIds || []).some((rid) => (this.state.requestSourceAttempts[rid] || 0) < this.maxSourceAttempts)) {
               this.triggerProcessPendingRequests(100);
@@ -5045,7 +5081,7 @@ export class BridgeService {
     if (!matchedBookId) {
       task.status = 'finalization_failed';
       task.error = 'Finalization did not yield a valid BookOrbit book ID';
-      this.recordTaskFailureAttempts(task, 'finalization_failed');
+      this.recordTaskFailureAttempts(task, 'finalization_failed', fetchFn);
       this.saveState();
       if ((task.requestIds || []).some((rid) => (this.state.requestSourceAttempts[rid] || 0) < this.maxSourceAttempts)) {
         this.triggerProcessPendingRequests(100);
@@ -5534,7 +5570,7 @@ export class BridgeService {
       if (task.status === 'fulfilled') {
         continue;
       }
-      if (task.isbnVerificationFailed || task.editionVerificationFailed) {
+      if (task.isbnVerificationFailed || task.editionVerificationFailed || task.status === 'finalization_failed' || task.status === 'review_required') {
         continue;
       }
 
@@ -5567,10 +5603,10 @@ export class BridgeService {
         }
       }
 
-      if (completedMap.has(taskIdStr) && task.status !== 'cancelled' && task.status !== 'fulfilled') {
+      if (completedMap.has(taskIdStr) && task.status !== 'cancelled' && task.status !== 'fulfilled' && task.status !== 'finalization_failed' && task.status !== 'review_required' && !task.editionVerificationFailed && !task.isbnVerificationFailed) {
         // Shelfmark positively reports completion for this exact task ID!
-        // Recovers tasks in 'queued', 'downloading', 'awaiting_file', 'completed', 'finalization_failed',
-        // or earlier 'failed' (from transient verification failure)
+        // Recovers tasks in 'queued', 'downloading', 'awaiting_file', 'completed',
+        // or earlier transient verification failure
         const smTask = completedMap.get(taskIdStr);
         const candidatePath = smTask.download_path || smTask.file_path || smTask.target || smTask.paths?.target || smTask.final_paths?.[0] || task.filePath;
         if (candidatePath) {
@@ -5705,7 +5741,7 @@ export class BridgeService {
             this.triggerProcessPendingRequests(100);
           }
         }
-      } else if (task.status === 'completed' || task.status === 'imported' || task.status === 'finalization_failed' || task.status === 'partially_fulfilled' || task.status === 'uncertain_upload') {
+      } else if (task.status === 'completed' || task.status === 'imported' || task.status === 'partially_fulfilled' || task.status === 'uncertain_upload') {
         // Task completed or partially fulfilled mid-flight; retry fulfillment
         if (this.bookorbitUrl) {
           // Do not retry fulfillment for tasks whose requests are all cancelled.

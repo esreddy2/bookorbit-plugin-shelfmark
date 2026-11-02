@@ -8,6 +8,7 @@
  *   node scripts/diagnose.mjs [requestId]
  */
 
+import { existsSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { BridgeService } from '../bridge/bridge.mjs';
@@ -37,7 +38,14 @@ async function run() {
   } catch {}
 
   // Fallback: inspect disk state directly without launching server
-  const stateFile = process.env.STATE_FILE_PATH || path.resolve(process.cwd(), '.bridge-state.json');
+  const candidateStateFiles = [
+    process.env.STATE_FILE_PATH,
+    '/data/companion-state.json',
+    '/data/.bridge-state.json',
+    path.resolve(process.cwd(), '.bridge-state.json'),
+    path.resolve(root, '.bridge-state.json'),
+  ].filter(Boolean);
+  let stateFile = candidateStateFiles.find((f) => existsSync(f)) || candidateStateFiles[0];
   const bridge = new BridgeService({
     host,
     stateFilePath: stateFile,

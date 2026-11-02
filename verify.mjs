@@ -5179,6 +5179,100 @@ test('MAX SOURCE ATTEMPTS TERMINAL REJECTION: reconcile and recordTaskFailureAtt
   assert.ok(['rejected', 'exhausted'].includes(bridge.state.requestProgress['req-exhaust'].stage));
 });
 
+test('RECONCILE LOOP PREVENTION: tasks in finalization_failed are not resurrected into completed state by Shelfmark complete status', async () => {
+  const bridge = established(new BridgeService(bridgeOpts()));
+  const task = createTask(bridge, {
+    status: 'finalization_failed',
+    filePath: '/tmp/nonexistent-failed.epub',
+    format: 'epub',
+    requestIds: ['req-failed-fin'],
+    title: 'Failed Finalization Book',
+    author: 'Some Author',
+  });
+  task.editionVerificationFailed = true;
+  bridge.state.tasks[task.taskId] = task;
+  bridge.state.requestProgress['req-failed-fin'] = { stage: 'finalization_failed', reason: 'incompatible_title' };
+
+  let fulfillCalled = 0;
+  bridge.fulfillBookOrbitRequests = async () => { fulfillCalled++; };
+
+  const fake = apiScenarios({
+    'sm.status': response({
+      complete: {
+        [task.taskId]: { id: task.taskId, title: task.title, download_path: '/tmp/nonexistent-failed.epub' },
+      },
+    }),
+  });
+
+  await bridge.reconcile({ fetchFn: fake.fetch });
+
+  assert.equal(fulfillCalled, 0, 'fulfillBookOrbitRequests was NOT re-called for finalization_failed task');
+  assert.equal(bridge.state.tasks[task.taskId].status, 'finalization_failed', 'task status remained finalization_failed');
+  assert.equal(bridge.state.requestProgress['req-failed-fin'].stage, 'finalization_failed', 'request progress remained finalization_failed');
+});
+
+test('COOLDOWN_WAIT: holding state activates when all edition-compatible candidates are in cooldown even if other incompatible releases exist', async () => {
+  const bridge = established(new BridgeService(bridgeOpts({ releaseFailureCooldownMs: 3600000 })));
+  const reqId = 'req-cd-mixed';
+  bridge.state.baselineRequestIds = {};
+  bridge.state.baselineEstablishedAt = new Date(Date.now() - 10000).toISOString();
+  bridge.state.requestSourceAttempts[reqId] = 1;
+  bridge.state.requestProgress[reqId] = { stage: 'shelfmark_download_failed' };
+
+  // Release in cooldown:
+  const coolReleaseKey = 'mock:rel-cool';
+  bridge.state.failedReleases[coolReleaseKey] = {
+    releaseKey: coolReleaseKey,
+    source: 'mock',
+    sourceId: 'rel-cool',
+    failedAt: new Date(Date.now() - 60000).toISOString(), // 1 min ago
+    error: 'Temporary mirror down',
+  };
+
+  const req = {
+    id: reqId,
+    title: 'The Mixed Cooldown Work',
+    author: 'Author A',
+    status: 'approved',
+    mediaKind: 'ebook',
+    createdAt: new Date().toISOString(),
+  };
+
+  const coolRel = {
+    guid: JSON.stringify({ source: 'mock', source_id: 'rel-cool' }),
+    source: 'mock',
+    sourceId: 'rel-cool',
+    title: 'The Mixed Cooldown Work',
+    author: 'Author A',
+    format: 'epub',
+  };
+  const foreignRel = {
+    guid: JSON.stringify({ source: 'mock', source_id: 'rel-foreign' }),
+    source: 'mock',
+    sourceId: 'rel-foreign',
+    title: 'Das Werk',
+    author: 'Wrong Author',
+    format: 'epub',
+  };
+
+  // Mock search to return 1 cooled-down release and 1 incompatible release
+  const originalSearch = plugin.search;
+  plugin.search = async () => [coolRel, foreignRel];
+
+  try {
+    const fake = apiScenarios({
+      requests: [req],
+    });
+
+    await bridge.processPendingRequests({ fetchFn: fake.fetch });
+
+    assert.equal(bridge.state.requestProgress[reqId]?.stage, 'cooldown_wait', 'request transitioned to cooldown_wait');
+    assert.ok(bridge.state.requestProgress[reqId]?.cooldownUntil, 'cooldownUntil timestamp is present');
+  } finally {
+    plugin.search = originalSearch;
+  }
+});
+
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Test runner — keep executing after failures so one bad release is diagnosed

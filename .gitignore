@@ -17,3 +17,6 @@ e2e/shelfmark-books/
 e2e/shelfmark-config/
 e2e/e2e/
 e2e/plugins/
+# Local state & auth token cache
+.bridge-state.json
+.bookorbit-auth-token.json
