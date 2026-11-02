@@ -412,10 +412,10 @@ async function main() {
     const coreTitle = ID.extractCoreTitle(input_title, { author: expected_author });
     const candidates = ID.extractSearchTitleCandidates(input_title, { author: expected_author });
 
-    const coreMatch = isDiscretionaryTitleMatch(coreTitle, expected_title, expected_author);
-    const candMatch = candidates.some((c) => isDiscretionaryTitleMatch(c, expected_title, expected_author));
+    const primaryTitle = decomp.canonicalTitle || coreTitle;
+    const coreMatch = isDiscretionaryTitleMatch(primaryTitle, expected_title, expected_author);
 
-    if (coreMatch || candMatch) {
+    if (coreMatch) {
       decompPass++;
     } else {
       decompFail++;
@@ -423,6 +423,7 @@ async function main() {
         index: i + 1,
         input_title,
         expected_title,
+        primaryTitle,
         coreTitle,
         candidates,
         decomp,
@@ -436,12 +437,15 @@ async function main() {
     for (const f of decompFailures) {
       console.log(`  [#${f.index}] "${f.input_title}"`);
       console.log(`       expected: "${f.expected_title}"`);
-      console.log(`       got core: "${f.coreTitle}"`);
+      console.log(`       got primary: "${f.primaryTitle}" (core: "${f.coreTitle}")`);
       console.log(`       cands:    ${JSON.stringify(f.candidates)}`);
     }
   }
 
   if (process.env.SUITE === '1' || process.argv.includes('--decomp-only')) {
+    if (decompFailures.length > 0) {
+      process.exitCode = 1;
+    }
     return;
   }
 

@@ -4608,6 +4608,93 @@ test('CANDIDATE-ORDERING: search title candidate extraction orders specific work
   assert.ok(hpCands.some((c) => c.toLowerCase().includes('sorcerer')));
 });
 
+test('DECOMPOSITION: decomposes unnumbered franchise/series/character prefixes into substantive work canonicalTitle', async () => {
+  const lotrDecomp = decomposeTitleStructure('The Lord of the Rings: Fellowship of the Ring');
+  assert.equal(lotrDecomp.canonicalTitle, 'Fellowship of the Ring');
+  assert.equal(lotrDecomp.seriesPrefix, 'The Lord of the Rings');
+
+  const darkTowerDecomp = decomposeTitleStructure('The Dark Tower: The Gunslinger');
+  assert.equal(darkTowerDecomp.canonicalTitle, 'The Gunslinger');
+  assert.equal(darkTowerDecomp.seriesPrefix, 'The Dark Tower');
+
+  const poirotDecomp = decomposeTitleStructure('Hercule Poirot: Mystery of the Blue Train', { author: 'Agatha Christie' });
+  assert.equal(poirotDecomp.canonicalTitle, 'Mystery of the Blue Train');
+
+  const sherlockDecomp = decomposeTitleStructure('Sherlock Holmes: A Study in Scarlet', { author: 'Arthur Conan Doyle' });
+  assert.equal(sherlockDecomp.canonicalTitle, 'A Study in Scarlet');
+
+  const sherlockHound = decomposeTitleStructure('Sherlock Holmes - The Hound of the Baskervilles', { author: 'Arthur Conan Doyle' });
+  assert.equal(sherlockHound.canonicalTitle, 'The Hound of the Baskervilles');
+
+  const hungerDecomp = decomposeTitleStructure('Hunger Games Prequel: Ballad of Songbirds and Snakes', { author: 'Suzanne Collins' });
+  assert.equal(hungerDecomp.canonicalTitle, 'Ballad of Songbirds and Snakes');
+
+  const narniaDecomp = decomposeTitleStructure('Narnia Book: Prince Caspian', { author: 'C.S. Lewis' });
+  assert.equal(narniaDecomp.canonicalTitle, 'Prince Caspian');
+
+  // Work title before series volume
+  const dragonboneDecomp = decomposeTitleStructure('The Dragonbone Chair | Memory, Sorrow, and Thorn Book 1 by Tad Williams', { author: 'Tad Williams' });
+  assert.equal(dragonboneDecomp.canonicalTitle, 'The Dragonbone Chair');
+
+  // Single-letter author works
+  const pynchonDecomp = decomposeTitleStructure('Thomas Pynchon — V.', { author: 'Thomas Pynchon' });
+  assert.equal(pynchonDecomp.canonicalTitle, 'V.');
+
+  // Comma clauses before by <Author>
+  const outerOrderDecomp = decomposeTitleStructure('Outer Order, Inner Calm by Gretchen Rubin', { author: 'Gretchen Rubin' });
+  assert.equal(outerOrderDecomp.canonicalTitle, 'Outer Order, Inner Calm');
+
+  // Book N of Series prefix
+  const bookNSeriesDecomp = decomposeTitleStructure('Book 7 of A to Z Mysteries: The White Wolf', { author: 'Ron Roy' });
+  assert.equal(bookNSeriesDecomp.canonicalTitle, 'The White Wolf');
+
+  // Subtitle genre vs dash franchise work
+  const silentDecomp = decomposeTitleStructure('The Silent Patient - Psychological Thriller', { author: 'Alex Michaelides' });
+  assert.equal(silentDecomp.canonicalTitle, 'The Silent Patient');
+
+  const poirotMysteryDecomp = decomposeTitleStructure('Death on the Nile: A Hercule Poirot Mystery', { author: 'Agatha Christie' });
+  assert.equal(poirotMysteryDecomp.canonicalTitle, 'Death on the Nile');
+
+  const fairestDecomp = decomposeTitleStructure('Fairest: Levana\'s Story', { author: 'Marissa Meyer' });
+  assert.equal(fairestDecomp.canonicalTitle, 'Fairest');
+
+  const pernNerilkaDecomp = decomposeTitleStructure('Pern — Nerilka\'s Story', { author: 'Anne McCaffrey' });
+  assert.equal(pernNerilkaDecomp.canonicalTitle, 'Nerilka\'s Story');
+
+  // Author prefix peeling without explicit options.author provided
+  const marieBrennanDecomp = decomposeTitleStructure('Marie Brennan — A Natural History of Dragons');
+  assert.equal(marieBrennanDecomp.canonicalTitle, 'A Natural History of Dragons');
+
+  const agathaCaribbeanDecomp = decomposeTitleStructure('Agatha Christie — A Caribbean Mystery');
+  assert.equal(agathaCaribbeanDecomp.canonicalTitle, 'A Caribbean Mystery');
+
+  const stephenKingDecomp = decomposeTitleStructure('Stephen King — The Shining');
+  assert.equal(stephenKingDecomp.canonicalTitle, 'The Shining');
+
+  // Possessive titles must not be misidentified as author names
+  const hpStoneDecomp = decomposeTitleStructure('The 1st Harry Potter - Philosopher\'s Stone');
+  assert.equal(hpStoneDecomp.canonicalTitle, 'Philosopher\'s Stone');
+
+  // Primary candidate ordering prioritizes canonicalTitle over colonRhsWorkCandidate
+  const fairestCands = extractSearchTitleCandidates('Fairest: Levana\'s Story', { author: 'Marissa Meyer' });
+  assert.equal(fairestCands[0], 'Fairest');
+
+  const freakoCands = extractSearchTitleCandidates('Freakonomics: A Rogue Economist Explores the Hidden Side of Everything');
+  assert.equal(freakoCands[0], 'Freakonomics');
+
+  // Comma-separated series without by <Author>
+  const exileCommaDecomp = decomposeTitleStructure('Planet of Exile, The Hainish Cycle');
+  assert.equal(exileCommaDecomp.canonicalTitle, 'Planet of Exile');
+  assert.equal(exileCommaDecomp.seriesPrefix, 'The Hainish Cycle');
+
+  // Subtitle 'A Life' vs substantive work title ending in 'Life'
+  const washingtonDecomp = decomposeTitleStructure('Washington: A Life');
+  assert.equal(washingtonDecomp.canonicalTitle, 'Washington');
+
+  const charmedLifeDecomp = decomposeTitleStructure('Chrestomanci — Charmed Life');
+  assert.equal(charmedLifeDecomp.canonicalTitle, 'Charmed Life');
+});
+
 test('CANDIDATE-ORDERING: purely algorithmic numeric title equivalences handle arbitrary numbers', async () => {
   // Test pure 4-digit years
   assert.ok(KNOWN_TITLE_EQUIVALENTS.get('1984').includes('nineteen eighty-four'));
