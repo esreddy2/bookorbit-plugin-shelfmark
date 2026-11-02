@@ -456,57 +456,111 @@ async function main() {
   let pubMatchCount = 0;
   let langMatchCount = 0;
 
-  const results = [];
   const limitIdx = process.argv.indexOf('--limit');
   const maxCases = (limitIdx !== -1 && process.argv[limitIdx + 1]) ? parseInt(process.argv[limitIdx + 1], 10) : corpus.length;
   const casesToRun = corpus.slice(0, maxCases);
 
-  for (let i = 0; i < casesToRun.length; i++) {
-    const item = casesToRun[i];
-    const { input_title, expected_title, expected_author } = item;
+  const concurrency = parseInt(process.env.CONCURRENCY || '2', 10);
+  const delayMs = parseInt(process.env.DELAY_MS || '200', 10);
+  const outPath = process.env.REPORT_PATH || '/home/dev/tmp/kilo/personal/bookorbit-plugin-shelfmark/work/corpus-test-report.json';
 
-    const searchRes = await runMetadataSearch(input_title, expected_author);
-    const b = searchRes.matchedBook;
+  const saveReport = (isFinal = false) => {
+    const validResults = results.filter(Boolean);
+    const report = {
+      generatedAt: new Date().toISOString(),
+      isFinal,
+      totalCases: corpus.length,
+      evaluatedLiveCases: validResults.length,
+      decomposition: {
+        passed: decompPass,
+        failed: decompFail,
+        passRate: (decompPass / corpus.length * 100).toFixed(1) + '%',
+        failures: decompFailures,
+      },
+      metadataResolution: {
+        workMatches: workPass,
+        workMatchRate: validResults.length ? (workPass / validResults.length * 100).toFixed(1) + '%' : '0%',
+        exactPublicationMatches: exactPubPass,
+        exactPublicationMatchRate: validResults.length ? (exactPubPass / validResults.length * 100).toFixed(1) + '%' : '0%',
+        titleMatches: titleMatchCount,
+        authorMatches: authorMatchCount,
+        publicationMatches: pubMatchCount,
+        languageMatches: langMatchCount,
+        results: validResults,
+      },
+    };
+    try {
+      writeFileSync(outPath, JSON.stringify(report, null, 2), 'utf8');
+    } catch (err) {
+      console.error(`Failed to write report to ${outPath}:`, err.message);
+    }
+  };
 
-    const bAuthors = b ? (Array.isArray(b.authors) ? b.authors.join(', ') : (b.author || '')) : '';
-    const titleOk = Boolean(b && isDiscretionaryTitleMatch(b.title, expected_title, expected_author));
-    const authorOk = Boolean(b && (isDiscretionaryAuthorMatch(bAuthors, expected_author) || !bAuthors));
-    const pubOk = Boolean(b && isPublicationMatch(b.title, input_title));
-    const langOk = Boolean(b && isLanguageMatch(b, 'en', input_title));
+  let activeIndex = 0;
+  let completedCount = 0;
+  const results = new Array(casesToRun.length);
 
-    const workMatch = Boolean(b && titleOk && authorOk);
-    const exactPublication = Boolean(workMatch && pubOk && langOk);
+  async function worker() {
+    while (true) {
+      const i = activeIndex++;
+      if (i >= casesToRun.length) break;
+      const item = casesToRun[i];
+      const { input_title, expected_title, expected_author } = item;
 
-    if (titleOk) titleMatchCount++;
-    if (authorOk) authorMatchCount++;
-    if (pubOk) pubMatchCount++;
-    if (langOk) langMatchCount++;
-    if (workMatch) workPass++;
-    if (exactPublication) exactPubPass++;
+      if (delayMs > 0) {
+        await new Promise((r) => setTimeout(r, delayMs));
+      }
 
-    results.push({
-      index: i + 1,
-      input_title,
-      expected_title,
-      expected_author,
-      workMatch,
-      exactPublication,
-      titleMatch: titleOk,
-      authorMatch: authorOk,
-      publicationMatch: pubOk,
-      languageMatch: langOk,
-      candidateUsed: searchRes.matchedCandidate,
-      bestScore: searchRes.bestScore,
-      observedTitle: b?.title ?? null,
-      observedAuthor: bAuthors || null,
-      observedLanguage: b?.language ?? null,
-      queryLogs: searchRes.queryLogs,
-    });
+      const searchRes = await runMetadataSearch(input_title, expected_author);
+      const b = searchRes.matchedBook;
 
-    if ((i + 1) % 25 === 0 || i === casesToRun.length - 1) {
-      console.log(`  Processed ${i + 1}/${casesToRun.length} cases (workMatch: ${workPass}, exactPublication: ${exactPubPass})...`);
+      const bAuthors = b ? (Array.isArray(b.authors) ? b.authors.join(', ') : (b.author || '')) : '';
+      const titleOk = Boolean(b && isDiscretionaryTitleMatch(b.title, expected_title, expected_author));
+      const authorOk = Boolean(b && (isDiscretionaryAuthorMatch(bAuthors, expected_author) || !bAuthors));
+      const pubOk = Boolean(b && isPublicationMatch(b.title, input_title));
+      const langOk = Boolean(b && isLanguageMatch(b, 'en', input_title));
+
+      const workMatch = Boolean(b && titleOk && authorOk);
+      const exactPublication = Boolean(workMatch && pubOk && langOk);
+
+      if (titleOk) titleMatchCount++;
+      if (authorOk) authorMatchCount++;
+      if (pubOk) pubMatchCount++;
+      if (langOk) langMatchCount++;
+      if (workMatch) workPass++;
+      if (exactPublication) exactPubPass++;
+
+      results[i] = {
+        index: i + 1,
+        input_title,
+        expected_title,
+        expected_author,
+        workMatch,
+        exactPublication,
+        titleMatch: titleOk,
+        authorMatch: authorOk,
+        publicationMatch: pubOk,
+        languageMatch: langOk,
+        candidateUsed: searchRes.matchedCandidate,
+        bestScore: searchRes.bestScore,
+        observedTitle: b?.title ?? null,
+        observedAuthor: bAuthors || null,
+        observedLanguage: b?.language ?? null,
+        queryLogs: searchRes.queryLogs,
+      };
+
+      completedCount++;
+      if (completedCount % 25 === 0 || completedCount === casesToRun.length) {
+        console.log(`  Processed ${completedCount}/${casesToRun.length} cases (workMatch: ${workPass}, exactPublication: ${exactPubPass})...`);
+        if (completedCount % 50 === 0 || completedCount === casesToRun.length) {
+          saveReport(completedCount === casesToRun.length);
+        }
+      }
     }
   }
+
+  const workers = Array.from({ length: Math.max(1, concurrency) }, () => worker());
+  await Promise.all(workers);
 
   console.log('\n------------------------------------------------------------------------');
   console.log('METADATA RESOLUTION SUMMARY:');
@@ -520,30 +574,7 @@ async function main() {
   console.log(`  - Publication Type Matches: ${pubMatchCount}/${casesToRun.length} (${(pubMatchCount / casesToRun.length * 100).toFixed(1)}%)`);
   console.log(`  - Language Matches:         ${langMatchCount}/${casesToRun.length} (${(langMatchCount / casesToRun.length * 100).toFixed(1)}%)`);
 
-  const report = {
-    generatedAt: new Date().toISOString(),
-    totalCases: corpus.length,
-    decomposition: {
-      passed: decompPass,
-      failed: decompFail,
-      passRate: (decompPass / corpus.length * 100).toFixed(1) + '%',
-      failures: decompFailures,
-    },
-    metadataResolution: {
-      workMatches: workPass,
-      workMatchRate: (workPass / corpus.length * 100).toFixed(1) + '%',
-      exactPublicationMatches: exactPubPass,
-      exactPublicationMatchRate: (exactPubPass / corpus.length * 100).toFixed(1) + '%',
-      titleMatches: titleMatchCount,
-      authorMatches: authorMatchCount,
-      publicationMatches: pubMatchCount,
-      languageMatches: langMatchCount,
-      results,
-    },
-  };
-
-  const outPath = process.env.REPORT_PATH || '/home/dev/tmp/kilo/personal/bookorbit-plugin-shelfmark/work/corpus-test-report.json';
-  writeFileSync(outPath, JSON.stringify(report, null, 2), 'utf8');
+  saveReport(true);
   console.log(`\nFull report written to: ${outPath}`);
 }
 
