@@ -81,7 +81,7 @@ import {
 } from './bridge/bridge.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
-const EXPECTED_VERSION = '1.8.0';
+const EXPECTED_VERSION = '1.8.1';
 const RELEASE_MODE = process.argv.includes('--release');
 const TEST_TIMEOUT_MS = 10_000;
 const tests = [];
