@@ -1,5 +1,5 @@
 /**
- * BookOrbit ↔ Shelfmark acceptance and regression verification, v1.7.2.
+ * BookOrbit ↔ Shelfmark acceptance and regression verification, v1.8.2.
  *
  * EXTERNAL ORACLES — NOT AN IMPLEMENTATION-DERIVED TEST PLAN:
  *   - BookOrbit v3.5.0 API/host contracts and request behavior.
@@ -81,7 +81,7 @@ import {
 } from './bridge/bridge.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
-const EXPECTED_VERSION = '1.8.1';
+const EXPECTED_VERSION = '1.8.2';
 const RELEASE_MODE = process.argv.includes('--release');
 const TEST_TIMEOUT_MS = 10_000;
 const tests = [];
@@ -470,7 +470,7 @@ test('RELEASE CONTRACT: package version, plugin version and release target agree
   assert.equal(plugin.version, EXPECTED_VERSION);
 });
 if (RELEASE_MODE) {
-  test('RELEASE: signed manifest has declared format and v1.7.6 version', () => {
+  test('RELEASE: signed manifest has declared format and v1.8.2 version', () => {
     const manifest = JSON.parse(readFileSync(join(HERE, 'updates', 'shelfmark.json'), 'utf8'));
     assert.equal(manifest.schemaVersion, 1);
     assert.equal(manifest.type, 'shelfmark');
@@ -4961,6 +4961,222 @@ test('CANONICAL TITLE EQUIVALENTS: KNOWN_TITLE_EQUIVALENTS resolves canonical wo
   // Adherence to AGENTS.md Section 5: "Do not confuse canonical title equivalents with translated editions."
   const threeMusketeers = KNOWN_TITLE_EQUIVALENTS.get('les trois mousquetaires');
   assert.ok(!threeMusketeers.includes('the three musketeers'), 'Translated foreign editions are not canonical title equivalents');
+});
+
+test('AUTH CACHE: BookOrbitAuthManager persists valid tokens to disk and reuses session without login call', async () => {
+  const cacheFile = join(root, `${unique('token-cache')}.json`);
+  const loginJwt = fakeJwt(3600);
+  const fake = apiScenarios({
+    'bo.login': response({ token: loginJwt, refreshToken: 'refresh-cache-1', expiresAt: new Date(Date.now() + 3600_000).toISOString() }),
+  });
+
+  const auth1 = new BookOrbitAuthManager({
+    url: 'http://bookorbit-app:3000',
+    username: 'service-fixture',
+    password: 'fake-password',
+    tokenCachePath: cacheFile,
+    fetchFn: fake.fetch,
+  });
+
+  assert.equal(await auth1.login(), loginJwt);
+  assert.ok(existsSync(cacheFile), 'token cache file written to disk');
+  const cacheData = JSON.parse(readFileSync(cacheFile, 'utf8'));
+  assert.equal(cacheData.token, loginJwt);
+  assert.equal(cacheData.refreshToken, 'refresh-cache-1');
+
+  // Second manager reuses the token without calling login or refresh
+  const noCallFake = {
+    fetch: async () => {
+      throw new Error('fetch should not be called when cached token is valid');
+    },
+  };
+  const auth2 = new BookOrbitAuthManager({
+    url: 'http://bookorbit-app:3000',
+    username: 'service-fixture',
+    password: 'fake-password',
+    tokenCachePath: cacheFile,
+    fetchFn: noCallFake.fetch,
+  });
+
+  const token = await auth2.getValidToken();
+  assert.equal(token, loginJwt, 'valid cached token was returned directly');
+});
+
+test('AUTH RATE LIMIT: BookOrbitAuthManager reuses cached token on HTTP 429 login response', async () => {
+  const cacheFile = join(root, `${unique('token-cache-429')}.json`);
+  const activeJwt = fakeJwt(1800);
+  writeFileSync(cacheFile, JSON.stringify({
+    url: 'http://bookorbit-app:3000',
+    username: 'service-fixture',
+    token: activeJwt,
+    refreshToken: 'refresh-active',
+    updatedAt: new Date().toISOString(),
+  }), 'utf8');
+
+  // Server returns 429 on login attempt
+  const fake = apiScenarios({
+    'bo.login': failResponse(429, 'Too many login attempts, please try again later.'),
+  });
+
+  const auth = new BookOrbitAuthManager({
+    url: 'http://bookorbit-app:3000',
+    username: 'service-fixture',
+    password: 'fake-password',
+    tokenCachePath: cacheFile,
+    fetchFn: fake.fetch,
+  });
+
+  // Calling login() directly catches 429 and falls back to cached token
+  const token = await auth.login();
+  assert.equal(token, activeJwt, 'reused cached token on HTTP 429');
+});
+
+test('OPF MULTI-TITLE: extractEpubMetadata extracts main title, subtitle, compositeTitle, and series', () => {
+  const opf = `<?xml version="1.0" encoding="UTF-8"?>
+<package xmlns="http://www.idpf.org/2007/opf" version="3.0" unique-identifier="uid">
+  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:opf="http://www.idpf.org/2007/opf">
+    <dc:title id="t1">Camp Half-Blood</dc:title>
+    <dc:title id="t2">The Wild Zone</dc:title>
+    <meta refines="#t1" property="title-type">main</meta>
+    <meta refines="#t2" property="title-type">subtitle</meta>
+    <dc:creator>Rick Riordan</dc:creator>
+    <dc:language>en</dc:language>
+    <meta name="calibre:series" content="Percy Jackson Universe"/>
+    <meta name="calibre:series_index" content="2"/>
+  </metadata>
+</package>`;
+  const buf = zipBytesWithStreamingDataDescriptor([
+    ['mimetype', 'application/epub+zip'],
+    ['META-INF/container.xml', '<?xml version="1.0"?><container xmlns="urn:oasis:names:tc:opendocument:xmlns:container" version="1.0"><rootfiles><rootfile full-path="ops/content.opf" media-type="application/oebps-package+xml"/></rootfiles></container>'],
+    ['ops/content.opf', opf],
+  ]);
+
+  const meta = extractEpubMetadata(buf);
+  assert.ok(meta);
+  assert.equal(meta.title, 'Camp Half-Blood');
+  assert.equal(meta.subtitle, 'The Wild Zone');
+  assert.equal(meta.compositeTitle, 'Camp Half-Blood: The Wild Zone');
+  assert.equal(meta.series, 'Percy Jackson Universe');
+  assert.equal(meta.seriesIndex, 2);
+  assert.ok(meta.titles.includes('Camp Half-Blood'));
+  assert.ok(meta.titles.includes('The Wild Zone'));
+});
+
+test('EDITION VERIFICATION: EPUB with main title and subtitle verifies against requested subtitle work title', () => {
+  const opf = `<?xml version="1.0" encoding="UTF-8"?>
+<package xmlns="http://www.idpf.org/2007/opf" version="3.0" unique-identifier="uid">
+  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:opf="http://www.idpf.org/2007/opf">
+    <dc:title id="t1">Camp Half-Blood</dc:title>
+    <dc:title id="t2">The Wild Zone</dc:title>
+    <meta refines="#t1" property="title-type">main</meta>
+    <meta refines="#t2" property="title-type">subtitle</meta>
+    <dc:creator>Rick Riordan</dc:creator>
+    <dc:language>en</dc:language>
+  </metadata>
+  <manifest>
+    <item id="ch1" href="ch1.xhtml" media-type="application/xhtml+xml"/>
+  </manifest>
+  <spine><itemref idref="ch1"/></spine>
+</package>`;
+  const buf = zipBytesWithStreamingDataDescriptor([
+    ['mimetype', 'application/epub+zip'],
+    ['META-INF/container.xml', '<?xml version="1.0"?><container xmlns="urn:oasis:names:tc:opendocument:xmlns:container" version="1.0"><rootfiles><rootfile full-path="ops/content.opf" media-type="application/oebps-package+xml"/></rootfiles></container>'],
+    ['ops/content.opf', opf],
+    ['ops/ch1.xhtml', `<?xml version="1.0" encoding="UTF-8"?><html xmlns="http://www.w3.org/1999/xhtml"><body>${DEFAULT_ENGLISH_CHAPTERS[0]}</body></html>`],
+  ]);
+  const epubPath = join(root, `${unique('epub-sub')}.epub`);
+  writeFileSync(epubPath, buf);
+
+  // Verification succeeds against the specific work title (The Wild Zone)
+  const res1 = verifyDownloadedEdition({ filePath: epubPath, format: 'epub', requestTitle: 'The Wild Zone', requestAuthor: 'Rick Riordan' });
+  assert.equal(res1.ok, true, 'matches against subtitle work title');
+
+  // Verification succeeds against the composite title
+  const res2 = verifyDownloadedEdition({ filePath: epubPath, format: 'epub', requestTitle: 'Camp Half-Blood: The Wild Zone', requestAuthor: 'Rick Riordan' });
+  assert.equal(res2.ok, true, 'matches against composite title');
+
+  // Verification succeeds against the series main title
+  const res3 = verifyDownloadedEdition({ filePath: epubPath, format: 'epub', requestTitle: 'Camp Half-Blood', requestAuthor: 'Rick Riordan' });
+  assert.equal(res3.ok, true, 'matches against main title');
+
+  // Verification rejects unrelated book
+  const res4 = verifyDownloadedEdition({ filePath: epubPath, format: 'epub', requestTitle: 'The Lightning Thief', requestAuthor: 'Rick Riordan' });
+  assert.equal(res4.ok, false);
+  assert.ok(res4.conflicts.includes('incompatible_title'));
+});
+
+test('SHARED TASK RECONCILIATION: failed Shelfmark download task synchronizes all shared requests with shelfmark_download_failed', async () => {
+  const bridge = established(new BridgeService(bridgeOpts()));
+  const task = createTask(bridge, {
+    status: 'downloading',
+    filePath: null,
+    requestIds: ['req-shared-1', 'req-shared-2'],
+    title: 'Shared Title',
+    author: 'Shared Author',
+  });
+  bridge.state.requests['req-shared-1'] = task.taskId;
+  bridge.state.requests['req-shared-2'] = task.taskId;
+  bridge.state.requestTasks['req-shared-1'] = task.taskId;
+  bridge.state.requestTasks['req-shared-2'] = task.taskId;
+  bridge.setRequestProgress('req-shared-1', 'downloading');
+  bridge.setRequestProgress('req-shared-2', 'downloading');
+
+  const fake = apiScenarios({
+    'sm.status': response({
+      error: {
+        [task.taskId]: { id: task.taskId, title: task.title, error: 'Shelfmark network failure' },
+      },
+    }),
+  });
+
+  await bridge.reconcile({ fetchFn: fake.fetch });
+
+  // Both requests must be unmapped from active requests but recorded in requestTasks
+  assert.equal(bridge.state.requests['req-shared-1'], undefined);
+  assert.equal(bridge.state.requests['req-shared-2'], undefined);
+  assert.equal(bridge.state.requestTasks['req-shared-1'], task.taskId);
+  assert.equal(bridge.state.requestTasks['req-shared-2'], task.taskId);
+
+  // Both requests must have progress transitioned to shelfmark_download_failed
+  assert.equal(bridge.state.requestProgress['req-shared-1'].stage, 'shelfmark_download_failed');
+  assert.equal(bridge.state.requestProgress['req-shared-2'].stage, 'shelfmark_download_failed');
+  assert.ok(String(bridge.state.requestFailureReasons['req-shared-1']).includes('Shelfmark network failure'));
+  assert.ok(String(bridge.state.requestFailureReasons['req-shared-2']).includes('Shelfmark network failure'));
+});
+
+test('MAX SOURCE ATTEMPTS TERMINAL REJECTION: reconcile and recordTaskFailureAttempts reject request in BookOrbit when maxSourceAttempts is reached', async () => {
+  const bridge = established(new BridgeService(bridgeOpts({ maxSourceAttempts: 3 })));
+  const task = createTask(bridge, {
+    status: 'downloading',
+    filePath: null,
+    requestIds: ['req-exhaust'],
+    title: 'Doomed Book',
+    author: 'Doomed Author',
+  });
+  bridge.state.requests['req-exhaust'] = task.taskId;
+  bridge.state.requestSourceAttempts['req-exhaust'] = 2; // Next failure will make it 3 (exhausted)
+
+  let rejectedId = null;
+  let rejectionBody = null;
+  const fake = apiScenarios({
+    'sm.status': response({
+      error: {
+        [task.taskId]: { id: task.taskId, title: task.title, error: 'Mirror 404 Not Found' },
+      },
+    }),
+    'bo.reject': ({ path, options }) => {
+      rejectedId = path.split('/')[5];
+      rejectionBody = options.body ? JSON.parse(options.body) : {};
+      return response({ status: 'REJECTED' });
+    },
+  });
+
+  await bridge.reconcile({ fetchFn: fake.fetch });
+
+  assert.equal(rejectedId, 'req-exhaust', 'terminal rejection was called for req-exhaust');
+  assert.ok(rejectionBody.decisionNote.includes('Automated request failed after 3/3 attempts'));
+  assert.ok(rejectionBody.decisionNote.includes('Mirror 404 Not Found'));
+  assert.ok(['rejected', 'exhausted'].includes(bridge.state.requestProgress['req-exhaust'].stage));
 });
 
 

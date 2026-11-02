@@ -87,7 +87,64 @@ function decodeXmlEntities(str) {
 
 function parseOpfMetadataXml(opfText) {
   if (!opfText || typeof opfText !== 'string') return null;
-  const titleMatch = opfText.match(/<dc:title[^>]*>([\s\S]*?)<\/dc:title>/i);
+  const titleMatches = [...opfText.matchAll(/<dc:title([^>]*)>([\s\S]*?)<\/dc:title>/gi)];
+  const titleEntries = titleMatches.map((m) => {
+    const attrs = m[1] || '';
+    const idMatch = attrs.match(/\bid\s*=\s*["']([^"']+)["']/i);
+    const id = idMatch ? idMatch[1] : null;
+    const text = decodeXmlEntities(m[2].replace(/<[^>]+>/g, '')).trim();
+    return { id, text };
+  }).filter((e) => Boolean(e.text));
+
+  const titleTypes = new Map();
+  for (const m of opfText.matchAll(/<meta[^>]*refines=["']#?([^"']+)["'][^>]*property=["']title-type["'][^>]*>([\s\S]*?)<\/meta>/gi)) {
+    titleTypes.set(m[1].trim(), m[2].replace(/<[^>]+>/g, '').trim().toLowerCase());
+  }
+  for (const m of opfText.matchAll(/<meta[^>]*property=["']title-type["'][^>]*refines=["']#?([^"']+)["'][^>]*>([\s\S]*?)<\/meta>/gi)) {
+    titleTypes.set(m[1].trim(), m[2].replace(/<[^>]+>/g, '').trim().toLowerCase());
+  }
+
+  let mainTitle = null;
+  let subtitle = null;
+  const titles = [];
+  const subtitles = [];
+
+  for (const entry of titleEntries) {
+    if (!titles.includes(entry.text)) titles.push(entry.text);
+    const tType = entry.id ? titleTypes.get(entry.id) : null;
+    if (tType === 'main' && !mainTitle) {
+      mainTitle = entry.text;
+    } else if (tType === 'subtitle') {
+      subtitles.push(entry.text);
+      if (!subtitle) subtitle = entry.text;
+    }
+  }
+  if (!mainTitle && titles.length > 0) mainTitle = titles[0];
+  if (!subtitle && titles.length > 1) subtitle = titles[1];
+
+  let compositeTitle = null;
+  if (mainTitle && subtitle && ID.normalizeString(mainTitle) !== ID.normalizeString(subtitle)) {
+    compositeTitle = `${mainTitle}: ${subtitle}`;
+  } else if (titles.length > 1) {
+    compositeTitle = titles.join(': ');
+  }
+
+  // Extract Calibre or EPUB3 collection series
+  let series = null;
+  const calSeries = opfText.match(/<meta[^>]*name=["']calibre:series["'][^>]*content=["']([^"']+)["']/i);
+  if (calSeries) series = decodeXmlEntities(calSeries[1]).trim();
+  if (!series) {
+    const collMatch = opfText.match(/<meta[^>]*property=["']belongs-to-collection["'][^>]*>([\s\S]*?)<\/meta>/i);
+    if (collMatch) series = decodeXmlEntities(collMatch[1].replace(/<[^>]+>/g, '')).trim();
+  }
+  let seriesIndex = null;
+  const calIdx = opfText.match(/<meta[^>]*name=["']calibre:series_index["'][^>]*content=["']([^"']+)["']/i);
+  if (calIdx) seriesIndex = parseFloat(calIdx[1]);
+  if (seriesIndex === null) {
+    const grpMatch = opfText.match(/<meta[^>]*property=["']group-position["'][^>]*>([\s\S]*?)<\/meta>/i);
+    if (grpMatch) seriesIndex = parseFloat(grpMatch[1].replace(/<[^>]+>/g, '').trim());
+  }
+
   const creatorMatches = [...opfText.matchAll(/<dc:creator[^>]*>([\s\S]*?)<\/dc:creator>/gi)];
   const authors = creatorMatches
     .map((m) => decodeXmlEntities(m[1].replace(/<[^>]+>/g, '')))
@@ -165,11 +222,18 @@ function parseOpfMetadataXml(opfText) {
   const isbns = [...validIsbns, ...explicitIsbns.filter((x) => !validIsbns.includes(x))];
 
   const languageMatch = opfText.match(/<dc:language[^>]*>([\s\S]*?)<\/dc:language>/i);
-  const rawTitle = titleMatch ? decodeXmlEntities(titleMatch[1].replace(/<[^>]+>/g, '')) : '';
+  const rawTitle = mainTitle || (titles[0] || null);
   const rawLanguage = languageMatch ? decodeXmlEntities(languageMatch[1].replace(/<[^>]+>/g, '')) : '';
 
   return {
-    title: rawTitle || null,
+    title: rawTitle || compositeTitle || null,
+    subtitle: subtitles[0] || null,
+    rawTitle,
+    titles,
+    subtitles,
+    compositeTitle,
+    series: series || null,
+    seriesIndex: Number.isFinite(seriesIndex) ? seriesIndex : null,
     author: authors[0] || null,
     authors,
     year: years[0] || null,
@@ -1509,21 +1573,50 @@ export function verifyDownloadedEdition(task, reqSpec = {}) {
       evidence.push({ field: 'title', level: 'work', status: 'missing', expected: expectedTitle, observed: null });
       error = error || `EPUB title mismatch: expected "${expectedTitle}", got missing title`;
     } else if (opf.title && expectedTitle) {
-      const td = ID.titleMatchDecision(opf.title, expectedTitle, {
+      const candidateTitles = [];
+      if (opf.compositeTitle) candidateTitles.push(opf.compositeTitle);
+      if (Array.isArray(opf.titles)) {
+        for (const t of opf.titles) {
+          if (t && !candidateTitles.includes(t)) candidateTitles.push(t);
+        }
+      }
+      if (opf.title && !candidateTitles.includes(opf.title)) candidateTitles.push(opf.title);
+      if (opf.series && opf.rawTitle && !candidateTitles.includes(`${opf.series}: ${opf.rawTitle}`)) {
+        candidateTitles.push(`${opf.series}: ${opf.rawTitle}`);
+      }
+
+      const matchOpts = {
         candAuthor: opf.author || '',
         reqAuthor: expectedAuthor || '',
-        reqSeriesName: expectedSeriesName,
-        reqSeriesIndex: expectedSeriesIndex,
-      });
-      if (td.outcome !== 'match' && td.outcome !== 'provisional') {
-        if (td.conflicts.includes('incompatible_series_volume')) {
+        reqSeriesName: expectedSeriesName || opf.series,
+        reqSeriesIndex: expectedSeriesIndex ?? opf.seriesIndex,
+      };
+
+      let bestDecision = null;
+      let matchedObserved = null;
+
+      for (const candTitle of candidateTitles) {
+        const td = ID.titleMatchDecision(candTitle, expectedTitle, matchOpts);
+        if (td.outcome === 'match' || td.outcome === 'provisional') {
+          bestDecision = td;
+          matchedObserved = candTitle;
+          break;
+        }
+        if (!bestDecision) {
+          bestDecision = td;
+          matchedObserved = candTitle;
+        }
+      }
+
+      if (bestDecision && (bestDecision.outcome === 'match' || bestDecision.outcome === 'provisional')) {
+        evidence.push({ field: 'title', level: 'work', status: 'verified', expected: expectedTitle, observed: matchedObserved });
+      } else {
+        if (bestDecision?.conflicts.includes('incompatible_series_volume')) {
           conflicts.push('incompatible_series_volume');
         }
         conflicts.push('incompatible_title');
-        evidence.push({ field: 'title', level: 'work', status: 'contradictory', expected: expectedTitle, observed: opf.title });
-        error = error || `EPUB title mismatch: expected "${expectedTitle}", got "${opf.title}"`;
-      } else {
-        evidence.push({ field: 'title', level: 'work', status: 'verified', expected: expectedTitle, observed: opf.title });
+        evidence.push({ field: 'title', level: 'work', status: 'contradictory', expected: expectedTitle, observed: opf.rawTitle || opf.title });
+        error = error || `EPUB title mismatch: expected "${expectedTitle}", got "${opf.rawTitle || opf.title}"`;
       }
     } else if (opf.title) {
       evidence.push({ field: 'title', level: 'work', status: 'verified', expected: expectedTitle, observed: opf.title });
@@ -1708,6 +1801,24 @@ function isValidOceanofPdfPageUrlBridge(url) {
   return isHttpUrlBridge(url) && String(url).toLowerCase().includes('oceanofpdf');
 }
 
+function resolveDefaultTokenCachePath() {
+  if (process.env.BOOKORBIT_TOKEN_CACHE_PATH) return process.env.BOOKORBIT_TOKEN_CACHE_PATH;
+  if (process.env.STATE_FILE_PATH) {
+    return path.join(path.dirname(process.env.STATE_FILE_PATH), '.bookorbit-auth-token.json');
+  }
+  if (fs.existsSync('/data') && fs.statSync('/data').isDirectory()) {
+    try {
+      fs.accessSync('/data', fs.constants.W_OK);
+      return '/data/.bookorbit-auth-token.json';
+    } catch {}
+  }
+  const localCache = path.resolve(process.cwd(), '.bookorbit-auth-token.json');
+  if (fs.existsSync(localCache)) {
+    return localCache;
+  }
+  return null;
+}
+
 /**
  * Manages BookOrbit v3.5.0 authentication sessions, handling login,
  * proactive token renewal, session refresh, and JWT validation.
@@ -1720,10 +1831,59 @@ export class BookOrbitAuthManager {
     this.token = options.token || process.env.BOOKORBIT_TOKEN || '';
     this.refreshToken = options.refreshToken || process.env.BOOKORBIT_REFRESH_TOKEN || '';
     this.apiKey = options.apiKey || process.env.BOOKORBIT_API_KEY || '';
+    this.tokenCachePath = options.tokenCachePath !== undefined
+      ? options.tokenCachePath
+      : (options.cachePath !== undefined ? options.cachePath : resolveDefaultTokenCachePath());
     this.expiresAt = options.expiresAt || (this.token ? decodeJwtExp(this.token) : null);
     this.refreshBufferMs = options.refreshBufferMs || 5 * 60 * 1000; // Refresh 5m before expiry
     this.fetchFn = options.fetchFn || globalThis.fetch;
     this._authLock = null;
+    this._loadCachedToken();
+  }
+
+  _loadCachedToken() {
+    if (!this.tokenCachePath || typeof this.tokenCachePath !== 'string') return;
+    try {
+      if (fs.existsSync(this.tokenCachePath)) {
+        const raw = fs.readFileSync(this.tokenCachePath, 'utf8');
+        const data = JSON.parse(raw);
+        if (data && data.token && isJwt(data.token)) {
+          const exp = data.expiresAt || decodeJwtExp(data.token);
+          if (exp && Date.now() < (exp - this.refreshBufferMs)) {
+            const urlMatch = !data.baseUrl || (data.baseUrl.replace(/\/$/, '') === this.baseUrl);
+            const userMatch = !this.username || !data.username || (data.username === this.username);
+            if (urlMatch && userMatch) {
+              if (!this.token || this.isTokenExpired()) {
+                this.token = data.token;
+                this.refreshToken = data.refreshToken || this.refreshToken;
+                this.expiresAt = exp;
+              }
+            }
+          }
+        }
+      }
+    } catch {}
+  }
+
+  _saveCachedToken() {
+    if (!this.tokenCachePath || typeof this.tokenCachePath !== 'string' || !this.token) return;
+    try {
+      const dir = path.dirname(this.tokenCachePath);
+      if (!fs.existsSync(dir)) {
+        fs.mkdirSync(dir, { recursive: true });
+      }
+      const data = {
+        token: this.token,
+        refreshToken: this.refreshToken,
+        expiresAt: this.expiresAt,
+        baseUrl: this.baseUrl,
+        username: this.username,
+        updatedAt: new Date().toISOString(),
+      };
+      const tmpPath = `${this.tokenCachePath}.tmp.${Date.now()}.${crypto.randomBytes(4).toString('hex')}`;
+      fs.writeFileSync(tmpPath, JSON.stringify(data, null, 2), 'utf8');
+      fs.renameSync(tmpPath, this.tokenCachePath);
+    } catch {}
   }
 
   isTokenExpired() {
@@ -1764,6 +1924,13 @@ export class BookOrbitAuthManager {
     });
 
     if (!res.ok) {
+      if (res.status === 429) {
+        this._loadCachedToken();
+        if (this.token && !this.isTokenExpired()) {
+          console.warn('[BookOrbitAuthManager] BookOrbit login rate-limited (HTTP 429); reusing valid cached session.');
+          return this.token;
+        }
+      }
       const errText = await res.text().catch(() => '');
       throw new Error(`BookOrbit login failed (HTTP ${res.status})`);
     }
@@ -1777,6 +1944,7 @@ export class BookOrbitAuthManager {
     this.token = newToken;
     this.refreshToken = data.refreshToken || this.refreshToken;
     this.expiresAt = (data.accessTokenExpiresAt || data.expiresAt) ? new Date(data.accessTokenExpiresAt || data.expiresAt).getTime() : decodeJwtExp(newToken);
+    this._saveCachedToken();
     return this.token;
     } finally {
       this._authLock = null;
@@ -1806,6 +1974,7 @@ export class BookOrbitAuthManager {
             this.token = newToken;
             this.refreshToken = data.refreshToken || this.refreshToken;
             this.expiresAt = (data.accessTokenExpiresAt || data.expiresAt) ? new Date(data.accessTokenExpiresAt || data.expiresAt).getTime() : decodeJwtExp(newToken);
+            this._saveCachedToken();
             return this.token;
           }
         }
@@ -1826,6 +1995,9 @@ export class BookOrbitAuthManager {
   }
 
   async getValidToken() {
+    if (this.isTokenExpired()) {
+      this._loadCachedToken();
+    }
     if (this.isTokenExpired()) {
       if (this.refreshToken) {
         try {
@@ -2125,6 +2297,9 @@ export class BridgeService {
     ];
 
     // BookOrbit Authentication Session Manager
+    const defaultTokenCachePath = this.stateFilePath
+      ? path.join(path.dirname(this.stateFilePath), '.bookorbit-auth-token.json')
+      : resolveDefaultTokenCachePath();
     this.authManager = options.authManager || new BookOrbitAuthManager({
       url: this.bookorbitUrl,
       username: options.bookorbitUsername || process.env.BOOKORBIT_USERNAME || '',
@@ -2132,6 +2307,7 @@ export class BridgeService {
       token: options.bookorbitToken || process.env.BOOKORBIT_TOKEN || '',
       refreshToken: options.bookorbitRefreshToken || process.env.BOOKORBIT_REFRESH_TOKEN || '',
       apiKey: options.bookorbitApiKey || process.env.BOOKORBIT_API_KEY || '',
+      tokenCachePath: options.tokenCachePath || defaultTokenCachePath,
       fetchFn: options.fetchFn,
     });
 
@@ -2592,10 +2768,9 @@ export class BridgeService {
      this.state.requestProgress[reqId] = entry;
      this.state.requestStages[reqId] = entry;
      this.state.requestStatus[reqId] = entry;
-    if (details && details.reason) {
-      this.state.requestFailureReasons = this.state.requestFailureReasons || {};
-      this.state.requestFailureReasons[reqId] = details.reason;
-    }
+     const transitionReason = (details && (details.error || details.reason)) ? (details.error || details.reason) : stage;
+    this.state.requestFailureReasons = this.state.requestFailureReasons || {};
+    this.state.requestFailureReasons[reqId] = transitionReason;
     this.saveState();
   }
 
@@ -2818,27 +2993,28 @@ export class BridgeService {
           if (req.mediaKind && req.mediaKind !== 'ebook') continue;
           if (!req.language && !req.lang) req.language = 'English';
 
-          // 3. Skip if already tracked (never blindly requeue on Socket.IO broadcasts)
-          if (this.state.requests[reqId]) {
-            continue;
-          }
-
-          // 3a. Skip if currently holding in cooldown_wait and cooldown has not expired
-          const curProgress = this.state.requestProgress[reqId];
-          if (curProgress?.stage === 'cooldown_wait' && curProgress.cooldownUntil) {
-            if (Date.now() < new Date(curProgress.cooldownUntil).getTime()) {
-              continue;
-            }
-          }
-
-          // 3b. Stop retry if request reached max attempts (reject in BookOrbit and halt)
+          // 3. Stop retry if request reached max attempts (reject in BookOrbit and halt)
           if ((this.state.requestSourceAttempts[reqId] || 0) >= this.maxSourceAttempts) {
+            delete this.state.requests[reqId];
             await this.rejectBookOrbitRequest(reqId, {
               stage: this.state.requestProgress[reqId]?.stage || 'exhausted',
               reason: this.state.requestErrors[reqId]?.error || 'max_attempts_exhausted',
               req,
             }, fetchFn);
             continue;
+          }
+
+          // 3a. Skip if already tracked (never blindly requeue on Socket.IO broadcasts)
+          if (this.state.requests[reqId]) {
+            continue;
+          }
+
+          // 3b. Skip if currently holding in cooldown_wait and cooldown has not expired
+          const curProgress = this.state.requestProgress[reqId];
+          if (curProgress?.stage === 'cooldown_wait' && curProgress.cooldownUntil) {
+            if (Date.now() < new Date(curProgress.cooldownUntil).getTime()) {
+              continue;
+            }
           }
 
           // Cancellation-aware: check request status before queueing/searching
@@ -2852,7 +3028,7 @@ export class BridgeService {
             continue;
           }
 
-          this.setRequestProgress(reqId, 'searching');
+          this.setRequestProgress(reqId, 'searching', { reason: 'searching' });
 
           // 4. Search releases using corrected plugin logic (bounded per request)
           const query = {
@@ -3627,6 +3803,8 @@ export class BridgeService {
       mergeRequestIntoExistingTask(existing);
 
       this.state.requests[requestId] = taskId;
+      this.state.requestTasks = this.state.requestTasks || {};
+      this.state.requestTasks[requestId] = taskId;
       if (!existing.requestIds.includes(requestId)) {
         existing.requestIds.push(requestId);
       }
@@ -3638,6 +3816,7 @@ export class BridgeService {
       }
       existing.updatedAt = now;
       this.saveState();
+      this.scheduleActiveReconciliation(10000);
 
       if (existing.matchedBookId && this.bookorbitUrl) {
         const targetLibId = parsePositiveInt(existing.libraryId ?? this.defaultLibraryId);
@@ -3721,10 +3900,13 @@ export class BridgeService {
 
     this.state.tasks[taskId] = taskRecord;
     this.state.requests[requestId] = taskId;
+    this.state.requestTasks = this.state.requestTasks || {};
+    this.state.requestTasks[requestId] = taskId;
     if (releaseKey) {
       this.state.releases[releaseKey] = taskId;
     }
     this.saveState();
+    this.scheduleActiveReconciliation(10000);
 
     return {
       status: 'queued',
@@ -4486,7 +4668,7 @@ export class BridgeService {
    * Account a failed task attempt for all its requests and unmap them so another
    * source/candidate can be tried, subject to maxSourceAttempts.
    */
-  recordTaskFailureAttempts(task, errorType = 'finalization_failed') {
+  recordTaskFailureAttempts(task, errorType = 'finalization_failed', fetchFn = globalThis.fetch) {
     const now = new Date().toISOString();
     const attemptId = `${errorType}:${task.taskId}`;
     for (const rid of (task.requestIds || [])) {
@@ -4500,10 +4682,20 @@ export class BridgeService {
       const attempts = this.state.requestAttempts[rid].length;
       this.state.requestSourceAttempts[rid] = Math.max(this.state.requestSourceAttempts[rid] || 0, attempts);
       this.state.requestErrors[rid] = { error: task.error, errorType, lastAttemptAt: now, attempts: this.state.requestSourceAttempts[rid] };
+      delete this.state.requests[rid];
       if ((this.state.requestSourceAttempts[rid] || 0) < this.maxSourceAttempts) {
-        delete this.state.requests[rid];
+        this.setRequestProgress(rid, errorType, { reason: errorType, error: task.error });
+      } else {
+        console.warn(`[Bridge] Request ${rid} reached max source attempts (${attempts}/${this.maxSourceAttempts}) on ${errorType}. Terminally rejecting in BookOrbit.`);
+        this.setRequestProgress(rid, 'exhausted', { reason: errorType, error: task.error });
+        this.rejectBookOrbitRequest(rid, {
+          stage: errorType,
+          reason: task.error || errorType,
+          task,
+        }, fetchFn).catch((err) => {
+          console.warn(`[Bridge] Terminal reject error for request ${rid}: ${sanitizeLog(err.message)}`);
+        });
       }
-      this.setRequestProgress(rid, errorType, { reason: errorType });
     }
   }
 
@@ -4708,13 +4900,25 @@ export class BridgeService {
             };
             this.state.requestTasks = this.state.requestTasks || {};
             this.state.requestTasks[rid] = task.taskId || task.id;
+            delete this.state.requests[rid];
             if ((this.state.requestSourceAttempts[rid] || 0) < this.maxSourceAttempts) {
-              delete this.state.requests[rid];
+              this.setRequestProgress(rid, verStage, {
+                reason: ver.errorType || 'edition_verification_failed',
+                conflict: ver.primaryConflict || undefined,
+              });
+            } else {
+              console.warn(`[Bridge] Request ${rid} reached max source attempts (${attempts}/${this.maxSourceAttempts}) on edition verification. Terminally rejecting in BookOrbit.`);
+              this.setRequestProgress(rid, 'exhausted', {
+                reason: ver.errorType || 'edition_verification_failed',
+                conflict: ver.primaryConflict || undefined,
+              });
+              await this.rejectBookOrbitRequest(rid, {
+                stage: verStage,
+                reason: ver.error,
+                conflicts: ver.conflicts,
+                task,
+              }, fetchFn);
             }
-            this.setRequestProgress(rid, verStage, {
-              reason: ver.errorType || 'edition_verification_failed',
-              conflict: ver.primaryConflict || undefined,
-            });
           }
         }
       }
@@ -5439,6 +5643,8 @@ export class BridgeService {
         // Bounded selection of alternative eligible sources/releases with idempotent attempt counting
         for (const reqId of (task.requestIds || [])) {
           if (!task.requestFulfillments || !task.requestFulfillments[reqId]?.fulfilled) {
+            this.state.requestTasks = this.state.requestTasks || {};
+            this.state.requestTasks[reqId] = task.taskId || task.id;
             this.state.requestAttempts[reqId] = this.state.requestAttempts[reqId] || [];
             const alreadyCounted = this.state.requestAttempts[reqId].some((a) => a.attemptId === attemptId);
             if (!alreadyCounted) {
@@ -5451,7 +5657,7 @@ export class BridgeService {
                 timestamp: now,
                 error: task.error,
               });
-              const attempts = this.state.requestAttempts[reqId].length;
+              const attempts = Math.max(this.state.requestAttempts[reqId].length, (this.state.requestSourceAttempts[reqId] || 0) + 1);
               this.state.requestSourceAttempts[reqId] = attempts;
               this.state.requestErrors[reqId] = {
                 error: task.error,
@@ -5461,17 +5667,43 @@ export class BridgeService {
               };
               newlyFailed = true;
 
+              delete this.state.requests[reqId];
               if (attempts < this.maxSourceAttempts) {
-                delete this.state.requests[reqId];
-                this.triggerProcessPendingRequests(100);
+                this.setRequestProgress(reqId, 'shelfmark_download_failed', {
+                  reason: task.error || 'shelfmark_download_failed',
+                  error: task.error,
+                });
               } else {
-                console.warn(`[Bridge] Request ${reqId} reached max source attempts (${attempts}/${this.maxSourceAttempts}). Halting retries.`);
+                console.warn(`[Bridge] Request ${reqId} reached max source attempts (${attempts}/${this.maxSourceAttempts}) on shelfmark_download_failed. Terminally rejecting in BookOrbit.`);
+                this.setRequestProgress(reqId, 'exhausted', {
+                  reason: task.error || 'shelfmark_download_failed',
+                  error: task.error,
+                });
+                await this.rejectBookOrbitRequest(reqId, {
+                  stage: 'shelfmark_download_failed',
+                  reason: task.error || 'shelfmark_download_failed',
+                  task,
+                }, fetchFn);
+              }
+            } else {
+              if (this.state.requests[reqId] === (task.taskId || task.id)) {
+                delete this.state.requests[reqId];
+              }
+              const p = this.state.requestProgress?.[reqId];
+              if (p && (p.stage === 'queued' || p.stage === 'downloading')) {
+                this.setRequestProgress(reqId, 'shelfmark_download_failed', {
+                  reason: 'shelfmark_download_failed',
+                  error: task.error,
+                });
               }
             }
           }
         }
         if (newlyFailed) {
           updatedCount++;
+          if ((task.requestIds || []).some((rid) => (this.state.requestSourceAttempts[rid] || 0) < this.maxSourceAttempts)) {
+            this.triggerProcessPendingRequests(100);
+          }
         }
       } else if (task.status === 'completed' || task.status === 'imported' || task.status === 'finalization_failed' || task.status === 'partially_fulfilled' || task.status === 'uncertain_upload') {
         // Task completed or partially fulfilled mid-flight; retry fulfillment
@@ -5544,6 +5776,27 @@ export class BridgeService {
     }
   }
 
+  scheduleActiveReconciliation(delayMs = 15000) {
+    if (this._activeReconcileTimer) return;
+    this._activeReconcileTimer = setTimeout(async () => {
+      this._activeReconcileTimer = null;
+      try {
+        await this.reconcile();
+      } catch (err) {
+        console.warn(`[Bridge] Active reconciliation error: ${sanitizeLog(err.message)}`);
+      }
+      const hasActive = Object.values(this.state.tasks || {}).some((t) =>
+        t && (t.status === 'queued' || t.status === 'downloading' || t.status === 'awaiting_file')
+      ) || Object.keys(this.state.uncertainQueues || {}).length > 0;
+      if (hasActive) {
+        this.scheduleActiveReconciliation(15000);
+      }
+    }, delayMs);
+    if (this._activeReconcileTimer.unref) {
+      this._activeReconcileTimer.unref();
+    }
+  }
+
   /**
    * Stops periodic reconciliation loop and socket listeners.
    */
@@ -5551,6 +5804,10 @@ export class BridgeService {
     if (this.reconcileTimer) {
       clearInterval(this.reconcileTimer);
       this.reconcileTimer = null;
+    }
+    if (this._activeReconcileTimer) {
+      clearTimeout(this._activeReconcileTimer);
+      this._activeReconcileTimer = null;
     }
     if (this.debounceTimer) {
       clearTimeout(this.debounceTimer);
