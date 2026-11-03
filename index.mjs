@@ -26,7 +26,7 @@ const inFlightResolutions = new Map();
 /** Confident bidirectional title equivalents. */
 export default {
   apiVersion: 1,
-  version: '1.8.4',
+  version: '1.8.5',
   update: {
     manifestUrl: 'https://raw.githubusercontent.com/esreddy2/bookorbit-plugin-shelfmark/main/updates/shelfmark.json',
     ed25519PublicKey: '-0aHVhXqg7cGaDchc2p1Y8tDnn8A7cJ0WREKspNv5Bc',
@@ -585,12 +585,17 @@ export default {
             try {
               relRes = await safeHostFetch(host, releasesUrl.href, { headers }, signal);
             } catch (err) {
-                if (signal?.aborted) throw err;
+              if (signal?.aborted) throw err;
+              console.warn(`[Shelfmark Plugin] Failed to query releases from ${releasesUrl.href}: ${err?.message || err}`);
               return [];
             }
             if (!relRes.ok) {
               if (relRes.status === 400) {
                 throw host.fail('error', `Shelfmark releases query rejected (HTTP 400): ${await relRes.text().catch(() => '')}`);
+              }
+              if (relRes.status === 429) {
+                console.warn(`[Shelfmark Plugin] Upstream releases query rate-limited (HTTP 429) at ${releasesUrl.href}`);
+                return [];
               }
               return [];
             }
@@ -1143,9 +1148,16 @@ async function doResolveFile(release, payload, resolvedFormat, fileName, baseUrl
               }
               if (matchedFailed.length === 1) {
                 const [failedId, failedTask] = matchedFailed[0];
+                try {
+                  await safeHostFetch(host, `${baseUrl}/api/activity/dismiss`, {
+                    method: 'POST',
+                    headers: { ...headers, 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ item_type: 'download', item_key: `download:${failedId}` }),
+                  }, signal);
+                } catch (_) {}
                 throw host.fail(
                   'error',
-                  `Shelfmark refused to queue download because a previous attempt failed (${failedId}: ${(failedTask.status_message || failedTask.error || failedTask.message || failedTask.status || 'failed')}). The failed task must be cleared in Shelfmark or container restarted, or choose another release in BookOrbit.`
+                  `Shelfmark refused to queue download because a previous attempt failed (${failedId}: ${(failedTask.status_message || failedTask.error || failedTask.message || failedTask.status || 'failed')}). The failed task has been dismissed from Shelfmark; please retry the request.`
                 );
               }
             }
@@ -1170,6 +1182,18 @@ async function doResolveFile(release, payload, resolvedFormat, fileName, baseUrl
   // Step 3: Bounded polling with sensible backoff while this specific download is active
   let pollDelay = initialDelay;
   let completedTaskId = null;
+  let lastMilestone = undefined;
+
+  const logProgressMilestone = (smTask) => {
+    const rawPct = smTask?.progress ?? smTask?.percent ?? smTask?.percentage ?? smTask?.download_percentage ?? 0;
+    const pct = typeof rawPct === 'number' ? rawPct : parseFloat(rawPct) || 0;
+    const milestone = Math.min(100, Math.max(0, Math.floor(pct / 25) * 25));
+    if (lastMilestone === undefined || milestone !== lastMilestone) {
+      lastMilestone = milestone;
+      const link = payload?.download_url || payload?.source_url || payload?.info_url || release?.downloadUrl || 'N/A';
+      console.log(`[Shelfmark Plugin] Download progress: ${milestone}% (${pct.toFixed(1)}%) for "${release?.title || payload?.title || ''}" [upstream: ${payload?.source || release?.extra?.source || 'unknown'}, link: ${link}]`);
+    }
+  };
 
   while (Date.now() - startTime < timeoutSec * 1000) {
     if (signal?.aborted) {
@@ -1218,6 +1242,11 @@ async function doResolveFile(release, payload, resolvedFormat, fileName, baseUrl
       const exactCompletedEntry = Object.entries(completed).find(([id, task]) => isExactMatch(id, task));
       if (exactCompletedEntry) {
         completedTaskId = exactCompletedEntry[0];
+        if (lastMilestone !== 100) {
+          lastMilestone = 100;
+          const link = payload?.download_url || payload?.source_url || payload?.info_url || release?.downloadUrl || 'N/A';
+          console.log(`[Shelfmark Plugin] Download progress: 100% for "${release?.title || payload?.title || ''}" [upstream: ${payload?.source || release?.extra?.source || 'unknown'}, link: ${link}]`);
+        }
         break;
       }
 
@@ -1231,6 +1260,7 @@ async function doResolveFile(release, payload, resolvedFormat, fileName, baseUrl
       // 3. If exact task is in active, it is still downloading -> continue polling
       const exactActiveEntry = Object.entries(active).find(([id, task]) => isExactMatch(id, task));
       if (exactActiveEntry) {
+        logProgressMilestone(exactActiveEntry[1]);
         continue;
       }
 
@@ -1255,6 +1285,11 @@ async function doResolveFile(release, payload, resolvedFormat, fileName, baseUrl
     if (totalStrong === 1) {
       if (strongCompleted.length === 1) {
         completedTaskId = strongCompleted[0][0];
+        if (lastMilestone !== 100) {
+          lastMilestone = 100;
+          const link = payload?.download_url || payload?.source_url || payload?.info_url || release?.downloadUrl || 'N/A';
+          console.log(`[Shelfmark Plugin] Download progress: 100% for "${release?.title || payload?.title || ''}" [upstream: ${payload?.source || release?.extra?.source || 'unknown'}, link: ${link}]`);
+        }
         break;
       }
       if (strongFailed.length === 1) {
@@ -1262,6 +1297,7 @@ async function doResolveFile(release, payload, resolvedFormat, fileName, baseUrl
       }
       if (strongActive.length === 1) {
         queuedTaskId = strongActive[0][0];
+        logProgressMilestone(strongActive[0][1]);
         continue;
       }
     } else if (totalStrong > 1) {
@@ -1285,6 +1321,11 @@ async function doResolveFile(release, payload, resolvedFormat, fileName, baseUrl
     if (totalTitleMatches === 1) {
       if (titleCompleted.length === 1) {
         completedTaskId = titleCompleted[0][0];
+        if (lastMilestone !== 100) {
+          lastMilestone = 100;
+          const link = payload?.download_url || payload?.source_url || payload?.info_url || release?.downloadUrl || 'N/A';
+          console.log(`[Shelfmark Plugin] Download progress: 100% for "${release?.title || payload?.title || ''}" [upstream: ${payload?.source || release?.extra?.source || 'unknown'}, link: ${link}]`);
+        }
         break;
       }
       if (titleFailed.length === 1) {
@@ -1292,6 +1333,7 @@ async function doResolveFile(release, payload, resolvedFormat, fileName, baseUrl
       }
       if (titleActive.length === 1) {
         queuedTaskId = titleActive[0][0];
+        logProgressMilestone(titleActive[0][1]);
         continue;
       }
     } else if (totalTitleMatches > 1) {

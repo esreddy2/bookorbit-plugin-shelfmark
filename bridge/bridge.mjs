@@ -2933,6 +2933,30 @@ export class BridgeService {
         return true;
       } else {
         console.warn(`[Bridge] BookOrbit reject request returned HTTP ${res?.status} for request ${reqIdStr}`);
+        // If HTTP 400 (or non-success), BookOrbit refuses rejection because the request is approved.
+        // Fall back to POST /api/v1/book-requests/:id/cancel to settle and mark as cancelled/failed in BookOrbit.
+        const cancelUrl = `${this.bookorbitUrl}/api/v1/book-requests/${encodeURIComponent(reqIdStr)}/cancel`;
+        try {
+          const cancelRes = await fetchFn(cancelUrl, {
+            method: 'POST',
+            headers,
+          });
+          if (cancelRes && (cancelRes.ok || cancelRes.status === 404 || cancelRes.status === 409)) {
+            this.state.rejectedRequests = this.state.rejectedRequests || {};
+            this.state.rejectedRequests[reqIdStr] = {
+              rejectedAt: new Date().toISOString(),
+              decisionNote: note,
+              reason,
+            };
+            delete this.state.requests[reqIdStr];
+            this.setRequestProgress(reqIdStr, 'rejected', { reason: 'cancelled_in_bookorbit', decisionNote: note });
+            this.saveState();
+            console.log(`[Bridge] Successfully settled/cancelled BookOrbit request ${reqIdStr} after exhaustion.`);
+            return true;
+          }
+        } catch (cErr) {
+          console.warn(`[Bridge] Failed to cancel request ${reqIdStr} in BookOrbit: ${sanitizeLog(cErr.message)}`);
+        }
       }
     } catch (err) {
       console.warn(`[Bridge] Failed to send rejection to BookOrbit for request ${reqIdStr}: ${sanitizeLog(err.message)}`);
@@ -3113,76 +3137,15 @@ export class BridgeService {
             timeoutErr.name = 'TimeoutError';
             searchController.abort(timeoutErr);
           }, 80000);
+          let initialSearchError = null;
           try {
             searchResults = await plugin.search(query, config, host, searchController.signal);
           } catch (err) {
-            const errorMessage = err instanceof Error ? err.message : String(err ?? 'unknown error');
-            console.warn(`[Bridge] Plugin search error for "${query.title}": ${sanitizeLog(errorMessage)}`);
-            this.setRequestProgress(reqId, 'search_failed', { reason: 'search_failed', error: errorMessage });
-            const nextAttemptSf = (this.state.requestSourceAttempts[reqId] || 0) + 1;
-            const attemptIdSf = `search_failed:${reqId}:${nextAttemptSf}`;
-            this.state.requestAttempts[reqId] = this.state.requestAttempts[reqId] || [];
-            if (!this.state.requestAttempts[reqId].some((a) => a.attemptId === attemptIdSf)) {
-              this.state.requestAttempts[reqId].push({ attemptId: attemptIdSf, timestamp: new Date().toISOString(), error: errorMessage });
-              this.state.requestSourceAttempts[reqId] = nextAttemptSf;
-            }
-            this.state.requestErrors[reqId] = {
-              error: errorMessage,
-              errorType: 'search_failed',
-              reason: 'search_failed',
-              lastAttemptAt: new Date().toISOString(),
-              attempts: this.state.requestSourceAttempts[reqId] || 0,
-            };
-            if (this.state.requestSourceAttempts[reqId] >= this.maxSourceAttempts) {
-              await this.rejectBookOrbitRequest(reqId, {
-                stage: 'search_failed',
-                reason: errorMessage,
-                req,
-                searchTitle: query.title,
-              }, fetchFn);
-            }
-            this.saveState();
-            continue;
+            initialSearchError = err instanceof Error ? err.message : String(err ?? 'unknown error');
+            console.warn(`[Bridge] Upstream search error for request ${reqId} ("${query.title}"): ${sanitizeLog(initialSearchError)}. Trying other upstreams...`);
+            searchResults = [];
           } finally {
             clearTimeout(searchTimeout);
-          }
-
-           if (!searchResults || searchResults.length === 0) {
-             console.log(`[Bridge] No valid releases found for approved request ${reqId} ("${query.title}")`);
-             const emptyCounts = { metadataCandidateCount: 0, releaseCandidateCount: 0, candidateRejectionReasonCounts: {} };
-             this.state.requestProgress[reqId] = { ...(this.state.requestProgress[reqId] || {}), ...emptyCounts, updatedAt: new Date().toISOString() };
-             this.state.requestStages[reqId] = this.state.requestProgress[reqId];
-             this.state.requestStatus[reqId] = this.state.requestProgress[reqId];
-             this.state.requestCandidateCounts[reqId] = { metadataCandidateCount: 0, releaseCandidateCount: 0 };
-             this.state.requestMetadataCandidateCounts[reqId] = 0;
-             this.state.requestReleaseCandidateCounts[reqId] = 0;
-             this.state.requestCandidateRejectionReasons[reqId] = {};
-             this.setRequestProgress(reqId, 'no_releases', { reason: 'no_releases', ...emptyCounts });
-             this.saveState();
-            const nextAttemptNr = (this.state.requestSourceAttempts[reqId] || 0) + 1;
-            const attemptIdNr = `no_releases:${reqId}:${nextAttemptNr}`;
-            this.state.requestAttempts[reqId] = this.state.requestAttempts[reqId] || [];
-            if (!this.state.requestAttempts[reqId].some((a) => a.attemptId === attemptIdNr)) {
-              this.state.requestAttempts[reqId].push({ attemptId: attemptIdNr, timestamp: new Date().toISOString(), error: 'No releases found' });
-              this.state.requestSourceAttempts[reqId] = nextAttemptNr;
-            }
-            this.state.requestErrors[reqId] = {
-              error: 'No releases found',
-              errorType: 'no_releases',
-              reason: 'no_releases',
-              lastAttemptAt: new Date().toISOString(),
-              attempts: this.state.requestSourceAttempts[reqId] || 0,
-            };
-            if (this.state.requestSourceAttempts[reqId] >= this.maxSourceAttempts) {
-              await this.rejectBookOrbitRequest(reqId, {
-                stage: 'no_releases',
-                reason: 'No releases found',
-                req,
-                searchTitle: query.title,
-              }, fetchFn);
-            }
-            this.saveState();
-            continue;
           }
 
            // 5. Filter releases for Stage 1 candidate compatibility and filter out recently failed releases
@@ -3243,72 +3206,80 @@ export class BridgeService {
            this.state.requestStages[reqId] = progressEntry;
            this.state.requestStatus[reqId] = progressEntry;
 
-          // If no eligible releases found in initial search, but candidate(s) are in cooldown or had verification conflict,
+          // If no eligible releases found in initial search,
           // actively search alternative release sources before evaluating failure
           if (eligibleReleases.length === 0) {
-            const hasCooldownInit = (candidateRejectionReasonCounts.cooldown || 0) > 0;
             const priorVerInit = this.state.requestVerification?.[reqId];
-            const hasUnrecoverableConflictInit = priorVerInit && priorVerInit.ok === false && (
-              priorVerInit.conflicts?.includes('incompatible_title') ||
-              priorVerInit.conflicts?.includes('incompatible_author')
+            const failedSources = new Set(
+              (searchResults || [])
+                .filter((rel) => {
+                  const rKey = this.getReleaseKey(rel);
+                  return rKey && this.state.failedReleases?.[rKey];
+                })
+                .map((rel) => (rel.extra?.source || rel.source || '').toLowerCase())
+                .filter(Boolean)
             );
-            if (hasCooldownInit || hasUnrecoverableConflictInit) {
-              const failedSources = new Set(
-                (searchResults || [])
-                  .filter((rel) => {
-                    const rKey = this.getReleaseKey(rel);
-                    return rKey && this.state.failedReleases?.[rKey];
-                  })
-                  .map((rel) => (rel.extra?.source || rel.source || '').toLowerCase())
-                  .filter(Boolean)
-              );
-              if (priorVerInit?.task?.source) {
-                failedSources.add(priorVerInit.task.source.toLowerCase());
-              }
-              const candidateSources = ['libgen', 'aa-fast', 'aa-slow-nowait', 'zlib', 'oceanofpdf'];
-              const altSources = candidateSources.filter((s) => !failedSources.has(s));
+            if (priorVerInit?.releaseKey) {
+              const src = priorVerInit.releaseKey.split(':')[0]?.toLowerCase();
+              if (src) failedSources.add(src);
+            }
+            if (priorVerInit?.taskId && this.state.tasks?.[priorVerInit.taskId]?.source) {
+              failedSources.add(this.state.tasks[priorVerInit.taskId].source.toLowerCase());
+            }
+            const normalizeUpstream = (s) => {
+              const lower = String(s || '').toLowerCase();
+              if (lower.includes('oceanofpdf') || lower.includes('direct_download')) return 'direct_download';
+              if (lower.includes('anna') || lower.includes('aa-')) return 'annas';
+              if (lower.includes('libgen')) return 'libgen';
+              return lower;
+            };
+            const failedFamilies = new Set([...failedSources].map(normalizeUpstream));
+            const allUpstreams = ['annas', 'libgen', 'direct_download', 'oceanofpdf'];
+            const altSources = allUpstreams.filter((s) => !failedFamilies.has(normalizeUpstream(s)));
 
-              for (const altSource of altSources) {
-                if (eligibleReleases.length > 0) break;
-                try {
-                  const altConfig = {
-                    ...config,
-                    settings: {
-                      ...config.settings,
-                      releaseSource: altSource,
-                    },
-                  };
-                  const altResults = await plugin.search(query, altConfig, host, searchController.signal);
-                  for (const rel of (altResults || [])) {
-                    const reason = getEditionIncompatibilityReason(reqForCompatibility, rel);
-                    const rKey = this.getReleaseKey(rel);
-                    const inCooldown = rKey && this.state.failedReleases?.[rKey] &&
-                      (Date.now() - new Date(this.state.failedReleases[rKey].failedAt).getTime() < this.releaseFailureCooldownMs);
-                    if (!reason && !inCooldown) {
-                      eligibleReleases.push(rel);
-                    } else if (inCooldown) {
-                      candidateRejectionReasonCounts.cooldown = (candidateRejectionReasonCounts.cooldown || 0) + 1;
-                    }
+            for (const altSource of altSources) {
+              if (eligibleReleases.length > 0) break;
+              try {
+                console.log(`[Bridge] Upstream query: searching provider "${altSource}" for request ${reqId} ("${query.title}")`);
+                const altConfig = {
+                  ...config,
+                  settings: {
+                    ...config.settings,
+                    releaseSource: altSource,
+                  },
+                };
+                const altResults = await plugin.search(query, altConfig, host, searchController.signal);
+                for (const rel of (altResults || [])) {
+                  const reason = getEditionIncompatibilityReason(reqForCompatibility, rel);
+                  const rKey = this.getReleaseKey(rel);
+                  const inCooldown = rKey && this.state.failedReleases?.[rKey] &&
+                    (Date.now() - new Date(this.state.failedReleases[rKey].failedAt).getTime() < this.releaseFailureCooldownMs);
+                  if (!reason && !inCooldown) {
+                    eligibleReleases.push(rel);
+                  } else if (inCooldown) {
+                    candidateRejectionReasonCounts.cooldown = (candidateRejectionReasonCounts.cooldown || 0) + 1;
                   }
-                } catch (_) {}
+                }
+              } catch (altErr) {
+                console.warn(`[Bridge] Upstream provider "${altSource}" error for request ${reqId}: ${sanitizeLog(altErr?.message || altErr)}. Trying next upstream...`);
               }
+            }
 
-              if (eligibleReleases.length > 0) {
-                eligibleReleases.sort((a, b) => {
-                  const ca = candidateCompatibility(reqForCompatibility, a);
-                  const cb = candidateCompatibility(reqForCompatibility, b);
-                  const langConflictA = ca.languageHint === 'mismatch' ? 1 : 0;
-                  const langConflictB = cb.languageHint === 'mismatch' ? 1 : 0;
-                  if (langConflictA !== langConflictB) return langConflictA - langConflictB;
-                  const isbnBoostA = ca.isbnVerified ? 0 : 1;
-                  const isbnBoostB = cb.isbnVerified ? 0 : 1;
-                  if (isbnBoostA !== isbnBoostB) return isbnBoostA - isbnBoostB;
-                  const langTierA = ca.languageHint === 'match' ? 0 : (ca.languageHint === 'unknown' ? 1 : 2);
-                  const langTierB = cb.languageHint === 'match' ? 0 : (cb.languageHint === 'unknown' ? 1 : 2);
-                  return langTierA - langTierB;
-                });
-                console.log(`[Bridge] Discovered ${eligibleReleases.length} eligible release(s) via alternative release source fallback for request ${reqId}`);
-              }
+            if (eligibleReleases.length > 0) {
+              eligibleReleases.sort((a, b) => {
+                const ca = candidateCompatibility(reqForCompatibility, a);
+                const cb = candidateCompatibility(reqForCompatibility, b);
+                const langConflictA = ca.languageHint === 'mismatch' ? 1 : 0;
+                const langConflictB = cb.languageHint === 'mismatch' ? 1 : 0;
+                if (langConflictA !== langConflictB) return langConflictA - langConflictB;
+                const isbnBoostA = ca.isbnVerified ? 0 : 1;
+                const isbnBoostB = cb.isbnVerified ? 0 : 1;
+                if (isbnBoostA !== isbnBoostB) return isbnBoostA - isbnBoostB;
+                const langTierA = ca.languageHint === 'match' ? 0 : (ca.languageHint === 'unknown' ? 1 : 2);
+                const langTierB = cb.languageHint === 'match' ? 0 : (cb.languageHint === 'unknown' ? 1 : 2);
+                return langTierA - langTierB;
+              });
+              console.log(`[Bridge] Discovered ${eligibleReleases.length} eligible release(s) via alternative release source fallback for request ${reqId}`);
             }
           }
 
@@ -3397,29 +3368,32 @@ export class BridgeService {
               this.saveState();
               continue;
             }
-            console.log(`[Bridge] No eligible edition-compatible releases found for approved request ${reqId} ("${query.title}")`);
-            this.setRequestProgress(reqId, 'no_eligible_edition', { reason, ...candidateCounts });
-            const nextAttemptNe = (this.state.requestSourceAttempts[reqId] || 0) + 1;
-            const attemptIdNe = `no_eligible_edition:${reqId}:${nextAttemptNe}`;
+            const isNoReleases = (searchResults?.length || 0) === 0;
+            const stage = initialSearchError ? 'search_failed' : (isNoReleases ? 'no_releases' : 'no_eligible_edition');
+            const finalReason = initialSearchError || ineligibilityReason || (isNoReleases ? 'No releases found' : 'no_eligible_edition');
+            console.log(`[Bridge] No valid releases found for approved request ${reqId} ("${query.title}"): ${finalReason}`);
+            this.setRequestProgress(reqId, stage, { reason: finalReason, ...candidateCounts });
+            const nextAttempt = (this.state.requestSourceAttempts[reqId] || 0) + 1;
+            const attemptId = `${stage}:${reqId}:${nextAttempt}`;
             this.state.requestAttempts[reqId] = this.state.requestAttempts[reqId] || [];
-            if (!this.state.requestAttempts[reqId].some((a) => a.attemptId === attemptIdNe)) {
-              this.state.requestAttempts[reqId].push({ attemptId: attemptIdNe, timestamp: new Date().toISOString(), error: reason });
-              this.state.requestSourceAttempts[reqId] = nextAttemptNe;
+            if (!this.state.requestAttempts[reqId].some((a) => a.attemptId === attemptId)) {
+              this.state.requestAttempts[reqId].push({ attemptId, timestamp: new Date().toISOString(), error: finalReason });
+              this.state.requestSourceAttempts[reqId] = nextAttempt;
             }
             this.state.requestErrors[reqId] = {
-              error: reason,
-              errorType: reason,
-              reason,
+              error: finalReason,
+              errorType: stage,
+              reason: stage,
               lastAttemptAt: new Date().toISOString(),
               attempts: this.state.requestSourceAttempts[reqId] || 0,
             };
             if (this.state.requestSourceAttempts[reqId] >= this.maxSourceAttempts) {
               await this.rejectBookOrbitRequest(reqId, {
-                stage: 'no_eligible_edition',
-                reason,
+                stage,
+                reason: finalReason,
                 req,
                 searchTitle: query.title,
-                exhaustionReason: reason,
+                exhaustionReason: finalReason,
               }, fetchFn);
             }
             this.saveState();
@@ -3458,6 +3432,10 @@ export class BridgeService {
               break;
             }
 
+            const candidateLink = candidateRelease.downloadUrl || candidateRelease.extra?.releasePayload?.download_url || candidateRelease.extra?.releasePayload?.source_url || candidateRelease.extra?.releasePayload?.info_url || 'N/A';
+            const candidateUpstream = candidateRelease.source || candidateRelease.extra?.source || candidateRelease.extra?.releasePayload?.source || 'unknown';
+            console.log(`[Bridge] Initiating download for request ${reqId} ("${candidateRelease.title}") from upstream "${candidateUpstream}" (link: ${candidateLink})`);
+
             try {
               const queueRes = await this.queueRelease({
                 requestId: reqId,
@@ -3476,22 +3454,22 @@ export class BridgeService {
                 fetchFn,
               });
               if (queueRes.adopted || queueRes.reused) {
-                console.log(`[Bridge] Adopted existing task ${queueRes.taskId} for request ${reqId} ("${candidateRelease.title}")`);
+                console.log(`[Bridge] Adopted existing task ${queueRes.taskId} for request ${reqId} ("${candidateRelease.title}") [upstream: ${candidateUpstream}, link: ${candidateLink}]`);
               } else {
-                console.log(`[Bridge] Queued release for request ${reqId} ("${candidateRelease.title}")`);
+                console.log(`[Bridge] Queued release for request ${reqId} ("${candidateRelease.title}") from upstream "${candidateUpstream}" (link: ${candidateLink})`);
               }
               queuedSuccessfully = true;
-              this.setRequestProgress(reqId, 'queued', { reason: 'queued' });
+              this.setRequestProgress(reqId, 'queued', { reason: 'queued', upstream: candidateUpstream, downloadUrl: candidateLink !== 'N/A' ? candidateLink : null });
               break;
             } catch (err) {
               const isEditionConflict = err.message && (err.message.toLowerCase().includes('incompatible edition') || err.message.toLowerCase().includes('incompatible'));
               if (isEditionConflict) {
-                console.warn(`[Bridge] Candidate release "${candidateRelease.title}" conflicted with existing task edition: ${sanitizeLog(err.message)}. Trying next candidate release...`);
+                console.warn(`[Bridge] Candidate release "${candidateRelease.title}" from upstream "${candidateUpstream}" conflicted with existing task edition: ${sanitizeLog(err.message)}. Trying next candidate release...`);
                 // DO NOT blacklist candidate in failedReleases! Try next candidate release.
                 continue;
               }
 
-              console.error(`[Bridge] Failed to queue release for request ${reqId}: ${sanitizeLog(err.message)}`);
+              console.error(`[Bridge] Failed to queue release for request ${reqId} from upstream "${candidateUpstream}" (link: ${candidateLink}): ${sanitizeLog(err.message)}. Trying other upstreams...`);
               const rKey = this.getReleaseKey(candidateRelease);
               if (rKey) {
                 this.state.failedReleases[rKey] = {
@@ -3674,59 +3652,76 @@ export class BridgeService {
 
     if (existingTaskId && this.state.tasks[existingTaskId]) {
       const existing = this.state.tasks[existingTaskId];
-      verifyExistingTaskAdoption(existing, existingTaskId, true);
+      const isFailedTask = Boolean(
+        existing.verificationFailed ||
+        existing.isbnVerificationFailed ||
+        existing.editionVerificationFailed ||
+        existing.status === 'finalization_failed' ||
+        existing.status === 'failed'
+      );
+      if (isFailedTask) {
+        // A previously failed task must not prevent the release/book from being requested again.
+        delete this.state.releases[releaseKey];
+      } else {
+        verifyExistingTaskAdoption(existing, existingTaskId, true);
 
-      this.state.requests[requestId] = existingTaskId;
-      if (!existing.requestIds.includes(requestId)) {
-        existing.requestIds.push(requestId);
-      }
-      if (userId && !existing.userIds.includes(userId)) {
-        existing.userIds.push(userId);
-      }
-      existing.updatedAt = new Date().toISOString();
-      mergeRequestIntoExistingTask(existing);
-      this.saveState();
+        const relUrl = release.downloadUrl || release.sourceUrl || release.infoUrl || null;
+        existing.downloadUrl = existing.downloadUrl || relUrl;
+        existing.sourceUrl = existing.sourceUrl || release.sourceUrl || relUrl;
+        existing.infoUrl = existing.infoUrl || release.infoUrl || null;
 
-      if ((existing.status === 'completed' || existing.status === 'fulfilled') && existing.filePath) {
-        const verify = this.verifyFile(existing.filePath, existing.format);
-        if (verify.ok) {
-          const targetLibId = parsePositiveInt(existing.libraryId ?? this.defaultLibraryId);
-          if (existing.matchedBookId && targetLibId && this.bookorbitUrl) {
-            const authHeaders = await this.getAuthHeaders();
-            const bookStatus = await this.verifyBookInLibrary(existing, targetLibId, existing.matchedBookId, authHeaders, fetchFn);
-            if (bookStatus === 'deleted') {
-              console.warn(`[Bridge] Book ${existing.matchedBookId} on adopted task ${existingTaskId} was definitively deleted; invalidating stale mapping.`);
-              existing.matchedBookId = null;
-              existing.dockFileId = null;
-              delete existing.uploadBaselineChecked;
-              delete existing.uploadBaselineIds;
-              delete existing.uncertainUpload;
-              if (existing.status === 'fulfilled' || existing.status === 'imported') {
-                existing.status = 'completed';
+        this.state.requests[requestId] = existingTaskId;
+        if (!existing.requestIds.includes(requestId)) {
+          existing.requestIds.push(requestId);
+        }
+        if (userId && !existing.userIds.includes(userId)) {
+          existing.userIds.push(userId);
+        }
+        existing.updatedAt = new Date().toISOString();
+        mergeRequestIntoExistingTask(existing);
+        this.saveState();
+
+        if ((existing.status === 'completed' || existing.status === 'fulfilled') && existing.filePath) {
+          const verify = this.verifyFile(existing.filePath, existing.format);
+          if (verify.ok) {
+            const targetLibId = parsePositiveInt(existing.libraryId ?? this.defaultLibraryId);
+            if (existing.matchedBookId && targetLibId && this.bookorbitUrl) {
+              const authHeaders = await this.getAuthHeaders();
+              const bookStatus = await this.verifyBookInLibrary(existing, targetLibId, existing.matchedBookId, authHeaders, fetchFn);
+              if (bookStatus === 'deleted') {
+                console.warn(`[Bridge] Book ${existing.matchedBookId} on adopted task ${existingTaskId} was definitively deleted; invalidating stale mapping.`);
+                existing.matchedBookId = null;
+                existing.dockFileId = null;
+                delete existing.uploadBaselineChecked;
+                delete existing.uploadBaselineIds;
+                delete existing.uncertainUpload;
+                if (existing.status === 'fulfilled' || existing.status === 'imported') {
+                  existing.status = 'completed';
+                }
+                this.saveState();
               }
-              this.saveState();
             }
+            if (this.bookorbitUrl) {
+              this.fulfillBookOrbitRequests(existing, fetchFn).catch((err) => {
+                console.warn(`[Bridge] Fulfillment error on adopted task ${existingTaskId}: ${sanitizeLog(err.message)}`);
+              });
+            }
+            return {
+              status: 'completed',
+              taskId: existingTaskId,
+              filePath: existing.filePath,
+              reused: Boolean(existing.matchedBookId),
+            };
           }
-          if (this.bookorbitUrl) {
-            this.fulfillBookOrbitRequests(existing, fetchFn).catch((err) => {
-              console.warn(`[Bridge] Fulfillment error on adopted task ${existingTaskId}: ${sanitizeLog(err.message)}`);
-            });
-          }
+        }
+
+        if (existing.status === 'queued' || existing.status === 'downloading' || existing.status === 'awaiting_file') {
           return {
-            status: 'completed',
+            status: 'in_progress',
             taskId: existingTaskId,
-            filePath: existing.filePath,
-            reused: Boolean(existing.matchedBookId),
+            adopted: true,
           };
         }
-      }
-
-      if (existing.status === 'queued' || existing.status === 'downloading' || existing.status === 'awaiting_file') {
-        return {
-          status: 'in_progress',
-          taskId: existingTaskId,
-          adopted: true,
-        };
       }
     }
 
@@ -3941,9 +3936,39 @@ export class BridgeService {
     const now = new Date().toISOString();
     if (this.state.tasks[taskId]) {
       const existing = this.state.tasks[taskId];
-      const sameSrc = Boolean(existing.sourceId && downloadPayload.source_id && String(existing.sourceId) === String(downloadPayload.source_id));
-      verifyExistingTaskAdoption(existing, taskId, sameSrc);
-      mergeRequestIntoExistingTask(existing);
+      const isFailedTask = Boolean(
+        existing.verificationFailed ||
+        existing.isbnVerificationFailed ||
+        existing.editionVerificationFailed ||
+        existing.status === 'finalization_failed' ||
+        existing.status === 'failed'
+      );
+      if (isFailedTask) {
+        existing.status = 'queued';
+        existing.verificationFailed = false;
+        existing.isbnVerificationFailed = false;
+        existing.editionVerificationFailed = false;
+        existing.error = null;
+        existing.filePath = null;
+        existing.progress = 0;
+        existing.downloadPercent = 0;
+        existing.requestIds = Array.isArray(existing.requestIds) ? existing.requestIds : [];
+        if (requestId && !existing.requestIds.includes(requestId)) {
+          existing.requestIds.push(requestId);
+        }
+        existing.userIds = Array.isArray(existing.userIds) ? existing.userIds : [];
+        if (userId && !existing.userIds.includes(userId)) {
+          existing.userIds.push(userId);
+        }
+        existing.downloadUrl = downloadPayload.download_url || release.downloadUrl || null;
+        existing.sourceUrl = downloadPayload.source_url || release.sourceUrl || null;
+        existing.infoUrl = downloadPayload.info_url || release.infoUrl || null;
+        mergeRequestIntoExistingTask(existing);
+      } else {
+        const sameSrc = Boolean(existing.sourceId && downloadPayload.source_id && String(existing.sourceId) === String(downloadPayload.source_id));
+        verifyExistingTaskAdoption(existing, taskId, sameSrc);
+        mergeRequestIntoExistingTask(existing);
+      }
 
       this.state.requests[requestId] = taskId;
       this.state.requestTasks = this.state.requestTasks || {};
@@ -4025,6 +4050,11 @@ export class BridgeService {
       format: (downloadPayload.format || release.format || 'epub').toLowerCase(),
       source: downloadPayload.source,
       sourceId: downloadPayload.source_id,
+      downloadUrl: downloadPayload.download_url || release.downloadUrl || null,
+      sourceUrl: downloadPayload.source_url || release.sourceUrl || null,
+      infoUrl: downloadPayload.info_url || release.infoUrl || null,
+      progress: 0,
+      downloadPercent: 0,
       libraryId: libraryId ?? this.defaultLibraryId,
       folderId: folderId ?? this.defaultFolderId,
       shelfmarkUrl: smUrl,
@@ -5715,13 +5745,42 @@ export class BridgeService {
       const taskIdStr = String(task.taskId);
 
       if (downloadingMap.has(taskIdStr)) {
+        const smTask = downloadingMap.get(taskIdStr);
+        const rawPct = smTask?.progress ?? smTask?.percent ?? smTask?.percentage ?? smTask?.download_percentage ?? 0;
+        const pct = typeof rawPct === 'number' ? rawPct : parseFloat(rawPct) || 0;
+        const milestone = Math.min(100, Math.max(0, Math.floor(pct / 25) * 25));
+        task.progress = milestone;
+        task.downloadPercent = pct;
         for (const rid of (task.requestIds || [])) {
-          this.setRequestProgress(rid, 'downloading', { reason: 'downloading' });
+          const priorMilestone = this.state.requestProgress[rid]?.downloadMilestone;
+          if (priorMilestone === undefined || milestone !== priorMilestone) {
+            const link = task.downloadUrl || task.sourceUrl || task.infoUrl || 'N/A';
+            console.log(`[Bridge] Download progress: ${milestone}% (${pct.toFixed(1)}%) for request ${rid} ("${task.title || ''}") [upstream: ${task.source || 'unknown'}, link: ${link}]`);
+          }
+          this.setRequestProgress(rid, 'downloading', {
+            reason: 'downloading',
+            downloadMilestone: milestone,
+            progressPercent: pct,
+            downloadProgress: `${milestone}%`,
+            progress: milestone,
+            upstream: task.source || 'unknown',
+            downloadUrl: task.downloadUrl || task.sourceUrl || null,
+          });
         }
       }
       if (queuedMap.has(taskIdStr)) {
+        task.progress = 0;
+        task.downloadPercent = 0;
         for (const rid of (task.requestIds || [])) {
-          this.setRequestProgress(rid, 'queued', { reason: 'queued' });
+          this.setRequestProgress(rid, 'queued', {
+            reason: 'queued',
+            downloadMilestone: 0,
+            progressPercent: 0,
+            downloadProgress: '0%',
+            progress: 0,
+            upstream: task.source || 'unknown',
+            downloadUrl: task.downloadUrl || task.sourceUrl || null,
+          });
         }
       }
 
@@ -5753,8 +5812,23 @@ export class BridgeService {
             if (task.status !== 'partially_fulfilled') {
               task.status = 'completed';
             }
+            task.progress = 100;
+            task.downloadPercent = 100;
             for (const rid of (task.requestIds || [])) {
-              this.setRequestProgress(rid, 'verifying', { reason: 'download_verifying' });
+              const priorMilestone = this.state.requestProgress[rid]?.downloadMilestone;
+              const link = task.downloadUrl || task.sourceUrl || task.infoUrl || 'N/A';
+              if (priorMilestone !== 100) {
+                console.log(`[Bridge] Download progress: 100% (100.0%) for request ${rid} ("${task.title || ''}") [upstream: ${task.source || 'unknown'}, link: ${link}]`);
+              }
+              this.setRequestProgress(rid, 'verifying', {
+                reason: 'download_verifying',
+                downloadMilestone: 100,
+                progressPercent: 100,
+                downloadProgress: '100%',
+                progress: 100,
+                upstream: task.source || 'unknown',
+                downloadUrl: task.downloadUrl || task.sourceUrl || null,
+              });
             }
             task.filePath = verify.safePath;
             task.sizeBytes = verify.sizeBytes;
@@ -5798,6 +5872,20 @@ export class BridgeService {
         task.error = smError?.status_message || smError?.error || smError?.message || smError?.status || 'Shelfmark reported failure';
         task.errorSource = 'shelfmark';
         task.updatedAt = now;
+        if (this.shelfmarkUrl && (task.taskId || task.id)) {
+          const smDismissId = task.taskId || task.id;
+          try {
+            const dismissHeaders = {
+              'Content-Type': 'application/json',
+              ...(this.shelfmarkApiKey ? { 'X-Api-Key': this.shelfmarkApiKey, 'Authorization': `Bearer ${this.shelfmarkApiKey}` } : {}),
+            };
+            fetchFn(`${this.shelfmarkUrl}/api/activity/dismiss`, {
+              method: 'POST',
+              headers: dismissHeaders,
+              body: JSON.stringify({ item_type: 'download', item_key: `download:${smDismissId}` }),
+            }).catch(() => {});
+          } catch (_) {}
+        }
         if (task.releaseKey && this.state.releases[task.releaseKey] === task.taskId) {
           delete this.state.releases[task.releaseKey];
         }
@@ -5811,12 +5899,15 @@ export class BridgeService {
           };
         }
 
+        const link = task.downloadUrl || task.sourceUrl || task.infoUrl || 'N/A';
+        const upstream = task.source || 'unknown';
         const attemptId = `shelfmark:${task.taskId}`;
         let newlyFailed = false;
 
         // Bounded selection of alternative eligible sources/releases with idempotent attempt counting
         for (const reqId of (task.requestIds || [])) {
           if (!task.requestFulfillments || !task.requestFulfillments[reqId]?.fulfilled) {
+            console.error(`[Bridge] Download failed for request ${reqId} ("${task.title || ''}") from upstream "${upstream}" (link: ${link}): ${task.error}. Trying other upstreams...`);
             this.state.requestTasks = this.state.requestTasks || {};
             this.state.requestTasks[reqId] = task.taskId || task.id;
             this.state.requestAttempts[reqId] = this.state.requestAttempts[reqId] || [];

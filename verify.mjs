@@ -82,7 +82,7 @@ import {
 import { inspectTitle } from './scripts/decomp.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
-const EXPECTED_VERSION = '1.8.4';
+const EXPECTED_VERSION = '1.8.5';
 const RELEASE_MODE = process.argv.includes('--release');
 const TEST_TIMEOUT_MS = 10_000;
 const tests = [];
@@ -133,6 +133,7 @@ const CONTRACT_ROUTES = Object.freeze([
   ['bo.refresh',    'POST', /^\/api\/v1\/auth\/refresh\/?$/],
   ['bo.requests',   'GET',  /^\/api\/v1\/admin\/book-requests\/?$/],
   ['bo.request',    'GET',  /^\/api\/v1\/book-requests\/[^/]+\/?$/],
+  ['bo.cancel',     'POST', /^\/api\/v1\/book-requests\/[^/]+\/cancel\/?$/],
   ['bo.fulfill',    'POST', /^\/api\/v1\/admin\/book-requests\/[^/]+\/fulfill\/?$/],
   ['bo.reject',     'POST', /^\/api\/v1\/admin\/book-requests\/[^/]+\/reject\/?$/],
   ['bo.upload',     'POST', /^\/api\/v1\/libraries\/[1-9]\d*\/upload\/?$/],
@@ -254,6 +255,8 @@ function apiScenarios({ requests = [], details = {}, books = [], releases = [], 
   delete handlers['bo.fulfill'];
   const rawReject = handlers['bo.reject'] ?? (() => ({ success: true }));
   delete handlers['bo.reject'];
+  const rawCancel = handlers['bo.cancel'] ?? (() => ({ success: true, status: 'cancelled' }));
+  delete handlers['bo.cancel'];
 
   return contractFetch({
     'bo.requests': () => response({ items: requests, total: requests.length, page: 1, limit: 50 }),
@@ -261,6 +264,11 @@ function apiScenarios({ requests = [], details = {}, books = [], releases = [], 
       const id = decodeURIComponent(path.split('/').at(-1));
       const item = details[id] ?? requests.find((r) => String(r.id) === id);
       return item ? response(item) : failResponse(404, 'Request not found');
+    },
+    'bo.cancel': (entry) => {
+      onPost(entry);
+      const res = typeof rawCancel === 'function' ? rawCancel(entry) : rawCancel;
+      return res instanceof Response ? res : response(res);
     },
     'bo.upload': async (entry) => {
       onPost(entry);
@@ -5551,6 +5559,483 @@ test('SOURCE FALLBACK: queries alternative release source when primary source ca
   await bridge.processPendingRequests({ fetchFn: fake.fetch });
   assert.equal(queuedTaskId, 'task-libgen-wild-zone-valid', 'must query and queue from alternative release source (libgen) when primary is in cooldown');
   assert.equal(bridge.state.requestProgress[reqId]?.stage, 'queued');
+});
+
+test('BOOKORBIT REJECTION FALLBACK: approved request falls back to POST /api/v1/book-requests/:id/cancel when reject returns 400', async () => {
+  const bridge = established(new BridgeService(bridgeOpts()));
+  try {
+    const reqId = 'req-reject-fallback-test';
+    const req = request(reqId, 'The Wild Zone', 'Rick Riordan');
+
+    // Request has reached maxSourceAttempts
+    bridge.state.requestSourceAttempts[reqId] = 3;
+    bridge.state.requestErrors[reqId] = { error: 'max_attempts_exhausted', attempts: 3 };
+
+    let rejectCalled = false;
+    let cancelCalled = false;
+    const fake = apiScenarios({
+      requests: [req],
+      'bo.reject': () => {
+        rejectCalled = true;
+        return failResponse(400, 'BOOK_REQUEST_NOT_PENDING');
+      },
+      'bo.cancel': () => {
+        cancelCalled = true;
+        return response({ success: true, status: 'cancelled' });
+      },
+    });
+
+    await bridge.processPendingRequests({ fetchFn: fake.fetch });
+    assert.ok(rejectCalled, 'must attempt bo.reject first');
+    assert.ok(cancelCalled, 'must fall back to bo.cancel when bo.reject returns 400');
+    assert.equal(bridge.state.requestProgress[reqId]?.stage, 'rejected', 'companion stage marks request rejected');
+    assert.ok(bridge.state.rejectedRequests[reqId], 'rejection is recorded in companion state');
+  } finally {
+    bridge.stop();
+  }
+});
+
+test('ALTERNATIVE UPSTREAM SEARCH: queries annas provider when oceanofpdf candidate fails verification and attempts remain', async () => {
+  const bridge = established(new BridgeService(bridgeOpts({ maxSourceAttempts: 3, releaseFailureCooldownMs: 60_000 })));
+  try {
+    const reqId = 'req-annas-fallback-test';
+    const req = request(reqId, 'Camp Half-Blood: The Wild Zone', 'Rick Riordan');
+    const oopKey = 'oceanofpdf:oop-wild-1';
+
+    // Seed prior verification failure on oceanofpdf release with 1 attempt
+    bridge.state.requestSourceAttempts[reqId] = 1;
+    bridge.state.requestVerification[reqId] = {
+      ok: false,
+      taskId: 'sm-task-1',
+      releaseKey: oopKey,
+      stage: 'finalization_failed',
+      errorType: 'finalization_failed',
+      primaryConflict: 'incompatible_title',
+      conflicts: ['incompatible_title'],
+      error: 'EPUB title mismatch: expected "Camp Half-Blood: The Wild Zone", got "Camp Half-Blood"',
+    };
+    bridge.state.failedReleases[oopKey] = {
+      releaseKey: oopKey,
+      source: 'oceanofpdf',
+      sourceId: 'oop-wild-1',
+      failedAt: new Date().toISOString(),
+      error: 'EPUB title mismatch',
+    };
+
+    const oopRel = release('Camp Half-Blood: The Wild Zone', 'Rick Riordan', {
+      source: 'oceanofpdf',
+      source_id: 'oop-wild-1',
+      format: 'epub',
+    });
+    const annasRel = release('Camp Half-Blood: The Wild Zone', 'Rick Riordan', {
+      source: 'annas',
+      source_id: 'annas-wild-1-valid',
+      format: 'epub',
+    });
+
+    let queuedTaskId = null;
+    const searchedSources = [];
+    const fake = apiScenarios({
+      requests: [req],
+      books: [metadata('Camp Half-Blood: The Wild Zone', 'Rick Riordan')],
+      releases: [oopRel],
+      'sm.releases': ({ query }) => {
+        const src = query.get('source');
+        searchedSources.push(src);
+        if (src === 'annas') {
+          return response({ releases: [annasRel] });
+        }
+        return response({ releases: [oopRel] });
+      },
+      'sm.download': ({ options }) => {
+        const p = expectedJson(options);
+        queuedTaskId = `task-${p.source_id}`;
+        return response({ task_id: queuedTaskId });
+      },
+    });
+
+    await bridge.processPendingRequests({ fetchFn: fake.fetch });
+    assert.ok(searchedSources.includes('annas'), 'must search annas upstream provider');
+    assert.equal(queuedTaskId, 'task-annas-wild-1-valid', 'must queue download from annas provider');
+    assert.equal(bridge.state.requestProgress[reqId]?.stage, 'queued');
+  } finally {
+    bridge.stop();
+  }
+});
+
+test('DOWNLOAD PROGRESS: tracks download milestones at 25% increments with upstream and link', async () => {
+  const bridge = established(new BridgeService(bridgeOpts()));
+  try {
+    const reqId = 'req-progress-milestones';
+    const taskId = 'task-progress-sm-1';
+    bridge.state.tasks[taskId] = {
+      taskId,
+      title: 'The Wild Zone',
+      author: 'Rick Riordan',
+      format: 'epub',
+      source: 'annas',
+      sourceId: 'annas-src-1',
+      downloadUrl: 'https://annas-archive.org/md5/abcdef123456',
+      status: 'downloading',
+      requestIds: [reqId],
+      userIds: ['user-1'],
+      progress: 0,
+      downloadPercent: 0,
+      createdAt: new Date().toISOString(),
+    };
+    bridge.state.requests[reqId] = taskId;
+    bridge.state.requestTasks[reqId] = taskId;
+
+    const fake = apiScenarios({
+      'sm.status': () => response({
+        downloading: {
+          [taskId]: {
+            id: taskId,
+            title: 'The Wild Zone',
+            progress: 35.8, // Should map to 25% milestone
+          },
+        },
+      }),
+    });
+
+    await bridge.reconcile({ fetchFn: fake.fetch });
+    const prog25 = bridge.state.requestProgress[reqId];
+    assert.equal(prog25?.stage, 'downloading');
+    assert.equal(prog25?.downloadMilestone, 25);
+    assert.equal(prog25?.downloadProgress, '25%');
+    assert.equal(prog25?.upstream, 'annas');
+    assert.equal(prog25?.downloadUrl, 'https://annas-archive.org/md5/abcdef123456');
+
+    // Next reconcile at 80% (maps to 75% milestone)
+    const fake75 = apiScenarios({
+      'sm.status': () => response({
+        downloading: {
+          [taskId]: {
+            id: taskId,
+            title: 'The Wild Zone',
+            progress: 80.2,
+          },
+        },
+      }),
+    });
+    await bridge.reconcile({ fetchFn: fake75.fetch });
+    const prog75 = bridge.state.requestProgress[reqId];
+    assert.equal(prog75?.downloadMilestone, 75);
+    assert.equal(prog75?.downloadProgress, '75%');
+  } finally {
+    bridge.stop();
+  }
+});
+
+test('TASK ADOPTION: previously failed task does not block re-requesting the same release', async () => {
+  const bridge = established(new BridgeService(bridgeOpts()));
+  try {
+    const releaseKey = 'annas:failed-release-1';
+    const oldTaskId = 'task-old-failed';
+
+    // Seed state with an old failed task referencing the same releaseKey
+    bridge.state.tasks[oldTaskId] = {
+      taskId: oldTaskId,
+      releaseKey,
+      title: 'The Wild Zone',
+      author: 'Rick Riordan',
+      format: 'epub',
+      source: 'annas',
+      sourceId: 'failed-release-1',
+      status: 'finalization_failed',
+      error: 'Previous failure',
+      requestIds: ['old-req-1'],
+      userIds: ['user-old'],
+    };
+    bridge.state.releases[releaseKey] = oldTaskId;
+
+    const rel = release('The Wild Zone', 'Rick Riordan', {
+      source: 'annas',
+      source_id: 'failed-release-1',
+      download_url: 'https://example.com/dl',
+      format: 'epub',
+    });
+
+    let queued = false;
+    const fakeFetch = async (url) => {
+      if (url.includes('/api/releases/download')) {
+        queued = true;
+        return response({ task_id: 'new-task-success' });
+      }
+      return response({});
+    };
+
+    const res = await bridge.queueRelease({
+      release: rel,
+      requestId: 'new-req-2',
+      userId: 'user-new',
+      libraryId: 1,
+      folderId: 1,
+      fetchFn: fakeFetch,
+    });
+
+    assert.ok(queued, 'must proceed to queue release when previous task was failed');
+    assert.equal(res.status, 'queued');
+    assert.equal(res.taskId, 'new-task-success');
+    assert.equal(bridge.state.releases[releaseKey], 'new-task-success');
+  } finally {
+    bridge.stop();
+  }
+});
+
+test('UPSTREAM SEARCH ERROR FALLBACK: queries alternative upstreams when initial search throws an error', async () => {
+  const bridge = established(new BridgeService(bridgeOpts({ maxSourceAttempts: 3 })));
+  const originalSearch = plugin.search;
+  try {
+    const reqId = 'req-search-error-fallback';
+    const req = request(reqId, 'The Lightning Thief', 'Rick Riordan');
+    const annasRel = release('The Lightning Thief', 'Rick Riordan', {
+      source: 'annas',
+      sourceId: 'annas-lt-1',
+      source_id: 'annas-lt-1',
+      download_url: 'https://annas-archive.org/md5/1122334455',
+      format: 'epub',
+    });
+
+    let primaryCalled = false;
+    let annasCalled = false;
+    let queuedTaskId = null;
+
+    plugin.search = async (q, cfg) => {
+      const src = cfg.settings?.releaseSource;
+      if (!src || src === 'all') {
+        primaryCalled = true;
+        throw new Error('HTTP 429 Too Many Requests from primary provider');
+      }
+      if (src === 'annas') {
+        annasCalled = true;
+        return [annasRel];
+      }
+      return [];
+    };
+
+    const fake = apiScenarios({
+      requests: [req],
+      'sm.download': ({ options }) => {
+        const p = expectedJson(options);
+        queuedTaskId = `task-${p.source_id}`;
+        return response({ task_id: queuedTaskId });
+      },
+    });
+
+    await bridge.processPendingRequests({ fetchFn: fake.fetch });
+    assert.ok(primaryCalled, 'primary search was attempted');
+    assert.ok(annasCalled, 'annas upstream was queried after primary search failed');
+    assert.equal(queuedTaskId, 'task-annas-lt-1', 'queued release from annas');
+    assert.equal(bridge.state.requestProgress[reqId]?.stage, 'queued');
+  } finally {
+    plugin.search = originalSearch;
+    bridge.stop();
+  }
+});
+
+test('FAILED TASK RESET ON TASK ID COLLISION: resets failed flags when Shelfmark returns an existing failed taskId', async () => {
+  const bridge = established(new BridgeService(bridgeOpts()));
+  try {
+    const taskId = 'task-recycled-failed-id';
+    const releaseKey = 'annas:rel-recycled-1';
+
+    // Seed state with an old task in finalization_failed with verificationFailed flags
+    bridge.state.tasks[taskId] = {
+      taskId,
+      releaseKey,
+      title: 'The Sea of Monsters',
+      author: 'Rick Riordan',
+      format: 'epub',
+      source: 'annas',
+      sourceId: 'rel-recycled-1',
+      status: 'finalization_failed',
+      verificationFailed: true,
+      editionVerificationFailed: true,
+      error: 'Previous title mismatch',
+      requestIds: ['old-req-prior'],
+      userIds: ['old-user'],
+    };
+
+    const rel = release('The Sea of Monsters', 'Rick Riordan', {
+      source: 'annas',
+      source_id: 'rel-recycled-1',
+      download_url: 'https://annas-archive.org/md5/9988776655',
+      format: 'epub',
+    });
+
+    const fakeFetch = async (url) => {
+      if (url.includes('/api/releases/download')) {
+        return response({ task_id: taskId });
+      }
+      return response({});
+    };
+
+    const res = await bridge.queueRelease({
+      release: rel,
+      requestId: 'new-req-recycled',
+      userId: 'new-user',
+      libraryId: 1,
+      folderId: 1,
+      fetchFn: fakeFetch,
+    });
+
+    assert.equal(res.status, 'queued');
+    assert.equal(res.taskId, taskId);
+    const updatedTask = bridge.state.tasks[taskId];
+    assert.equal(updatedTask.status, 'queued');
+    assert.equal(updatedTask.verificationFailed, false);
+    assert.equal(updatedTask.editionVerificationFailed, false);
+    assert.equal(updatedTask.error, null);
+    assert.ok(updatedTask.requestIds.includes('new-req-recycled'));
+  } finally {
+    bridge.stop();
+  }
+});
+
+test('SHELFMARK DISMISSAL ON DOWNLOAD FAILURE: dismisses task from Shelfmark activity when status is failed', async () => {
+  const bridge = established(new BridgeService(bridgeOpts()));
+  try {
+    const taskId = 'task-sm-failure-dismiss';
+    const reqId = 'req-sm-failure-dismiss';
+
+    bridge.state.tasks[taskId] = {
+      taskId,
+      title: 'The Titan Curse',
+      author: 'Rick Riordan',
+      format: 'epub',
+      source: 'oceanofpdf',
+      sourceId: 'oop-tc-1',
+      status: 'downloading',
+      requestIds: [reqId],
+      userIds: ['user-1'],
+    };
+    bridge.state.requests[reqId] = taskId;
+    bridge.state.requestTasks[reqId] = taskId;
+
+    let dismissedKey = null;
+    const fake = apiScenarios({
+      'sm.status': () => response({
+        failed: {
+          [taskId]: {
+            id: taskId,
+            title: 'The Titan Curse',
+            error: 'Upstream mirror timed out',
+          },
+        },
+      }),
+      'sm.dismiss': ({ options }) => {
+        const body = expectedJson(options);
+        dismissedKey = body.item_key;
+        return response({ success: true });
+      },
+    });
+
+    await bridge.reconcile({ fetchFn: fake.fetch });
+    assert.equal(dismissedKey, `download:${taskId}`, 'failed download must be dismissed from Shelfmark activity');
+    assert.equal(bridge.state.tasks[taskId].status, 'failed');
+    assert.equal(bridge.state.requestProgress[reqId]?.stage, 'shelfmark_download_failed');
+  } finally {
+    bridge.stop();
+  }
+});
+
+test('FAILED TASK RESET PRESERVES EXISTING REQUEST IDS: non-destructive merge of requestIds', async () => {
+  const bridge = established(new BridgeService(bridgeOpts()));
+  try {
+    const taskId = 'task-recycled-multi-req';
+    const releaseKey = 'annas:source-recycle-multi';
+    bridge.state.tasks[taskId] = {
+      taskId,
+      releaseKey,
+      source: 'annas',
+      sourceId: 'source-recycle-multi',
+      title: 'The Sea of Monsters',
+      status: 'finalization_failed',
+      verificationFailed: true,
+      editionVerificationFailed: true,
+      error: 'EPUB title mismatch',
+      requestIds: ['prior-req-1', 'prior-req-2'],
+      userIds: ['user-prior-1'],
+    };
+
+    const rel = release('The Sea of Monsters', 'Rick Riordan', {
+      source: 'annas',
+      sourceId: 'source-recycle-multi',
+      source_id: 'source-recycle-multi',
+      format: 'epub',
+    });
+
+    const fakeFetch = async (url, opts) => {
+      if (String(url).includes('/api/releases/download')) {
+        return response({ task_id: taskId });
+      }
+      return response({});
+    };
+
+    const res = await bridge.queueRelease({
+      release: rel,
+      requestId: 'new-req-3',
+      userId: 'user-new-2',
+      libraryId: 1,
+      folderId: 1,
+      fetchFn: fakeFetch,
+    });
+
+    assert.equal(res.status, 'queued');
+    const updated = bridge.state.tasks[taskId];
+    assert.deepEqual(updated.requestIds, ['prior-req-1', 'prior-req-2', 'new-req-3'], 'prior requestIds must be preserved');
+    assert.deepEqual(updated.userIds, ['user-prior-1', 'user-new-2'], 'prior userIds must be preserved');
+  } finally {
+    bridge.stop();
+  }
+});
+
+test('ADOPTED TASK BACKFILLS DOWNLOAD AND SOURCE URLS: preserves authentic URLs on adoption', async () => {
+  const bridge = established(new BridgeService(bridgeOpts()));
+  try {
+    const taskId = 'task-adopt-no-url';
+    const releaseKey = 'oceanofpdf:rel-no-url';
+    bridge.state.tasks[taskId] = {
+      taskId,
+      releaseKey,
+      source: 'oceanofpdf',
+      sourceId: 'rel-no-url',
+      title: 'The Battle of the Labyrinth',
+      author: 'Rick Riordan',
+      format: 'epub',
+      status: 'downloading',
+      requestIds: ['req-adopt-1'],
+      userIds: ['user-1'],
+    };
+    bridge.state.releases[releaseKey] = taskId;
+
+    const testUrl = 'https://oceanofpdf.com/authors/rick-riordan/the-battle-of-the-labyrinth';
+    const rel = release('The Battle of the Labyrinth', 'Rick Riordan', {
+      source: 'oceanofpdf',
+      sourceId: 'rel-no-url',
+      source_id: 'rel-no-url',
+      downloadUrl: testUrl,
+      sourceUrl: testUrl,
+      format: 'epub',
+    });
+
+    const res = await bridge.queueRelease({
+      release: rel,
+      requestId: 'req-adopt-2',
+      userId: 'user-2',
+      libraryId: 1,
+      folderId: 1,
+    });
+
+    assert.equal(res.status, 'in_progress');
+    const adopted = bridge.state.tasks[taskId];
+    assert.equal(adopted.downloadUrl, testUrl, 'downloadUrl should be backfilled from release');
+    assert.equal(adopted.sourceUrl, testUrl, 'sourceUrl should be backfilled from release');
+    assert.ok(adopted.requestIds.includes('req-adopt-1') && adopted.requestIds.includes('req-adopt-2'));
+  } finally {
+    bridge.stop();
+  }
 });
 
 
