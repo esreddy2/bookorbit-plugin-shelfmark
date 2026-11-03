@@ -1620,8 +1620,26 @@ export function verifyDownloadedEdition(task, reqSpec = {}) {
         }
       }
 
+      // Filename-backed rescue for minor title mismatches: if the EPUB's dc:title is an
+      // abbreviation/subset of the expected title but the downloaded file's own name
+      // carries the full expected title, treat the edition as verified.
+      const fileBaseNoExt = String(task?.filePath || '').split(/[\\\\/]/).pop().replace(/\\.[^.]+$/, '');
+      const normFileBase = ID.normalizeString(fileBaseNoExt);
+      const normObservedTitle = ID.normalizeString(matchedObserved || opf.rawTitle || opf.title || '');
+      const normExpectedTitle = ID.normalizeString(expectedTitle || '');
+      const minorTitleMismatch = Boolean(
+        normExpectedTitle && normObservedTitle &&
+        (normExpectedTitle.includes(normObservedTitle) || normObservedTitle.includes(normExpectedTitle))
+      );
+      const filenameSupportsTitle = Boolean(
+        normFileBase && normExpectedTitle &&
+        (normFileBase.includes(normExpectedTitle) || normExpectedTitle.includes(normFileBase))
+      );
+
       if (bestDecision && (bestDecision.outcome === 'match' || bestDecision.outcome === 'provisional')) {
         evidence.push({ field: 'title', level: 'work', status: 'verified', expected: expectedTitle, observed: matchedObserved });
+      } else if (minorTitleMismatch && filenameSupportsTitle) {
+        evidence.push({ field: 'title', level: 'work', status: 'verified', expected: expectedTitle, observed: `${matchedObserved || opf.rawTitle || opf.title} (filename: ${fileBaseNoExt})` });
       } else {
         if (bestDecision?.conflicts.includes('incompatible_series_volume')) {
           conflicts.push('incompatible_series_volume');
