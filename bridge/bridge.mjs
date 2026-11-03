@@ -2760,7 +2760,13 @@ export class BridgeService {
     if (fmtA && fmtB && fmtA !== fmtB) return false;
     const yA = this._reqYear(a);
     const yB = this._reqYear(b);
-    if (yA && yB && String(yA) !== String(yB)) return false;
+    if (yA && yB && String(yA) !== String(yB)) {
+      // Year conflict, but a shared ISBN means same edition — allow merge.
+      const isbnsA = new Set(this._reqIsbns(a));
+      const isbnsB = this._reqIsbns(b);
+      const sharedIsbn = isbnsB.some((x) => isbnsA.has(x));
+      if (!sharedIsbn) return false;
+    }
     return true;
   }
 

@@ -2105,7 +2105,10 @@ const BOOK_N_OF_SERIES_RE = new RegExp(
 );
 const SERIES_WITH_BARE_NUMBER_SEGMENT_RE = /^([\p{L}][\p{L}\s'’&.-]{2,}?)\s+0*([1-9]|[12]\d|30)$/u;
 const ATTRIBUTION_PREFIX_SEGMENT_RE = /^from\s+(?:the\s+(?:files|world|pages|journals?|chronicles|universe|desk|archives)\s+of\s+)?[\p{L}\p{N}][\p{L}\p{N}\s'’&.-]{1,70}$/iu;
-const UNPUNCTUATED_SERIES_VOLUME_RE = /^(.+?)\s+(?:(?:series|trilogy|duology|saga|chronicles?)\s+)?(?:(?:book|vol\.?|volume|part|tome)\s+#?0*([1-9]\d?)|#\s*0*([1-9]\d?)|0*([1-9]\d?))\s+(?=[A-Za-z\p{L}])(.+)$/iu;
+const UNPUNCTUATED_SERIES_VOLUME_RE = new RegExp(
+  `^(.+?)(?:,\\s*|\\s+)(?:(?:series|trilogy|duology|saga|chronicles?)\\s+)?(?:(?:book|bk\\.?|vol\\.?|volume|part|tome|no\\.?|nr\\.?|number)\\s+#?0*(${VOLUME_NUM_PATTERN})|#\\s*0*([1-9]\\d?)|0*([1-9]\\d?))\\s+(?=[A-Za-z\\p{L}])(.+)$`,
+  'iu'
+);
 const SERIES_DESCRIPTOR_SUFFIX_RE = /\s+(?:quartet|trilogy|series|saga|chronicles?|duology|cycle|sequence|quintet|septet)\b/i;
 
 const NON_PERSON_TITLE_WORDS = new Set([
