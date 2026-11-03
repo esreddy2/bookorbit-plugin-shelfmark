@@ -3675,6 +3675,37 @@ export class BridgeService {
     };
 
     const mergeRequestIntoExistingTask = (existing) => {
+      // Merge gate: terminal states never merge.
+      if (!existing) return false;
+      const terminalStatuses = new Set(['cancelled', 'rejected', 'exhausted']);
+      if (terminalStatuses.has(existing.status)) return false;
+      // Exhausted retries (cancel already sent to BookOrbit) blocks merge.
+      const rids = Array.isArray(existing.requestIds) ? existing.requestIds : [];
+      const exhausted = rids.length > 0 && rids.every((r) =>
+        (this.state.requestSourceAttempts?.[r] || 0) >= this.maxSourceAttempts
+      );
+      if (exhausted) return false;
+      const cancelSent = rids.length > 0 && rids.every((r) => this.state.rejectedRequests?.[r]);
+      if (cancelSent) return false;
+      // Edition verification failure alone does NOT block (allows recycling).
+      // Merge gate: in-flight tasks never merge.
+      const inFlightStatuses = new Set(['grabbed', 'downloading', 'importing']);
+      if (inFlightStatuses.has(existing.status)) return false;
+      const activeShelfmarkTask = (this.state.releases?.[existing.releaseKey] === existing.taskId) &&
+        !['completed', 'fulfilled', 'available'].includes(
+          (this.state.tasks?.[existing.taskId]?.status) ?? existing.status
+        );
+      if (activeShelfmarkTask) return false;
+      // Edition compatibility is enforced by callers (verifyExistingTaskAdoption);
+      // do not re-gate here so failed-task recycling still works.
+      // Available/fulfilled: mark request fulfilled, no download.
+      if (existing.status === 'available' || existing.status === 'fulfilled') {
+        existing.requestFulfillments = existing.requestFulfillments || {};
+        const now = new Date().toISOString();
+        existing.requestFulfillments[requestId] = { fulfilled: true, fulfilledAt: now, status: 200 };
+        return true;
+      }
+      // Normal merge (existing logic):
       if (requestTitle && !existing.requestTitle) existing.requestTitle = requestTitle;
       if (requestTitle) {
         existing.requestTitles = existing.requestTitles || {};
@@ -3712,6 +3743,17 @@ export class BridgeService {
       }
       existing.trustedIsbns = gatherTrustedIsbnsBridge(existing.trustedIsbns, existing.bookMetadata, existing.extra, release?.extra?.bookMetadata, release?.extra, release);
       existing.bookMetadata = existing.bookMetadata || release?.extra?.bookMetadata || null;
+      // Reset logic:
+      const rKey = existing.releaseKey || releaseKey;
+      this.state.failedReleases = this.state.failedReleases || {};
+      if (rKey && this.state.failedReleases[rKey]) delete this.state.failedReleases[rKey];
+      if (releaseKey && this.state.failedReleases[releaseKey]) delete this.state.failedReleases[releaseKey];
+      this.state.requestSourceAttempts = this.state.requestSourceAttempts || {};
+      if (requestId) this.state.requestSourceAttempts[requestId] = 0;
+      if (requestId && this.state.requestProgress?.[requestId]) {
+        delete this.state.requestProgress[requestId].cooldownUntil;
+      }
+      return true;
     };
 
     if (existingTaskId && this.state.tasks[existingTaskId]) {
@@ -3742,10 +3784,15 @@ export class BridgeService {
           existing.userIds.push(userId);
         }
         existing.updatedAt = new Date().toISOString();
-        mergeRequestIntoExistingTask(existing);
-        this.saveState();
+        const merged = mergeRequestIntoExistingTask(existing);
+        if (!merged) {
+          // Terminal/in-flight/incompatible: do not adopt; queue as new
+          delete this.state.releases[releaseKey];
+        } else {
+          this.saveState();
+        }
 
-        if ((existing.status === 'completed' || existing.status === 'fulfilled') && existing.filePath) {
+        if (merged && (existing.status === 'completed' || existing.status === 'fulfilled') && existing.filePath) {
           const verify = this.verifyFile(existing.filePath, existing.format);
           if (verify.ok) {
             const targetLibId = parsePositiveInt(existing.libraryId ?? this.defaultLibraryId);
@@ -4027,11 +4074,17 @@ export class BridgeService {
         existing.downloadUrl = downloadPayload.download_url || release.downloadUrl || null;
         existing.sourceUrl = downloadPayload.source_url || release.sourceUrl || null;
         existing.infoUrl = downloadPayload.info_url || release.infoUrl || null;
-        mergeRequestIntoExistingTask(existing);
+        const merged1 = mergeRequestIntoExistingTask(existing);
+        if (!merged1) {
+          throw new Error(`Cannot adopt existing task ${taskId}: terminal or in-flight`);
+        }
       } else {
         const sameSrc = Boolean(existing.sourceId && downloadPayload.source_id && String(existing.sourceId) === String(downloadPayload.source_id));
         verifyExistingTaskAdoption(existing, taskId, sameSrc);
-        mergeRequestIntoExistingTask(existing);
+        const merged2 = mergeRequestIntoExistingTask(existing);
+        if (!merged2) {
+          throw new Error(`Cannot adopt existing task ${taskId}: terminal or in-flight`);
+        }
       }
 
       this.state.requests[requestId] = taskId;
