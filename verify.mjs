@@ -1,5 +1,5 @@
 /**
- * BookOrbit ↔ Shelfmark acceptance and regression verification, v1.8.10.
+ * BookOrbit ↔ Shelfmark acceptance and regression verification, v1.8.11.
  *
  * EXTERNAL ORACLES — NOT AN IMPLEMENTATION-DERIVED TEST PLAN:
  *   - BookOrbit v3.5.0 API/host contracts and request behavior.
@@ -82,7 +82,7 @@ import {
 import { inspectTitle } from './scripts/decomp.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
-const EXPECTED_VERSION = '1.8.10';
+const EXPECTED_VERSION = '1.8.11';
 const RELEASE_MODE = process.argv.includes('--release');
 const TEST_TIMEOUT_MS = 10_000;
 const tests = [];
@@ -145,6 +145,7 @@ const CONTRACT_ROUTES = Object.freeze([
   ['sm.releases',   'GET',  /^\/api\/releases\/?$/],
   ['sm.download',   'POST', /^\/api\/releases\/download\/?$/],
   ['sm.dismiss',    'POST', /^\/api\/activity\/dismiss\/?$/],
+  ['sm.cancel',     'DELETE', /^\/api\/download\/[^/]+\/cancel\/?$/],
   ['sm.local',      'GET',  /^\/api\/localdownload\/?$/],
 ]);
 
@@ -6092,5 +6093,109 @@ async function runAll() {
   console.log('After test success, verify native UI version, running companion mount, and a new request end-to-end.');
   process.exitCode = failed ? 1 : 0;
 }
+
+test('HYBRID CANCEL: cancelled request cancels unshared Shelfmark task, releases, failed cooldown and progress', async () => {
+  const bridge = established(new BridgeService(bridgeOpts()));
+  const task = createTask(bridge, {
+    status: 'queued', requestIds: ['hybrid-cancel-unshared'], releaseKey: 'annas:hybrid-unshared',
+    source: 'annas', sourceId: 'hybrid-unshared', title: 'A Tale of Two Cities', author: 'Charles Dickens',
+  });
+  bridge.state.requestTasks['hybrid-cancel-unshared'] = task.taskId;
+  bridge.state.releases[task.releaseKey] = task.taskId;
+  bridge.state.failedReleases[task.releaseKey] = { releaseKey: task.releaseKey, failedAt: new Date().toISOString() };
+  bridge.state.requestAttempts['hybrid-cancel-unshared'] = [{ attemptId: 'a1', releaseKey: task.releaseKey }];
+  const fake = apiScenarios({
+    requests: [request('hybrid-cancel-unshared', task.title, task.author)],
+    details: { 'hybrid-cancel-unshared': request('hybrid-cancel-unshared', task.title, task.author, { status: 'cancelled' }) },
+    'sm.cancel': () => response({ status: 'cancelled' }),
+  });
+  await bridge.processPendingRequests({ fetchFn: fake.fetch });
+  assert.equal(fake.called('sm.cancel').length, 1);
+  assert.equal(bridge.state.tasks[task.taskId].status, 'cancelled');
+  assert.equal(bridge.state.releases[task.releaseKey], undefined);
+  assert.equal(bridge.state.failedReleases[task.releaseKey], undefined);
+  assert.equal(bridge.state.requestProgress['hybrid-cancel-unshared']?.stage, 'cancelled');
+  fake.assertKnownRoutes();
+});
+
+test('HYBRID CANCEL: shared Shelfmark task is not cancelled when another active request remains', async () => {
+  const bridge = established(new BridgeService(bridgeOpts()));
+  const task = createTask(bridge, {
+    status: 'queued', requestIds: ['hybrid-cancel-shared-a', 'hybrid-cancel-shared-b'],
+    releaseKey: 'annas:hybrid-shared', source: 'annas', sourceId: 'hybrid-shared',
+    title: 'A Tale of Two Cities', author: 'Charles Dickens',
+  });
+  bridge.state.requestTasks['hybrid-cancel-shared-a'] = task.taskId;
+  bridge.state.requestTasks['hybrid-cancel-shared-b'] = task.taskId;
+  bridge.state.requests['hybrid-cancel-shared-b'] = task.taskId;
+  bridge.state.requestProgress['hybrid-cancel-shared-b'] = { stage: 'searching' };
+  bridge.state.failedReleases[task.releaseKey] = { releaseKey: task.releaseKey, failedAt: new Date().toISOString() };
+  bridge.state.requestAttempts['hybrid-cancel-shared-a'] = [{ attemptId: 'a1', releaseKey: task.releaseKey }];
+  const fake = apiScenarios({
+    requests: [
+      request('hybrid-cancel-shared-a', task.title, task.author),
+      request('hybrid-cancel-shared-b', task.title, task.author),
+    ],
+    details: {
+      'hybrid-cancel-shared-a': request('hybrid-cancel-shared-a', task.title, task.author, { status: 'cancelled' }),
+      'hybrid-cancel-shared-b': request('hybrid-cancel-shared-b', task.title, task.author, { status: 'approved' }),
+    },
+    'sm.cancel': () => response({ status: 'cancelled' }),
+  });
+  await bridge.processPendingRequests({ fetchFn: fake.fetch });
+  assert.equal(fake.called('sm.cancel').length, 0);
+  assert.notEqual(bridge.state.tasks[task.taskId].status, 'cancelled');
+  assert.equal(bridge.state.failedReleases[task.releaseKey], undefined);
+  assert.equal(bridge.state.requestProgress['hybrid-cancel-shared-a']?.stage, 'cancelled');
+  fake.assertKnownRoutes();
+});
+
+test('HYBRID CANCEL: cancelling request unblocks cooldown_wait waiter on same failed release', async () => {
+  const bridge = established(new BridgeService(bridgeOpts()));
+  const cancelledTask = createTask(bridge, {
+    status: 'queued', requestIds: ['hybrid-wait-cancelled'], releaseKey: 'annas:hybrid-wait',
+    source: 'annas', sourceId: 'hybrid-wait', title: 'A Tale of Two Cities', author: 'Charles Dickens',
+  });
+  bridge.state.requestTasks['hybrid-wait-cancelled'] = cancelledTask.taskId;
+  bridge.state.releases[cancelledTask.releaseKey] = cancelledTask.taskId;
+  bridge.state.failedReleases[cancelledTask.releaseKey] = { releaseKey: cancelledTask.releaseKey, failedAt: new Date().toISOString() };
+  bridge.state.requestAttempts['hybrid-wait-cancelled'] = [{ attemptId: 'a1', releaseKey: cancelledTask.releaseKey }];
+
+  const waiterTaskId = unique('waiter-task');
+  bridge.state.tasks[waiterTaskId] = {
+    taskId: waiterTaskId, status: 'queued', title: 'A Tale of Two Cities', author: 'Charles Dickens',
+    releaseKey: cancelledTask.releaseKey, requestIds: ['hybrid-waiter'], requestFulfillments: {},
+  };
+  bridge.state.requestTasks['hybrid-waiter'] = waiterTaskId;
+  bridge.state.requestProgress['hybrid-waiter'] = {
+    stage: 'cooldown_wait', status: 'cooldown_wait',
+    cooldownUntil: new Date(Date.now() + 60_000).toISOString(),
+  };
+
+  const fake = apiScenarios({
+    requests: [request('hybrid-wait-cancelled', cancelledTask.title, cancelledTask.author)],
+    details: { 'hybrid-wait-cancelled': request('hybrid-wait-cancelled', cancelledTask.title, cancelledTask.author, { status: 'cancelled' }) },
+    'sm.cancel': () => response({ status: 'cancelled' }),
+  });
+  await bridge.processPendingRequests({ fetchFn: fake.fetch });
+  assert.equal(bridge.state.requestProgress['hybrid-waiter']?.stage, 'searching');
+  assert.equal(bridge.state.requestProgress['hybrid-waiter']?.cooldownUntil, undefined);
+  fake.assertKnownRoutes();
+});
+
+test('HYBRID RECONCILE: recovers a task that was locally cancelled when Shelfmark reports completed', async () => {
+  const bridge = established(new BridgeService(bridgeOpts()));
+  const task = createTask(bridge, {
+    status: 'cancelled', requestIds: ['hybrid-reconcile-recover'], title: 'A Tale of Two Cities',
+    author: 'Charles Dickens', filePath: FILES.taleEpub, format: 'epub',
+  });
+  bridge.bookorbitUrl = null;
+  const fake = apiScenarios({
+    'sm.status': response({ complete: { [task.taskId]: { id: task.taskId, status: 'completed', file_path: FILES.taleEpub } } }),
+  });
+  await bridge.reconcile({ fetchFn: fake.fetch });
+  assert.equal(bridge.state.tasks[task.taskId].status, 'completed');
+  fake.assertKnownRoutes();
+});
 
 await runAll();

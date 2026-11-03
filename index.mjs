@@ -26,7 +26,7 @@ const inFlightResolutions = new Map();
 /** Confident bidirectional title equivalents. */
 export default {
   apiVersion: 1,
-  version: '1.8.10',
+  version: '1.8.11',
   update: {
     manifestUrl: 'https://raw.githubusercontent.com/esreddy2/bookorbit-plugin-shelfmark/main/updates/shelfmark.json',
     ed25519PublicKey: '-0aHVhXqg7cGaDchc2p1Y8tDnn8A7cJ0WREKspNv5Bc',
@@ -3605,6 +3605,7 @@ function scoreBookMatch(book, searchTitle, searchAuthor) {
     return -40;
   }
   const decompReq = decomposeTitleStructure(searchTitle, { author: searchAuthor });
+  const decompBook = decomposeTitleStructure(bookTitle, { author: searchAuthor });
   if (decompReq.hasExplicitPrefix && decompReq.seriesPrefix) {
     const genericPrefixNorm = normalizeString(decompReq.seriesPrefix);
     const specificCoreNorm = normalizeString(decompReq.canonicalTitle || '');
@@ -3620,7 +3621,8 @@ function scoreBookMatch(book, searchTitle, searchAuthor) {
   } else if (normQueryCore && normBookCore && (
     normBookCore === normQueryCore ||
     stripLeadingArticle(normBookCore) === stripLeadingArticle(normQueryCore) ||
-    sameCanonicalWorkPhrase(normBookCore, normQueryCore)
+    sameCanonicalWorkPhrase(normBookCore, normQueryCore) ||
+    (decompBook && decompReq && normalizeString(decompBook.canonicalTitle || '') && normalizeString(decompBook.canonicalTitle) === normalizeString(decompReq.canonicalTitle || ''))
   )) {
     titleScore = 55;
   } else if (isTitleMatch(bookTitle, searchTitle, { reqAuthor: searchAuthor })) {

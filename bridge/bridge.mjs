@@ -1624,22 +1624,55 @@ export function verifyDownloadedEdition(task, reqSpec = {}) {
       // Filename-backed rescue for minor title mismatches: if the EPUB's dc:title is an
       // abbreviation/subset of the expected title but the downloaded file's own name
       // carries the full expected title, treat the edition as verified.
-      const fileBaseNoExt = String(task?.filePath || '').split(/[\\\\/]/).pop().replace(/\\.[^.]+$/, '');
+      const fileBaseNoExt = String(task?.filePath || '').split(/[\\\\/]/).pop().replace(/\.[^.]+$/, '');
       const normFileBase = ID.normalizeString(fileBaseNoExt);
       const normObservedTitle = ID.normalizeString(matchedObserved || opf.rawTitle || opf.title || '');
       const normExpectedTitle = ID.normalizeString(expectedTitle || '');
-      const minorTitleMismatch = Boolean(
-        normExpectedTitle && normObservedTitle &&
-        (normExpectedTitle.includes(normObservedTitle) || normObservedTitle.includes(normExpectedTitle))
-      );
+      // Filename-backed rescue: the source's own file name often carries the title even
+      // when the EPUB's dc:title is wrong/abbreviated. Accept if the (normalized)
+      // file name contains the full expected title OR a contiguous run of at least
+      // 2 title tokens (real source names rarely include the entire composite title).
+      const fileBaseTokens = normFileBase.split(' ').filter(Boolean);
+      // Candidate title phrases to look for in the filename: the raw expected title plus
+      // its decomposed canonical core / series prefix / sliding windows (so a source
+      // file named after just the subtitle or just the series prefix still rescues).
+      const decomp = ID.decomposeTitleStructure ? ID.decomposeTitleStructure(expectedTitle || '', {}) : null;
+      const candidatePhrases = [normExpectedTitle];
+      if (decomp) {
+        for (const p of [decomp.canonicalTitle, decomp.rawCore, ...(decomp.slidingWindows || [])]) {
+          const np = ID.normalizeString(p || '');
+          if (np && !candidatePhrases.includes(np)) candidatePhrases.push(np);
+        }
+      }
+      let bestTitleRun = 0;
+      let bestPhraseTokens = 0;
+      for (const phrase of candidatePhrases) {
+        const phraseTokens = phrase.split(' ').filter(Boolean);
+        if (phraseTokens.length === 0) continue;
+        let run = 0;
+        for (let i = 0; i < phraseTokens.length; i++) {
+          for (let j = 0; j < fileBaseTokens.length; j++) {
+            let k = 0;
+            while (i + k < phraseTokens.length && j + k < fileBaseTokens.length &&
+                   phraseTokens[i + k] === fileBaseTokens[j + k]) k++;
+            if (k > run) run = k;
+          }
+        }
+        if (run > bestTitleRun) { bestTitleRun = run; bestPhraseTokens = phraseTokens.length; }
+        // also direct substring
+        if (normFileBase.includes(phrase)) { bestTitleRun = Math.max(bestTitleRun, phraseTokens.length); bestPhraseTokens = Math.max(bestPhraseTokens, phraseTokens.length); }
+      }
       const filenameSupportsTitle = Boolean(
         normFileBase && normExpectedTitle &&
-        (normFileBase.includes(normExpectedTitle) || normExpectedTitle.includes(normFileBase))
+        (normFileBase.includes(normExpectedTitle) ||
+         normExpectedTitle.includes(normFileBase) ||
+         bestTitleRun >= 2 ||
+         (bestPhraseTokens === 1 && bestTitleRun === 1))
       );
 
       if (bestDecision && (bestDecision.outcome === 'match' || bestDecision.outcome === 'provisional')) {
         evidence.push({ field: 'title', level: 'work', status: 'verified', expected: expectedTitle, observed: matchedObserved });
-      } else if (minorTitleMismatch && filenameSupportsTitle) {
+      } else if (filenameSupportsTitle) {
         evidence.push({ field: 'title', level: 'work', status: 'verified', expected: expectedTitle, observed: `${matchedObserved || opf.rawTitle || opf.title} (filename: ${fileBaseNoExt})` });
       } else {
         if (bestDecision?.conflicts.includes('incompatible_series_volume')) {
@@ -1655,14 +1688,32 @@ export function verifyDownloadedEdition(task, reqSpec = {}) {
 
     // 2. Work author verification
     const opfAuthors = Array.isArray(opf.authors) && opf.authors.length ? opf.authors : (opf.author ? [opf.author] : []);
+    const authorFileBaseNoExt = String(task?.filePath || '').split(/[\\\\/]/).pop().replace(/\.[^.]+$/, '');
+    const authorNormFileBase = ID.normalizeString(authorFileBaseNoExt);
+    const authorFullNames = String(expectedAuthor || '').split(/\s+(?:and|&)\s+|\s*,\s*/).map((s) => s.trim()).filter(Boolean);
+    const filenameSupportsAuthor = Boolean(
+      authorNormFileBase && authorFullNames.length > 0 &&
+      authorFullNames.some((fn) => {
+        const normFn = ID.normalizeString(fn);
+        return Boolean(normFn) && authorNormFileBase.includes(normFn);
+      })
+    );
     if (opfAuthors.length > 0 && expectedAuthor && !ID.isAuthorMatch(opfAuthors, expectedAuthor)) {
-      conflicts.push('incompatible_author');
-      evidence.push({ field: 'author', level: 'work', status: 'contradictory', expected: expectedAuthor, observed: opf.author });
-      error = error || `EPUB author mismatch: expected "${expectedAuthor}", got "${opf.author}"`;
+      if (filenameSupportsAuthor) {
+        evidence.push({ field: 'author', level: 'work', status: 'verified', expected: expectedAuthor, observed: `${opf.author} (filename: ${authorFileBaseNoExt})` });
+      } else {
+        conflicts.push('incompatible_author');
+        evidence.push({ field: 'author', level: 'work', status: 'contradictory', expected: expectedAuthor, observed: opf.author });
+        error = error || `EPUB author mismatch: expected "${expectedAuthor}", got "${opf.author}"`;
+      }
     } else if (opfAuthors.length === 0 && expectedAuthor) {
-      conflicts.push('missing_author');
-      evidence.push({ field: 'author', level: 'work', status: 'unverified', expected: expectedAuthor, observed: null });
-      error = error || `EPUB author metadata missing: could not verify "${expectedAuthor}"`;
+      if (filenameSupportsAuthor) {
+        evidence.push({ field: 'author', level: 'work', status: 'verified', expected: expectedAuthor, observed: `(filename: ${authorFileBaseNoExt})` });
+      } else {
+        conflicts.push('missing_author');
+        evidence.push({ field: 'author', level: 'work', status: 'unverified', expected: expectedAuthor, observed: null });
+        error = error || `EPUB author metadata missing: could not verify "${expectedAuthor}"`;
+      }
     } else if (opfAuthors.length > 0) {
       evidence.push({ field: 'author', level: 'work', status: 'verified', expected: expectedAuthor, observed: opf.author });
     }
@@ -2644,7 +2695,7 @@ export class BridgeService {
     if (source && sourceId) {
       return `${source}:${sourceId}`;
     }
-    const title = (release.title || '').trim().toLowerCase();
+    const title = ID.normalizeString((ID.decomposeTitleStructure ? ID.decomposeTitleStructure(release.title || '', {}).canonicalTitle : '') || release.title || '').trim().toLowerCase().replace(/\s+/g, ' ');
     const format = (release.format || '').trim().toLowerCase();
     const year = release.year || release.publicationYear || release.publishedYear || '';
     const isbn = (release.isbn13 || release.isbn || '').replace(/[^0-9X]/gi, '');
@@ -3143,35 +3194,52 @@ export class BridgeService {
             continue;
           }
 
-          // 3a. Skip if already tracked (never blindly requeue on Socket.IO broadcasts)
-          if (this.state.requests[reqId]) {
-            continue;
-          }
-
-          // 3b. Skip if currently holding in cooldown_wait and cooldown has not expired
-          const curProgress = this.state.requestProgress[reqId];
-          if (curProgress?.stage === 'cooldown_wait' && curProgress.cooldownUntil) {
-            if (Date.now() < new Date(curProgress.cooldownUntil).getTime()) {
-              continue;
-            }
-          }
-
-          // Cancellation-aware: check request status before queueing/searching
+          // Cancellation-aware: check request status before tracked-request skip / queueing
           const requestState = await this.getRequestStatus(reqId, fetchFn);
           if (requestState === 'cancelled' || requestState === 'rejected') {
-            // Cancel any associated Shelfmark task and clear cooldown so retries unblock.
-            const assocTaskId = this.state.requestTasks?.[reqId] || this.state.tasks && Object.keys(this.state.tasks).find((tid) => (this.state.tasks[tid]?.requestIds || []).includes(reqId));
-            if (assocTaskId) {
+            // resolve assocTaskId: requestTasks, then tasks scan, then state.requests
+            let assocTaskId = this.state.requestTasks?.[reqId];
+            if (!assocTaskId) {
+              for (const [tid, t] of Object.entries(this.state.tasks || {})) {
+                if (Array.isArray(t?.requestIds) && t.requestIds.includes(reqId)) { assocTaskId = tid; break; }
+              }
+            }
+            if (!assocTaskId && this.state.requests?.[reqId] && this.state.tasks?.[this.state.requests[reqId]]) {
+              assocTaskId = this.state.requests[reqId];
+            }
+            const assocTask = assocTaskId ? this.state.tasks?.[assocTaskId] : null;
+            const otherActive = (assocTask?.requestIds || []).some((r) => r !== reqId && this.state.requests?.[r] && this.state.requestProgress?.[r]?.stage !== 'cancelled' && this.state.requestProgress?.[r]?.stage !== 'rejected');
+            // cancel Shelfmark task only if no other active requests
+            if (assocTaskId && !otherActive) {
               try { await fetchFn(`${this.shelfmarkUrl}/api/download/${encodeURIComponent(assocTaskId)}/cancel`, { method: 'DELETE', headers: { ...(this.shelfmarkApiKey ? { 'X-Api-Key': this.shelfmarkApiKey, 'Authorization': `Bearer ${this.shelfmarkApiKey}` } : {}) } }); } catch (_) {}
               if (this.state.tasks?.[assocTaskId]) this.state.tasks[assocTaskId].status = 'cancelled';
+              if (assocTask?.releaseKey) delete this.state.releases[assocTask.releaseKey];
             }
-            // Clear cooldown for any failed release tied to this request.
-            for (const rk of Object.keys(this.state.failedReleases || {})) {
-              const fr = this.state.failedReleases[rk];
-              const t = assocTaskId && this.state.tasks?.[assocTaskId];
-              if (fr && t && fr.releaseKey === t.releaseKey) delete this.state.failedReleases[rk];
-            }
+            // clear cooldown for all releases in this request's attempt history
+            const attemptedKeys = new Set();
+            for (const a of (this.state.requestAttempts?.[reqId] || [])) { if (a.releaseKey) attemptedKeys.add(a.releaseKey); }
+            if (assocTask?.releaseKey) attemptedKeys.add(assocTask.releaseKey);
             this.state.failedReleases = this.state.failedReleases || {};
+            for (const rk of attemptedKeys) delete this.state.failedReleases[rk];
+            // unblock cooldown_wait waiters whose failed releases no longer apply
+            for (const [wid, wp] of Object.entries(this.state.requestProgress || {})) {
+              if (wp?.stage === 'cooldown_wait' && wp.cooldownUntil) {
+                let wTaskResolved = this.state.requestTasks?.[wid] && this.state.tasks?.[this.state.requestTasks[wid]];
+                if (!wTaskResolved) {
+                  for (const [tid, t] of Object.entries(this.state.tasks || {})) {
+                    if (Array.isArray(t?.requestIds) && t.requestIds.includes(wid)) { wTaskResolved = t; break; }
+                  }
+                }
+                const wReleaseKey = wTaskResolved?.releaseKey;
+                if (!wReleaseKey || !this.state.failedReleases?.[wReleaseKey]) {
+                  if (this.state.requestProgress?.[wid]) {
+                    delete this.state.requestProgress[wid].cooldownUntil;
+                    this.state.requestProgress[wid].stage = 'searching';
+                    this.state.requestProgress[wid].reason = 'searching';
+                  }
+                }
+              }
+            }
             this.setRequestProgress(reqId, requestState === 'rejected' ? 'rejected' : 'cancelled', { reason: requestState });
             this.saveState();
             continue;
@@ -3183,6 +3251,19 @@ export class BridgeService {
           if (requestState !== 'active' && req.status !== 'approved') {
             this.setRequestProgress(reqId, 'status_unknown', { reason: 'status_unknown' });
             continue;
+          }
+
+          // 3a. Skip if already tracked (never blindly requeue on Socket.IO broadcasts)
+          if (this.state.requests[reqId]) {
+            continue;
+          }
+
+          // 3b. Skip if currently holding in cooldown_wait and cooldown has not expired
+          const curProgress = this.state.requestProgress[reqId];
+          if (curProgress?.stage === 'cooldown_wait' && curProgress.cooldownUntil) {
+            if (Date.now() < new Date(curProgress.cooldownUntil).getTime()) {
+              continue;
+            }
           }
 
           this.setRequestProgress(reqId, 'searching', { reason: 'searching' });
@@ -4003,11 +4084,17 @@ export class BridgeService {
           const parsed = parseShelfmarkStatus(statusJson);
           const candidates = [...parsed.downloading, ...parsed.queued, ...parsed.complete];
            const matched = candidates.find((t) => {
-             const titleMatch = (t.title || '').trim().toLowerCase() === (downloadPayload.title || '').trim().toLowerCase();
+             const titleMatch = ID.isTitleMatch(t.title || '', downloadPayload.title || '');
              const formatMatch = (t.format || '').toLowerCase() === (downloadPayload.format || '').toLowerCase();
              const sourceMatch = !downloadPayload.source || !(t.source) || String(t.source).toLowerCase() === String(downloadPayload.source).toLowerCase();
              const sourceIdMatch = !downloadPayload.source_id || !(t.source_id) || String(t.source_id) === String(downloadPayload.source_id);
-             return titleMatch && formatMatch && sourceMatch && sourceIdMatch;
+             // Author guard: when both sides expose an author, require at least one
+             // shared author (supports multiple authors) to avoid merging distinct works.
+             let authorMatch = true;
+             if (t.author && downloadPayload.author) {
+               authorMatch = ID.isAuthorMatch(t.author, downloadPayload.author) || ID.isAuthorMatch(downloadPayload.author, t.author);
+             }
+             return titleMatch && formatMatch && sourceMatch && sourceIdMatch && authorMatch;
            });
           if (matched) {
             taskId = matched.id || matched.task_id;
@@ -4062,11 +4149,17 @@ export class BridgeService {
           const parsed = parseShelfmarkStatus(statusJson);
           const candidates = [...parsed.downloading, ...parsed.queued, ...parsed.complete];
            const matched = candidates.find((t) => {
-             const titleMatch = (t.title || '').trim().toLowerCase() === (downloadPayload.title || '').trim().toLowerCase();
+             const titleMatch = ID.isTitleMatch(t.title || '', downloadPayload.title || '');
              const formatMatch = (t.format || '').toLowerCase() === (downloadPayload.format || '').toLowerCase();
              const sourceMatch = !downloadPayload.source || !(t.source) || String(t.source).toLowerCase() === String(downloadPayload.source).toLowerCase();
              const sourceIdMatch = !downloadPayload.source_id || !(t.source_id) || String(t.source_id) === String(downloadPayload.source_id);
-             return titleMatch && formatMatch && sourceMatch && sourceIdMatch;
+             // Author guard: when both sides expose an author, require at least one
+             // shared author (supports multiple authors) to avoid merging distinct works.
+             let authorMatch = true;
+             if (t.author && downloadPayload.author) {
+               authorMatch = ID.isAuthorMatch(t.author, downloadPayload.author) || ID.isAuthorMatch(downloadPayload.author, t.author);
+             }
+             return titleMatch && formatMatch && sourceMatch && sourceIdMatch && authorMatch;
            });
           if (matched) {
             taskId = matched.id || matched.task_id;
@@ -4294,7 +4387,7 @@ export class BridgeService {
         if (t.status === 'queued' || t.status === 'downloading' || t.status === 'awaiting_file') {
           const tTitle = (t.title || '').trim().toLowerCase();
           const fmtMatch = !format || (t.format || '').toLowerCase() === format.toLowerCase();
-          const titleMatch = tTitle === candTitle || rawBase === tTitle || rawBase.startsWith(tTitle + '_') || rawBase.startsWith(tTitle + ' ');
+           const titleMatch = tTitle === candTitle || rawBase === tTitle || rawBase.startsWith(tTitle + '_') || rawBase.startsWith(tTitle + ' ') || ID.isTitleMatch(t.title, title || rawBase);
           // Require additional work identity evidence when available to avoid wrong-task attachment.
           let extraMatch = true;
           if (title && t.title && ID.normalizeString(t.title) !== ID.normalizeString(title)) extraMatch = false;
@@ -5735,9 +5828,10 @@ export class BridgeService {
       const candidates = [...parsedStatus.downloading, ...parsedStatus.queued, ...parsedStatus.complete];
       for (const [rKey, unrec] of Object.entries(this.state.uncertainQueues)) {
         const cancelledCandidates = (parsedStatus.cancelled || []).filter((t) => {
-          const titleMatch = (t.title || '').trim().toLowerCase() === (unrec.release?.title || '').trim().toLowerCase();
+          const titleMatch = ID.isTitleMatch(t.title || '', unrec.release?.title || '');
           const formatMatch = !(t.format || unrec.release?.format) || (t.format || '').toLowerCase() === (unrec.release?.format || '').toLowerCase();
-          return titleMatch && formatMatch;
+          const authorMatch = !unrec.release?.author || !t.author || ID.isAuthorMatch(t.author, unrec.release.author) || ID.isAuthorMatch(unrec.release.author, t.author);
+          return titleMatch && formatMatch && authorMatch;
         });
         if (cancelledCandidates.length > 0) {
           const unrecRequestIds = Array.isArray(unrec.requestIds) && unrec.requestIds.length ? unrec.requestIds : (unrec.requestId ? [unrec.requestId] : []);
@@ -5750,9 +5844,9 @@ export class BridgeService {
           continue;
         }
         const matchedCandidates = candidates.filter((t) => {
-          const titleMatch = (t.title || '').trim().toLowerCase() === (unrec.release?.title || '').trim().toLowerCase();
+          const titleMatch = ID.isTitleMatch(t.title || '', unrec.release?.title || '');
           const formatMatch = !(t.format || unrec.release?.format) || (t.format || '').toLowerCase() === (unrec.release?.format || '').toLowerCase();
-          const authorMatch = !unrec.release?.author || !t.author || ID.isAuthorMatch(t.author, unrec.release.author);
+          const authorMatch = !unrec.release?.author || !t.author || ID.isAuthorMatch(t.author, unrec.release.author) || ID.isAuthorMatch(unrec.release.author, t.author);
           // Also require source identity when available.
           const sourceIdMatch = !unrec.release?.source_id || !t.source_id || String(t.source_id) === String(unrec.release.source_id);
           return titleMatch && formatMatch && authorMatch && sourceIdMatch;
@@ -5955,7 +6049,7 @@ export class BridgeService {
         }
       }
 
-      if (completedMap.has(taskIdStr) && task.status !== 'cancelled' && task.status !== 'fulfilled' && task.status !== 'finalization_failed' && task.status !== 'review_required' && !task.editionVerificationFailed && !task.isbnVerificationFailed) {
+        if (completedMap.has(taskIdStr) && task.status !== 'fulfilled' && task.status !== 'finalization_failed' && task.status !== 'review_required' && !task.editionVerificationFailed && !task.isbnVerificationFailed) {
         // Shelfmark positively reports completion for this exact task ID!
         // Recovers tasks in 'queued', 'downloading', 'awaiting_file', 'completed',
         // or earlier transient verification failure

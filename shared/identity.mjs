@@ -2160,6 +2160,7 @@ export function scoreBookMatch(book, searchTitle, searchAuthor) {
     return -40;
   }
   const decompReq = decomposeTitleStructure(searchTitle, { author: searchAuthor });
+  const decompBook = decomposeTitleStructure(bookTitle, { author: searchAuthor });
   if (decompReq.hasExplicitPrefix && decompReq.seriesPrefix) {
     const genericPrefixNorm = normalizeString(decompReq.seriesPrefix);
     const specificCoreNorm = normalizeString(decompReq.canonicalTitle || '');
@@ -2175,7 +2176,8 @@ export function scoreBookMatch(book, searchTitle, searchAuthor) {
   } else if (normQueryCore && normBookCore && (
     normBookCore === normQueryCore ||
     stripLeadingArticle(normBookCore) === stripLeadingArticle(normQueryCore) ||
-    sameCanonicalWorkPhrase(normBookCore, normQueryCore)
+    sameCanonicalWorkPhrase(normBookCore, normQueryCore) ||
+    (decompBook && decompReq && normalizeString(decompBook.canonicalTitle || '') && normalizeString(decompBook.canonicalTitle) === normalizeString(decompReq.canonicalTitle || ''))
   )) {
     titleScore = 55;
   } else if (isTitleMatch(bookTitle, searchTitle, { reqAuthor: searchAuthor })) {
