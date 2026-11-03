@@ -2506,6 +2506,7 @@ export class BridgeService {
            requestTasks: parsed.requestTasks || {},
            rejectedRequests: parsed.rejectedRequests || {},
            workGroups: parsed.workGroups || {},
+           requestSiblingIsbns: parsed.requestSiblingIsbns || {},
          };
       }
     } catch (err) {
@@ -2861,7 +2862,7 @@ export class BridgeService {
     for (const task of Object.values(this.state.tasks || {})) {
       if (!task || this._isTerminalTask(task)) continue;
       // Build a pseudo-request from the task to compare work identity.
-      const taskReq = { title: task.title || task.requestTitle, author: task.author || task.requestAuthor, format: task.format, year: task.year || task.requestYear };
+      const taskReq = { title: task.title || task.requestTitle, author: task.author || task.requestAuthor, format: task.format, year: task.year || task.requestYear, isbn: task.requestIsbn || task.isbn, trustedIsbns: task.trustedIsbns || [], requestIsbns: task.requestIsbns || {} };
       if (!this._sameWork(taskReq, req)) continue;
       return task;
     }
@@ -3424,15 +3425,17 @@ export class BridgeService {
             if (assocTask?.releaseKey) attemptedKeys.add(assocTask.releaseKey);
             this.state.failedReleases = this.state.failedReleases || {};
             for (const rk of attemptedKeys) delete this.state.failedReleases[rk];
-            // clear workGroup cooldown/attempt budget on cancel
+            // clear workGroup cooldown/attempt budget on cancel, but only if no other
+            // active requests remain in the group
             if (this.state.workGroups) {
               for (const g of Object.values(this.state.workGroups)) {
                 if (!g) continue;
-                if ((Array.isArray(g.requestIds) && g.requestIds.includes(reqId)) || (assocTaskId && g.taskId === assocTaskId)) {
-                  g.cooldownUntil = null;
-                  g.attemptCount = 0;
-                  g.lastFailedAt = null;
-                }
+                if (!((Array.isArray(g.requestIds) && g.requestIds.includes(reqId)) || (assocTaskId && g.taskId === assocTaskId))) continue;
+                const otherActive = (g.requestIds || []).some((r) => r !== reqId && this.state.requests?.[r] && this.state.requestProgress?.[r]?.stage !== 'cancelled' && this.state.requestProgress?.[r]?.stage !== 'rejected');
+                if (otherActive) continue;
+                g.cooldownUntil = null;
+                g.attemptCount = 0;
+                g.lastFailedAt = null;
               }
             }
             // unblock cooldown_wait waiters whose failed releases no longer apply
@@ -3483,7 +3486,7 @@ export class BridgeService {
            // --- Work-level grouping (cooldown/taskless request grouping) ---
            const workGroup = this._findOrCreateWorkGroup(req, reqId);
            this.state.requestSiblingIsbns = this.state.requestSiblingIsbns || {};
-           const siblingIsbns = workGroup?.trustedIsbns ? [...workGroup.trustedIsbns] : this._workSiblingIsbns(requests, req, reqId);
+           const siblingIsbns = [...new Set([...(workGroup?.trustedIsbns || []), ...this._workSiblingIsbns(requests, req, reqId)])];
            // union req ISBNs already in group.trustedIsbns
            this.state.requestSiblingIsbns[reqId] = siblingIsbns;
 
@@ -4703,9 +4706,9 @@ export class BridgeService {
           const fmtMatch = !format || (t.format || '').toLowerCase() === format.toLowerCase();
            const titleMatch = tTitle === candTitle || rawBase === tTitle || rawBase.startsWith(tTitle + '_') || rawBase.startsWith(tTitle + ' ') || ID.isTitleMatch(t.title, title || rawBase);
           // Require additional work identity evidence when available to avoid wrong-task attachment.
-          let extraMatch = true;
-          if (title && t.title && ID.normalizeString(t.title) !== ID.normalizeString(title)) extraMatch = false;
-          if (payload.author && t.author && !ID.isAuthorMatch(t.author, payload.author)) extraMatch = false;
+           let extraMatch = true;
+           if (title && t.title && !ID.isTitleMatch(t.title, title || rawBase)) extraMatch = false;
+           if (payload.author && t.author && !ID.isAuthorMatch(t.author, payload.author)) extraMatch = false;
           if (fmtMatch && titleMatch && extraMatch) {
             matchingTasks.push(t);
           }
@@ -5966,17 +5969,17 @@ export class BridgeService {
           body: JSON.stringify(fulfillDto),
         });
 
-        if (fulfillRes.ok) {
-          const fulfillData = await fulfillRes.json().catch(() => ({}));
-          const fulfillStatus = String(fulfillData.status || fulfillData.state || fulfillData.requestStatus || fulfillData.request_status || '').toUpperCase();
-          if (fulfillStatus === 'AVAILABLE' || fulfillStatus === 'FULFILLED' || fulfillStatus === 'SUCCESS' || fulfillStatus === 'DONE') {
-            task.requestFulfillments[reqId] = {
-              fulfilled: true,
-              status: fulfillRes.status,
-              fulfilledAt: new Date().toISOString(),
-            };
-            fulfilledCount++;
-          } else {
+         if (fulfillRes.ok) {
+           const fulfillData = await fulfillRes.json().catch(() => ({}));
+           const fulfillStatus = String(fulfillData.status || fulfillData.state || fulfillData.requestStatus || fulfillData.request_status || '').toUpperCase();
+           if (fulfillStatus === 'AVAILABLE' || fulfillStatus === 'FULFILLED' || fulfillStatus === 'SUCCESS' || fulfillStatus === 'DONE') {
+             task.requestFulfillments[reqId] = {
+               fulfilled: true,
+               status: fulfillRes.status,
+               fulfilledAt: new Date().toISOString(),
+             };
+             fulfilledCount++;
+           } else {
             task.requestFulfillments[reqId] = {
               fulfilled: false,
               status: fulfillRes.status,
@@ -6311,7 +6314,50 @@ export class BridgeService {
     for (const task of Object.values(this.state.tasks)) {
       if (task.status === 'fulfilled') {
         const hasUnfulfilled = (task.requestIds || []).some((rid) => !task.requestFulfillments?.[rid]?.fulfilled);
-        if (!hasUnfulfilled) continue;
+        // Stage-mismatch detection: companion marked fulfilled but BookOrbit still approved.
+        let stageMismatch = false;
+        if (!hasUnfulfilled) {
+          for (const rid of (task.requestIds || [])) {
+            if (!task.requestFulfillments?.[rid]?.fulfilled) continue;
+            const st = await this.getRequestStatus(rid, fetchFn);
+            if (st === 'active') { stageMismatch = true; break; }
+          }
+        }
+        if (!hasUnfulfilled && !stageMismatch) continue;
+        if (stageMismatch) {
+          if (!task.requestFulfillments) task.requestFulfillments = {};
+          let anyReset = false;
+          const statusCache = new Map();
+          for (const rid of (task.requestIds || [])) {
+            if (!task.requestFulfillments?.[rid]?.fulfilled) continue;
+            let st = statusCache.get(rid);
+            if (st === undefined) { st = await this.getRequestStatus(rid, fetchFn); statusCache.set(rid, st); }
+            if (st === 'active') {
+              const attempts = (task.requestFulfillments[rid].fulfillNotPersistedAttempts || 0) + 1;
+              if (attempts >= 3) {
+                task.requestFulfillments[rid] = {
+                  fulfilled: false,
+                  errorType: 'fulfill_not_persisted_exhausted',
+                  error: 'BookOrbit still approved after 3 fulfill attempts',
+                  fulfillNotPersistedAttempts: attempts,
+                  updatedAt: new Date().toISOString(),
+                };
+                task.status = 'review_required';
+              } else {
+                task.requestFulfillments[rid] = {
+                  fulfilled: false,
+                  errorType: 'fulfill_not_persisted',
+                  error: 'BookOrbit still approved after fulfill',
+                  fulfillNotPersistedAttempts: attempts,
+                  updatedAt: new Date().toISOString(),
+                };
+                anyReset = true;
+              }
+            }
+          }
+          if (anyReset && task.status !== 'review_required') task.status = 'completed';
+          this.saveState();
+        }
       }
       if (task.isbnVerificationFailed || task.editionVerificationFailed || task.status === 'finalization_failed' || task.status === 'review_required') {
         continue;

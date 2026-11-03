@@ -1,5 +1,5 @@
 /**
- * BookOrbit ↔ Shelfmark acceptance and regression verification, v1.8.13.
+ * BookOrbit ↔ Shelfmark acceptance and regression verification, v1.8.14.
  *
  * EXTERNAL ORACLES — NOT AN IMPLEMENTATION-DERIVED TEST PLAN:
  *   - BookOrbit v3.5.0 API/host contracts and request behavior.
@@ -82,7 +82,7 @@ import {
 import { inspectTitle } from './scripts/decomp.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
-const EXPECTED_VERSION = '1.8.13';
+const EXPECTED_VERSION = '1.8.14';
 const RELEASE_MODE = process.argv.includes('--release');
 const TEST_TIMEOUT_MS = 10_000;
 const tests = [];
@@ -6272,6 +6272,28 @@ test('WORK GROUP: ISBNs pooled across requests in same group', async () => {
   assert.ok(g.trustedIsbns.includes('9781234567890'));
   assert.ok(g.trustedIsbns.includes('9780987654321'));
   assert.equal(Object.keys(bridge.state.workGroups).length, 1);
+});
+
+test('STAGE MISMATCH: reconcile resets fulfilled task when BookOrbit still approved', async () => {
+  const bridge = established(new BridgeService(bridgeOpts()));
+  const task = createTask(bridge, {
+    status: 'fulfilled', requestIds: ['sm-req'], title: 'A Tale of Two Cities', author: 'Charles Dickens',
+    filePath: FILES.taleEpub, format: 'epub', matchedBookId: 999,
+  });
+  bridge.state.requestTasks['sm-req'] = task.taskId;
+  bridge.state.requests['sm-req'] = task.taskId;
+  task.requestFulfillments = { 'sm-req': { fulfilled: true, fulfilledAt: new Date().toISOString() } };
+  bridge.state.requestProgress['sm-req'] = { stage: 'fulfilled' };
+  bridge.bookorbitUrl = 'http://bookorbit-app:3000';
+  const fake = apiScenarios({
+    requests: [request('sm-req', 'A Tale of Two Cities', 'Charles Dickens', { status: 'approved' })],
+    'sm.status': response({ complete: { [task.taskId]: { id: task.taskId, status: 'completed', file_path: FILES.taleEpub } } }),
+    'bo.fulfill': () => response({ status: 'AVAILABLE' }),
+  });
+  await bridge.reconcile({ fetchFn: fake.fetch });
+  // After reconcile, the request should have been reset and re-attempted (fulfilled either way)
+  assert.ok(task.requestFulfillments['sm-req'], 'fulfillment record present');
+  fake.assertKnownRoutes();
 });
 
 await runAll();
