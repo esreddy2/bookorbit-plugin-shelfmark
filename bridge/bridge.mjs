@@ -1526,13 +1526,29 @@ export function verifyDownloadedEdition(task, reqSpec = {}) {
     'en'
   ).trim();
   const normExpectedLang = ID.normalizeLanguageCode(expectedLanguage) || 'en';
-  const reqIsbn = normalizeIsbnBridge(
-    reqSpec.isbn ??
-    (rid && task?.requestIsbns ? task.requestIsbns[rid] : undefined) ??
-    task?.requestIsbn ??
-    ''
-  );
-  const validReqIsbn = (reqIsbn.length === 10 || reqIsbn.length === 13) ? reqIsbn : '';
+  // Collect ALL candidate ISBNs for this request (primary + trusted + any extras),
+  // so that a match on any one of them overrides title/author conflicts.
+  const reqIsbnCandidates = new Set();
+  const addIsbnCandidate = (v) => {
+    if (v == null) return;
+    if (Array.isArray(v)) { for (const x of v) addIsbnCandidate(x); return; }
+    if (typeof v === 'object') { for (const x of Object.values(v)) addIsbnCandidate(x); return; }
+    const n = normalizeIsbnBridge(v);
+    if (n.length === 10 || n.length === 13) reqIsbnCandidates.add(n);
+  };
+  addIsbnCandidate(reqSpec.isbn);
+  addIsbnCandidate(reqSpec.isbn13);
+  addIsbnCandidate(reqSpec.isbn13s);
+  addIsbnCandidate(reqSpec.isbns);
+  if (rid && task?.requestIsbns) addIsbnCandidate(task.requestIsbns[rid]);
+  addIsbnCandidate(task?.requestIsbn);
+  addIsbnCandidate(task?.isbn);
+  addIsbnCandidate(task?.trustedIsbns);
+  // also any ISBNs recorded for sibling requests sharing this task
+  if (task?.requestIsbns) addIsbnCandidate(Object.values(task.requestIsbns));
+  const validReqIsbns = [...reqIsbnCandidates];
+  const reqIsbn = validReqIsbns[0] || '';
+  const validReqIsbn = reqIsbn;
   let isbnMatched = false;
 
   const fmtLower = String(task?.format || '').toLowerCase();
@@ -1765,18 +1781,23 @@ export function verifyDownloadedEdition(task, reqSpec = {}) {
 
     // 4. Positive-only ISBN observation (exact/counterpart match recorded as positive evidence; different/absent ISBN never blocks)
     const opfIsbns = Array.isArray(opf.isbns) ? opf.isbns : (opf.isbn ? [normalizeIsbnBridge(opf.isbn)].filter(Boolean) : []);
-    if (validReqIsbn) {
-      const matchedIsbn = opfIsbns.find((fi) =>
-        ID.sameIsbn(validReqIsbn, fi) ||
-        areVerifiedIsbnCounterpartsBridge(validReqIsbn, fi, task?.trustedIsbns, task?.bookMetadata, task?.extra?.bookMetadata)
-      );
+    if (validReqIsbns.length > 0) {
+      let matchedIsbn = null;
+      let matchedReqIsbn = validReqIsbns[0];
+      for (const ri of validReqIsbns) {
+        const m = opfIsbns.find((fi) =>
+          ID.sameIsbn(ri, fi) ||
+          areVerifiedIsbnCounterpartsBridge(ri, fi, task?.trustedIsbns, task?.bookMetadata, task?.extra?.bookMetadata)
+        );
+        if (m) { matchedIsbn = m; matchedReqIsbn = ri; break; }
+      }
       if (matchedIsbn) {
         isbnMatched = true;
-        evidence.push({ field: 'isbn', level: 'edition', status: 'verified', expected: validReqIsbn, observed: matchedIsbn });
+        evidence.push({ field: 'isbn', level: 'edition', status: 'verified', expected: matchedReqIsbn, observed: matchedIsbn });
       } else if (opfIsbns.length > 0) {
-        evidence.push({ field: 'isbn', level: 'edition', status: 'informational', expected: validReqIsbn, observed: opfIsbns[0] });
+        evidence.push({ field: 'isbn', level: 'edition', status: 'informational', expected: validReqIsbns.join(', '), observed: opfIsbns[0] });
       } else {
-        evidence.push({ field: 'isbn', level: 'edition', status: 'absent', expected: validReqIsbn, observed: null });
+        evidence.push({ field: 'isbn', level: 'edition', status: 'absent', expected: validReqIsbns.join(', '), observed: null });
       }
     } else if (opfIsbns.length > 0) {
       evidence.push({ field: 'isbn', level: 'edition', status: 'informational', expected: null, observed: opfIsbns[0] });
@@ -2706,6 +2727,114 @@ export class BridgeService {
     return parts.join('::');
   }
 
+  // --- Merge-at-intake helpers ---
+
+  _reqTitle(req) { return req?.title || req?.requestTitle || ''; }
+  _reqAuthor(req) { return req?.author || req?.requestAuthor || (Array.isArray(req?.authors) ? req.authors[0] : '') || ''; }
+  _reqYear(req) { return req?.year || req?.publicationYear || req?.publishedYear || req?.requestYear || null; }
+  _reqFormat(req) { return (req?.mediaKind === 'ebook' ? 'epub' : (req?.format || 'epub')).toLowerCase(); }
+  _reqIsbns(req) {
+    const out = new Set();
+    const add = (v) => {
+      if (v == null) return;
+      if (Array.isArray(v)) { for (const x of v) add(x); return; }
+      if (typeof v === 'object') { for (const x of Object.values(v)) add(x); return; }
+      const n = normalizeIsbnBridge(v);
+      if (n.length === 10 || n.length === 13) out.add(n);
+    };
+    add(req?.isbn); add(req?.isbn13); add(req?.isbn13s); add(req?.isbns);
+    return [...out];
+  }
+
+  _sameWork(a, b) {
+    if (!a || !b) return false;
+    const titleA = this._reqTitle(a);
+    const titleB = this._reqTitle(b);
+    if (!titleA || !titleB) return false;
+    if (!ID.isTitleMatch(titleA, titleB)) return false;
+    const authorA = this._reqAuthor(a);
+    const authorB = this._reqAuthor(b);
+    if (authorA && authorB && !(ID.isAuthorMatch(authorA, authorB) || ID.isAuthorMatch(authorB, authorA))) return false;
+    const fmtA = this._reqFormat(a);
+    const fmtB = this._reqFormat(b);
+    if (fmtA && fmtB && fmtA !== fmtB) return false;
+    const yA = this._reqYear(a);
+    const yB = this._reqYear(b);
+    if (yA && yB && String(yA) !== String(yB)) return false;
+    return true;
+  }
+
+  _isTerminalTask(task) {
+    if (!task) return true;
+    const s = task.status;
+    // 'failed' tasks are terminal for merge purposes: a new request for the same
+    // work should search independently rather than inherit a failed source's cooldown.
+    return s === 'cancelled' || s === 'rejected' || s === 'failed' || s === 'finalization_failed' || s === 'review_required';
+  }
+
+  _workSiblingIsbns(requests, req, reqId) {
+    const out = new Set();
+    for (const r of (requests || [])) {
+      const rid = r?.id ?? r?.requestId ?? r?.request_id;
+      if (rid === reqId) continue;
+      if (!this._sameWork(req, r)) continue;
+      for (const isbn of this._reqIsbns(r)) out.add(isbn);
+    }
+    return [...out];
+  }
+
+  _findSameWorkTask(req) {
+    for (const task of Object.values(this.state.tasks || {})) {
+      if (!task || this._isTerminalTask(task)) continue;
+      // Build a pseudo-request from the task to compare work identity.
+      const taskReq = { title: task.title || task.requestTitle, author: task.author || task.requestAuthor, format: task.format, year: task.year || task.requestYear };
+      if (!this._sameWork(taskReq, req)) continue;
+      return task;
+    }
+    return null;
+  }
+
+  _mergeRequestIntoTask(task, req, reqId, siblingIsbns) {
+    if (!task.requestIds) task.requestIds = [];
+    if (!task.requestIds.includes(reqId)) task.requestIds.push(reqId);
+    if (!task.userIds) task.userIds = [];
+    const uid = req?.userId || req?.requesterUserId || req?.user_id;
+    if (uid && !task.userIds.includes(uid)) task.userIds.push(uid);
+    if (!task.requestIsbns) task.requestIsbns = {};
+    const rIsbn = this._reqIsbns(req)[0];
+    if (rIsbn && !task.requestIsbns[reqId]) task.requestIsbns[reqId] = rIsbn;
+    // Aggregate trusted ISBNs (union).
+    if (!task.trustedIsbns) task.trustedIsbns = [];
+    const trustedSet = new Set(task.trustedIsbns);
+    for (const isbn of (siblingIsbns || [])) trustedSet.add(isbn);
+    for (const isbn of this._reqIsbns(req)) trustedSet.add(isbn);
+    task.trustedIsbns = [...trustedSet];
+    if (!task.requestFulfillments) task.requestFulfillments = {};
+    if (!task.requestFulfillments[reqId]) task.requestFulfillments[reqId] = { fulfilled: false };
+    // Per-request maps.
+    if (!task.requestTitles) task.requestTitles = {};
+    if (req?.title && !task.requestTitles[reqId]) task.requestTitles[reqId] = req.title;
+    if (!task.requestAuthorsMap) task.requestAuthorsMap = {};
+    const ra = this._reqAuthor(req);
+    if (ra && !task.requestAuthorsMap[reqId]) task.requestAuthorsMap[reqId] = ra;
+    if (!task.requestLanguages) task.requestLanguages = {};
+    const rl = req?.language || req?.lang;
+    if (rl && !task.requestLanguages[reqId]) task.requestLanguages[reqId] = rl;
+    if (!task.requestYears) task.requestYears = {};
+    const ry = this._reqYear(req);
+    if (ry && !task.requestYears[reqId]) task.requestYears[reqId] = ry;
+    // Reset shared attempt/cooldown budget on merge.
+    if (this.state.requestSourceAttempts) this.state.requestSourceAttempts[reqId] = 0;
+    // Progress inheritance + cooldown clear.
+    const stage = task.status === 'completed' ? 'verifying' : (task.status === 'queued' ? 'queued' : 'searching');
+    this.setRequestProgress(reqId, stage, { reason: stage });
+    const prog = this.state.requestProgress?.[reqId];
+    if (prog && prog.cooldownUntil) delete prog.cooldownUntil;
+    this.state.requests[reqId] = task.taskId || task.id;
+    this.state.requestTasks[reqId] = task.taskId || task.id;
+    task.updatedAt = new Date().toISOString();
+  }
+
   /**
    * Verifies file existence, size, and magic bytes.
    */
@@ -3266,9 +3395,23 @@ export class BridgeService {
             }
           }
 
-          this.setRequestProgress(reqId, 'searching', { reason: 'searching' });
+           // --- Merge-at-intake: work-level ISBN pooling + task merge ---
+           const siblingIsbns = this._workSiblingIsbns(requests, req, reqId);
+           this.state.requestSiblingIsbns = this.state.requestSiblingIsbns || {};
+           this.state.requestSiblingIsbns[reqId] = siblingIsbns;
 
-          // 4. Search releases using corrected plugin logic (bounded per request)
+           // If a non-terminal task for the same work already exists, merge this
+           // request into it and skip searching/downloading.
+           const existingWorkTask = this._findSameWorkTask(req);
+           if (existingWorkTask) {
+             this._mergeRequestIntoTask(existingWorkTask, req, reqId, siblingIsbns);
+             this.saveState();
+             continue;
+           }
+
+           this.setRequestProgress(reqId, 'searching', { reason: 'searching' });
+
+           // 4. Search releases using corrected plugin logic (bounded per request)
           const query = {
             title: req.title,
             subtitle: req.subtitle || undefined,
@@ -5168,6 +5311,15 @@ export class BridgeService {
     let explicitlyCancelled = 0;
     let alreadyAvailable = 0;
     if (!task.requestFulfillments) task.requestFulfillments = {};
+    // Work-level ISBN pooling: aggregate sibling ISBNs collected at intake.
+    if (Array.isArray(task.requestIds)) {
+      const extraIsbns = new Set(task.trustedIsbns || []);
+      for (const rid of task.requestIds) {
+        const sibs = this.state.requestSiblingIsbns?.[rid];
+        if (Array.isArray(sibs)) for (const x of sibs) extraIsbns.add(x);
+      }
+      task.trustedIsbns = [...extraIsbns];
+    }
     for (const rid of (task.requestIds || [])) {
       // A prior successful fulfillment is durable proof; a later API outage must
       // not overwrite it or cause a duplicate POST.
@@ -5985,7 +6137,8 @@ export class BridgeService {
 
     for (const task of Object.values(this.state.tasks)) {
       if (task.status === 'fulfilled') {
-        continue;
+        const hasUnfulfilled = (task.requestIds || []).some((rid) => !task.requestFulfillments?.[rid]?.fulfilled);
+        if (!hasUnfulfilled) continue;
       }
       if (task.isbnVerificationFailed || task.editionVerificationFailed || task.status === 'finalization_failed' || task.status === 'review_required') {
         continue;
@@ -6219,7 +6372,7 @@ export class BridgeService {
             this.triggerProcessPendingRequests(100);
           }
         }
-      } else if (task.status === 'completed' || task.status === 'imported' || task.status === 'partially_fulfilled' || task.status === 'uncertain_upload') {
+      } else if (task.status === 'completed' || task.status === 'imported' || task.status === 'partially_fulfilled' || task.status === 'uncertain_upload' || task.status === 'fulfilled') {
         // Task completed or partially fulfilled mid-flight; retry fulfillment
         if (this.bookorbitUrl) {
           // Do not retry fulfillment for tasks whose requests are all cancelled.

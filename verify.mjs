@@ -1,5 +1,5 @@
 /**
- * BookOrbit ↔ Shelfmark acceptance and regression verification, v1.8.11.
+ * BookOrbit ↔ Shelfmark acceptance and regression verification, v1.8.12.
  *
  * EXTERNAL ORACLES — NOT AN IMPLEMENTATION-DERIVED TEST PLAN:
  *   - BookOrbit v3.5.0 API/host contracts and request behavior.
@@ -82,7 +82,7 @@ import {
 import { inspectTitle } from './scripts/decomp.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
-const EXPECTED_VERSION = '1.8.11';
+const EXPECTED_VERSION = '1.8.12';
 const RELEASE_MODE = process.argv.includes('--release');
 const TEST_TIMEOUT_MS = 10_000;
 const tests = [];
@@ -6196,6 +6196,33 @@ test('HYBRID RECONCILE: recovers a task that was locally cancelled when Shelfmar
   await bridge.reconcile({ fetchFn: fake.fetch });
   assert.equal(bridge.state.tasks[task.taskId].status, 'completed');
   fake.assertKnownRoutes();
+});
+
+test('MERGE AT INTAKE: same-work requests merge into one task and aggregate ISBNs', async () => {
+  const bridge = established(new BridgeService(bridgeOpts()));
+  const task = createTask(bridge, {
+    status: 'queued', requestIds: ['merge-a'], title: 'The Wild Zone', author: 'Rick Riordan',
+    format: 'epub', releaseKey: 'annas:merge-1', trustedIsbns: ['9798217445981'],
+  });
+  bridge.state.requestTasks['merge-a'] = task.taskId;
+  bridge.state.releases[task.releaseKey] = task.taskId;
+  bridge.state.requestProgress['merge-a'] = { stage: 'searching' };
+
+  const reqA = request('merge-a', 'The Wild Zone', 'Rick Riordan', { isbn13: '9798217445981' });
+  const reqB = request('merge-b', 'Camp Half-Blood: The Wild Zone', 'Rick Riordan', { isbn13: '1234567890123' });
+
+  const siblingIsbns = bridge._workSiblingIsbns([reqA, reqB], reqB, 'merge-b');
+  assert.ok(siblingIsbns.includes('9798217445981'), 'sibling ISBNs aggregated');
+
+  const found = bridge._findSameWorkTask(reqB);
+  assert.ok(found, 'same-work task found');
+  assert.equal(found.taskId, task.taskId);
+
+  bridge._mergeRequestIntoTask(found, reqB, 'merge-b', siblingIsbns);
+  assert.ok(found.requestIds.includes('merge-b'), 'request B merged into task');
+  assert.ok(found.trustedIsbns.includes('1234567890123'), 'B ISBN aggregated');
+  assert.ok(found.trustedIsbns.includes('9798217445981'), 'A ISBN retained');
+  assert.equal(bridge.state.requests['merge-b'], task.taskId);
 });
 
 await runAll();
