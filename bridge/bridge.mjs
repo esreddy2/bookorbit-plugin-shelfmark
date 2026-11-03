@@ -2878,6 +2878,8 @@ export class BridgeService {
    */
   async rejectBookOrbitRequest(requestId, details = {}, fetchFn = globalThis.fetch) {
     const reqIdStr = String(requestId);
+    const releaseKey = details.releaseKey || details.task?.releaseKey ||
+      (this.state.requestTasks?.[reqIdStr] && this.state.tasks?.[this.state.requestTasks[reqIdStr]]?.releaseKey) || null;
     if (!reqIdStr || this.state.rejectedRequests?.[reqIdStr]) return false;
     let token = '';
     try { token = await this.authManager.getValidToken(); } catch {}
@@ -2935,6 +2937,7 @@ export class BridgeService {
         };
         delete this.state.requests[reqIdStr];
         this.setRequestProgress(reqIdStr, 'rejected', { reason: 'rejected_in_bookorbit', decisionNote: note });
+        if (releaseKey && this.state.failedReleases?.[releaseKey]) delete this.state.failedReleases[releaseKey];
         this.saveState();
         console.log(`[Bridge] Successfully rejected BookOrbit request ${reqIdStr} with diagnostic note.`);
         return true;
@@ -2947,6 +2950,7 @@ export class BridgeService {
         };
         delete this.state.requests[reqIdStr];
         this.setRequestProgress(reqIdStr, 'rejected', { reason: 'already_settled_in_bookorbit', decisionNote: note });
+        if (releaseKey && this.state.failedReleases?.[releaseKey]) delete this.state.failedReleases[releaseKey];
         this.saveState();
         return true;
       } else {
@@ -3010,6 +3014,7 @@ export class BridgeService {
             };
             delete this.state.requests[reqIdStr];
             this.setRequestProgress(reqIdStr, 'rejected', { reason: 'cancelled_in_bookorbit', decisionNote: note });
+            if (releaseKey && this.state.failedReleases?.[releaseKey]) delete this.state.failedReleases[releaseKey];
             this.saveState();
             console.log(`[Bridge] Successfully settled/cancelled BookOrbit request ${reqIdStr} after exhaustion.`);
             return true;
