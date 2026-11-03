@@ -1,5 +1,5 @@
 /**
- * BookOrbit ↔ Shelfmark acceptance and regression verification, v1.8.12.
+ * BookOrbit ↔ Shelfmark acceptance and regression verification, v1.8.13.
  *
  * EXTERNAL ORACLES — NOT AN IMPLEMENTATION-DERIVED TEST PLAN:
  *   - BookOrbit v3.5.0 API/host contracts and request behavior.
@@ -82,7 +82,7 @@ import {
 import { inspectTitle } from './scripts/decomp.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
-const EXPECTED_VERSION = '1.8.12';
+const EXPECTED_VERSION = '1.8.13';
 const RELEASE_MODE = process.argv.includes('--release');
 const TEST_TIMEOUT_MS = 10_000;
 const tests = [];
@@ -6223,6 +6223,55 @@ test('MERGE AT INTAKE: same-work requests merge into one task and aggregate ISBN
   assert.ok(found.trustedIsbns.includes('1234567890123'), 'B ISBN aggregated');
   assert.ok(found.trustedIsbns.includes('9798217445981'), 'A ISBN retained');
   assert.equal(bridge.state.requests['merge-b'], task.taskId);
+});
+
+test('WORK GROUP: taskless requests share one cooldown timer', async () => {
+  const bridge = established(new BridgeService(bridgeOpts({ releaseFailureCooldownMs: 60_000 })));
+  const reqA = request('wg-cooldown-a', 'The Wild Zone', 'Joy Fielding');
+  const reqB = request('wg-cooldown-b', 'The Wild Zone', 'Joy Fielding');
+  const failedKey = 'oceanofpdf:failed-wild-zone-wg';
+  bridge.state.failedReleases[failedKey] = {
+    releaseKey: failedKey,
+    failedAt: new Date().toISOString(),
+    error: 'EPUB title mismatch',
+  };
+
+  const fake = apiScenarios({
+    requests: [reqA, reqB],
+    books: [metadata('The Wild Zone', 'Joy Fielding')],
+    releases: [release('The Wild Zone', 'Joy Fielding', { source: 'oceanofpdf', source_id: 'failed-wild-zone-wg' })],
+    'sm.metadata': () => response({ books: [metadata('The Wild Zone', 'Joy Fielding')] }),
+  });
+
+  await bridge.processPendingRequests({ fetchFn: fake.fetch });
+  const pa = bridge.state.requestProgress['wg-cooldown-a'];
+  const pb = bridge.state.requestProgress['wg-cooldown-b'];
+  assert.equal(pa?.stage, 'cooldown_wait');
+  assert.equal(pb?.stage, 'cooldown_wait');
+  assert.equal(pa?.cooldownUntil, pb?.cooldownUntil, 'shared cooldownUntil');
+  assert.equal(Object.keys(bridge.state.workGroups).length, 1);
+});
+
+test('WORK GROUP: attempt budget shared across taskless requests', async () => {
+  const bridge = established(new BridgeService(bridgeOpts({ maxSourceAttempts: 2 })));
+  const reqA = request('wg-attempt-a', 'No Such Book WG', 'Nobody');
+  const reqB = request('wg-attempt-b', 'No Such Book WG', 'Nobody');
+  const fake = apiScenarios({ requests: [reqA, reqB], books: [], releases: [] });
+  await bridge.processPendingRequests({ fetchFn: fake.fetch });
+  await bridge.processPendingRequests({ fetchFn: fake.fetch });
+  assert.equal(bridge.state.requestProgress['wg-attempt-a']?.stage, 'rejected');
+  assert.equal(bridge.state.requestProgress['wg-attempt-b']?.stage, 'rejected');
+});
+
+test('WORK GROUP: ISBNs pooled across requests in same group', async () => {
+  const bridge = established(new BridgeService(bridgeOpts()));
+  const reqA = request('wg-isbn-a', 'Pooled Book', 'Author X', { isbn13: '9781234567890' });
+  const reqB = request('wg-isbn-b', 'Pooled Book', 'Author X', { isbn13: '9780987654321' });
+  const g = bridge._findOrCreateWorkGroup(reqA, 'wg-isbn-a');
+  bridge._findOrCreateWorkGroup(reqB, 'wg-isbn-b');
+  assert.ok(g.trustedIsbns.includes('9781234567890'));
+  assert.ok(g.trustedIsbns.includes('9780987654321'));
+  assert.equal(Object.keys(bridge.state.workGroups).length, 1);
 });
 
 await runAll();

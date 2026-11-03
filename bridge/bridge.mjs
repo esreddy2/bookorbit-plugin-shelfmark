@@ -2443,6 +2443,7 @@ export class BridgeService {
        requestVerification: {}, // requestId -> { ok, taskId, releaseKey, stage, errorType, primaryConflict, conflicts, evidence, error, verifiedAt }
        requestTasks: {},        // requestId -> taskId (historical task association preserved across failures)
        rejectedRequests: {},    // requestId -> { rejectedAt, decisionNote, reason }
+       workGroups: {},         // workKey -> WorkGroup
      };
 
     this.reconcileTimer = null;
@@ -2504,6 +2505,7 @@ export class BridgeService {
            requestVerification: parsed.requestVerification || {},
            requestTasks: parsed.requestTasks || {},
            rejectedRequests: parsed.rejectedRequests || {},
+           workGroups: parsed.workGroups || {},
          };
       }
     } catch (err) {
@@ -2744,6 +2746,72 @@ export class BridgeService {
     };
     add(req?.isbn); add(req?.isbn13); add(req?.isbn13s); add(req?.isbns);
     return [...out];
+  }
+
+  _workKey(req) {
+    if (!this.state.workGroups) this.state.workGroups = {};
+    const title = this._reqTitle(req);
+    const author = this._reqAuthor(req);
+    const decomp = ID.decomposeTitleStructure(title, { author });
+    const canon = decomp?.canonicalTitle || title;
+    const primaryAuthor = ID.normalizeString(author);
+    const format = this._reqFormat(req);
+    return ID.normalizeString(canon) + '|' + primaryAuthor + '|' + format;
+  }
+
+  _findOrCreateWorkGroup(req, reqId) {
+    if (!this.state.workGroups) this.state.workGroups = {};
+    const baseKey = this._workKey(req);
+    const reqYear = this._reqYear(req);
+    const reqIsbns = this._reqIsbns(req);
+    let foundKey = null;
+    for (const [k, g] of Object.entries(this.state.workGroups)) {
+      if (!g) continue;
+      const gBase = g.baseKey || g.workKey || k;
+      if (gBase !== baseKey) continue;
+      const gYear = g.year || null;
+      if (gYear && reqYear && String(gYear) !== String(reqYear)) {
+        const gIsbns = new Set(g.trustedIsbns || []);
+        const shared = reqIsbns.some((x) => gIsbns.has(x));
+        if (!shared) continue;
+      }
+      foundKey = k;
+      break;
+    }
+    let g;
+    if (foundKey) {
+      g = this.state.workGroups[foundKey];
+    } else {
+      let key = baseKey;
+      let i = 2;
+      while (this.state.workGroups[key]) { key = baseKey + '#' + i++; }
+      g = { workKey: key, baseKey, requestIds: [], trustedIsbns: [], cooldownUntil: null, attemptCount: 0, taskId: null, lastFailedAt: null, year: reqYear || null };
+      this.state.workGroups[key] = g;
+    }
+    if (reqId != null && !g.requestIds.includes(reqId)) g.requestIds.push(reqId);
+    const tset = new Set(g.trustedIsbns || []);
+    for (const isbn of reqIsbns) tset.add(isbn);
+    g.trustedIsbns = [...tset];
+    if (!g.year && reqYear) g.year = reqYear;
+    g.baseKey = baseKey;
+    return g;
+  }
+
+  _workGroupForTask(task, reqId) {
+    if (!this.state.workGroups) this.state.workGroups = {};
+    for (const g of Object.values(this.state.workGroups)) {
+      if (!g) continue;
+      if (task && g.taskId && g.taskId === (task.taskId || task.id)) return g;
+      if (reqId != null && Array.isArray(g.requestIds) && g.requestIds.includes(reqId)) return g;
+    }
+    if (task && Array.isArray(task.requestIds)) {
+      for (const rid of task.requestIds) {
+        for (const g of Object.values(this.state.workGroups)) {
+          if (g && Array.isArray(g.requestIds) && g.requestIds.includes(rid)) return g;
+        }
+      }
+    }
+    return null;
   }
 
   _sameWork(a, b) {
@@ -3356,6 +3424,17 @@ export class BridgeService {
             if (assocTask?.releaseKey) attemptedKeys.add(assocTask.releaseKey);
             this.state.failedReleases = this.state.failedReleases || {};
             for (const rk of attemptedKeys) delete this.state.failedReleases[rk];
+            // clear workGroup cooldown/attempt budget on cancel
+            if (this.state.workGroups) {
+              for (const g of Object.values(this.state.workGroups)) {
+                if (!g) continue;
+                if ((Array.isArray(g.requestIds) && g.requestIds.includes(reqId)) || (assocTaskId && g.taskId === assocTaskId)) {
+                  g.cooldownUntil = null;
+                  g.attemptCount = 0;
+                  g.lastFailedAt = null;
+                }
+              }
+            }
             // unblock cooldown_wait waiters whose failed releases no longer apply
             for (const [wid, wp] of Object.entries(this.state.requestProgress || {})) {
               if (wp?.stage === 'cooldown_wait' && wp.cooldownUntil) {
@@ -3401,15 +3480,32 @@ export class BridgeService {
             }
           }
 
-           // --- Merge-at-intake: work-level ISBN pooling + task merge ---
-           const siblingIsbns = this._workSiblingIsbns(requests, req, reqId);
+           // --- Work-level grouping (cooldown/taskless request grouping) ---
+           const workGroup = this._findOrCreateWorkGroup(req, reqId);
            this.state.requestSiblingIsbns = this.state.requestSiblingIsbns || {};
+           const siblingIsbns = workGroup?.trustedIsbns ? [...workGroup.trustedIsbns] : this._workSiblingIsbns(requests, req, reqId);
+           // union req ISBNs already in group.trustedIsbns
            this.state.requestSiblingIsbns[reqId] = siblingIsbns;
 
-           // If a non-terminal task for the same work already exists, merge this
-           // request into it and skip searching/downloading.
+           if (workGroup?.cooldownUntil && Date.now() < new Date(workGroup.cooldownUntil).getTime()) {
+             this.setRequestProgress(reqId, 'cooldown_wait', { reason: 'cooldown_wait', cooldownUntil: workGroup.cooldownUntil });
+             this.saveState();
+             continue;
+           }
+
+           if (workGroup?.taskId) {
+             const t = this.state.tasks?.[workGroup.taskId];
+             if (t && !this._isTerminalTask(t)) {
+               this._mergeRequestIntoTask(t, req, reqId, workGroup.trustedIsbns || siblingIsbns);
+               this.saveState();
+               continue;
+             }
+           }
+
+           // --- Merge-at-intake: work-level ISBN pooling + task merge ---
            const existingWorkTask = this._findSameWorkTask(req);
            if (existingWorkTask) {
+             if (workGroup) workGroup.taskId = existingWorkTask.taskId || existingWorkTask.id;
              this._mergeRequestIntoTask(existingWorkTask, req, reqId, siblingIsbns);
              this.saveState();
              continue;
@@ -3645,6 +3741,17 @@ export class BridgeService {
                 observedTitle: priorVer?.observedTitle || undefined,
                 observedAuthor: priorVer?.observedAuthor || undefined,
               }, fetchFn);
+              if (workGroup) {
+                workGroup.lastFailedAt = new Date().toISOString();
+                workGroup.attemptCount = (workGroup.attemptCount || 0) + 1;
+                for (const rid of [...(workGroup.requestIds || [])]) {
+                  if (rid === reqId) continue;
+                  await this.rejectBookOrbitRequest(rid, { stage, reason, req, searchTitle: query.title }, fetchFn);
+                  this.setRequestProgress(rid, 'rejected', { reason });
+                }
+                const k = Object.keys(this.state.workGroups).find((kk) => this.state.workGroups[kk] === workGroup);
+                if (k) delete this.state.workGroups[k];
+              }
               this.saveState();
               continue;
             }
@@ -3663,6 +3770,20 @@ export class BridgeService {
               }
               const cooldownUntil = new Date(earliestExpiry).toISOString();
               console.log(`[Bridge] All candidates in cooldown for request ${reqId}; holding in cooldown_wait until ${cooldownUntil}`);
+              if (workGroup) {
+                workGroup.cooldownUntil = cooldownUntil;
+                workGroup.lastFailedAt = new Date().toISOString();
+                workGroup.attemptCount = (workGroup.attemptCount || 0) + 1;
+                if ((workGroup.attemptCount || 0) >= this.maxSourceAttempts) {
+                  for (const rid of [...(workGroup.requestIds || [])]) {
+                    await this.rejectBookOrbitRequest(rid, { stage: 'exhausted', reason: 'max_attempts_exhausted', req, searchTitle: query.title }, fetchFn);
+                    this.setRequestProgress(rid, 'rejected', { reason: 'max_attempts_exhausted' });
+                  }
+                  delete this.state.workGroups[workGroup.workKey || Object.keys(this.state.workGroups).find((k)=>this.state.workGroups[k]===workGroup)];
+                  this.saveState();
+                  continue;
+                }
+              }
               this.setRequestProgress(reqId, 'cooldown_wait', {
                 reason: 'cooldown_wait',
                 cooldownUntil,
@@ -3697,6 +3818,19 @@ export class BridgeService {
                   conflicts: priorVer.conflicts,
                 }, fetchFn);
               }
+              if (workGroup) {
+                workGroup.lastFailedAt = new Date().toISOString();
+                workGroup.attemptCount = (workGroup.attemptCount || 0) + 1;
+                if ((workGroup.attemptCount || 0) >= this.maxSourceAttempts) {
+                  for (const rid of [...(workGroup.requestIds || [])]) {
+                    if (rid === reqId) continue;
+                    await this.rejectBookOrbitRequest(rid, { stage: priorStage, reason: priorReason, req, searchTitle: query.title }, fetchFn);
+                    this.setRequestProgress(rid, 'rejected', { reason: priorReason });
+                  }
+                  const k = Object.keys(this.state.workGroups).find((kk) => this.state.workGroups[kk] === workGroup);
+                  if (k) delete this.state.workGroups[k];
+                }
+              }
               this.saveState();
               continue;
             }
@@ -3727,6 +3861,21 @@ export class BridgeService {
                 searchTitle: query.title,
                 exhaustionReason: finalReason,
               }, fetchFn);
+            }
+            if (workGroup) {
+              workGroup.lastFailedAt = new Date().toISOString();
+              workGroup.attemptCount = (workGroup.attemptCount || 0) + 1;
+              if ((workGroup.attemptCount || 0) >= this.maxSourceAttempts) {
+                for (const rid of [...(workGroup.requestIds || [])]) {
+                  if (rid === reqId) continue;
+                  await this.rejectBookOrbitRequest(rid, { stage, reason: finalReason, req, searchTitle: query.title }, fetchFn);
+                  this.setRequestProgress(rid, 'rejected', { reason: finalReason });
+                }
+                const k = Object.keys(this.state.workGroups).find((kk) => this.state.workGroups[kk] === workGroup);
+                if (k) delete this.state.workGroups[k];
+              } else {
+                workGroup.cooldownUntil = null;
+              }
             }
             this.saveState();
             continue;
@@ -3791,6 +3940,7 @@ export class BridgeService {
                 console.log(`[Bridge] Queued release for request ${reqId} ("${candidateRelease.title}") from upstream "${candidateUpstream}" (link: ${candidateLink})`);
               }
               queuedSuccessfully = true;
+              if (workGroup && queueRes?.taskId) { workGroup.taskId = queueRes.taskId; workGroup.cooldownUntil = null; }
               this.setRequestProgress(reqId, 'queued', { reason: 'queued', upstream: candidateUpstream, downloadUrl: candidateLink !== 'N/A' ? candidateLink : null });
               break;
             } catch (err) {
@@ -3838,6 +3988,21 @@ export class BridgeService {
 
           if (!queuedSuccessfully && !this.state.requests[reqId]) {
             console.warn(`[Bridge] Could not queue any compatible release candidate for request ${reqId} ("${query.title}")`);
+            if (workGroup) {
+              workGroup.lastFailedAt = new Date().toISOString();
+              workGroup.attemptCount = (workGroup.attemptCount || 0) + 1;
+              if ((workGroup.attemptCount || 0) >= this.maxSourceAttempts) {
+                for (const rid of [...(workGroup.requestIds || [])]) {
+                  await this.rejectBookOrbitRequest(rid, { stage: 'exhausted', reason: 'max_attempts_exhausted', req, searchTitle: query.title }, fetchFn);
+                  this.setRequestProgress(rid, 'rejected', { reason: 'max_attempts_exhausted' });
+                }
+                const k = Object.keys(this.state.workGroups).find((kk) => this.state.workGroups[kk] === workGroup);
+                if (k) delete this.state.workGroups[k];
+              } else {
+                workGroup.cooldownUntil = null;
+              }
+              this.saveState();
+            }
           }
         }
 
@@ -5324,6 +5489,8 @@ export class BridgeService {
         const sibs = this.state.requestSiblingIsbns?.[rid];
         if (Array.isArray(sibs)) for (const x of sibs) extraIsbns.add(x);
       }
+      const wg = this._workGroupForTask(task, task.requestIds?.[0]);
+      if (wg && Array.isArray(wg.trustedIsbns)) for (const x of wg.trustedIsbns) extraIsbns.add(x);
       task.trustedIsbns = [...extraIsbns];
     }
     for (const rid of (task.requestIds || [])) {
