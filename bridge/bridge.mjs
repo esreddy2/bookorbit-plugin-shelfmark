@@ -1533,6 +1533,7 @@ export function verifyDownloadedEdition(task, reqSpec = {}) {
     ''
   );
   const validReqIsbn = (reqIsbn.length === 10 || reqIsbn.length === 13) ? reqIsbn : '';
+  let isbnMatched = false;
 
   const fmtLower = String(task?.format || '').toLowerCase();
   const pathLower = String(task?.filePath || '').toLowerCase();
@@ -1719,6 +1720,7 @@ export function verifyDownloadedEdition(task, reqSpec = {}) {
         areVerifiedIsbnCounterpartsBridge(validReqIsbn, fi, task?.trustedIsbns, task?.bookMetadata, task?.extra?.bookMetadata)
       );
       if (matchedIsbn) {
+        isbnMatched = true;
         evidence.push({ field: 'isbn', level: 'edition', status: 'verified', expected: validReqIsbn, observed: matchedIsbn });
       } else if (opfIsbns.length > 0) {
         evidence.push({ field: 'isbn', level: 'edition', status: 'informational', expected: validReqIsbn, observed: opfIsbns[0] });
@@ -1775,10 +1777,15 @@ export function verifyDownloadedEdition(task, reqSpec = {}) {
     }
   }
 
+  // ISBN-match override: a verified ISBN match overrides any title/author/language conflict.
+  if (isbnMatched) {
+    conflicts.length = 0;
+    error = null;
+  }
   const ok = conflicts.length === 0;
   const hardFailureSet = new Set(['incompatible_series_volume', 'incompatible_title', 'missing_title', 'incompatible_author', 'language_mismatch']);
-  const hardConflict = conflicts.find((c) => hardFailureSet.has(c)) || null;
-  const primaryConflict = hardConflict || conflicts[0] || null;
+  const hardConflict = (ok ? null : (conflicts.find((c) => hardFailureSet.has(c)) || null));
+  const primaryConflict = (ok ? null : (hardConflict || conflicts[0] || null));
   const workOrLanguageFailure = Boolean(hardConflict);
   const languageReviewRequired = !ok && !workOrLanguageFailure && conflicts.includes('insufficient_language_evidence');
 
@@ -2308,7 +2315,7 @@ export class BridgeService {
     this.fileVisibilityAttempts = options.fileVisibilityAttempts ?? 10;
     this.fileVisibilityDelayMs = options.fileVisibilityDelayMs ?? 200;
     this.fileVisibilityBackoff = options.fileVisibilityBackoff ?? 1.5;
-    this.releaseFailureCooldownMs = options.releaseFailureCooldownMs ?? (60 * 60 * 1000); // 1 hour cooldown
+    this.releaseFailureCooldownMs = options.releaseFailureCooldownMs ?? (20 * 60 * 1000); // 20 minutes cooldown
     this.maxSourceAttempts = options.maxSourceAttempts ?? 3; // Maximum bounded attempts per request
     this._fulfillLocks = new Map();
     this._workLock = Promise.resolve();
@@ -2878,8 +2885,20 @@ export class BridgeService {
    */
   async rejectBookOrbitRequest(requestId, details = {}, fetchFn = globalThis.fetch) {
     const reqIdStr = String(requestId);
-    const releaseKey = details.releaseKey || details.task?.releaseKey ||
+    let releaseKey = details.releaseKey || details.task?.releaseKey ||
       (this.state.requestTasks?.[reqIdStr] && this.state.tasks?.[this.state.requestTasks[reqIdStr]]?.releaseKey) || null;
+    if (!releaseKey) {
+      // Scan tasks whose requestIds include this request.
+      for (const t of Object.values(this.state.tasks || {})) {
+        if (Array.isArray(t?.requestIds) && t.requestIds.includes(reqIdStr) && t.releaseKey) {
+          releaseKey = t.releaseKey;
+          break;
+        }
+      }
+    }
+    if (!releaseKey) {
+      // Scan failedReleases for a matching requestId isn't stored; skip.
+    }
     if (!reqIdStr || this.state.rejectedRequests?.[reqIdStr]) return false;
     let token = '';
     try { token = await this.authManager.getValidToken(); } catch {}
@@ -3140,7 +3159,21 @@ export class BridgeService {
           // Cancellation-aware: check request status before queueing/searching
           const requestState = await this.getRequestStatus(reqId, fetchFn);
           if (requestState === 'cancelled' || requestState === 'rejected') {
+            // Cancel any associated Shelfmark task and clear cooldown so retries unblock.
+            const assocTaskId = this.state.requestTasks?.[reqId] || this.state.tasks && Object.keys(this.state.tasks).find((tid) => (this.state.tasks[tid]?.requestIds || []).includes(reqId));
+            if (assocTaskId) {
+              try { await fetchFn(`${this.shelfmarkUrl}/api/download/${encodeURIComponent(assocTaskId)}/cancel`, { method: 'DELETE', headers: { ...(this.shelfmarkApiKey ? { 'X-Api-Key': this.shelfmarkApiKey, 'Authorization': `Bearer ${this.shelfmarkApiKey}` } : {}) } }); } catch (_) {}
+              if (this.state.tasks?.[assocTaskId]) this.state.tasks[assocTaskId].status = 'cancelled';
+            }
+            // Clear cooldown for any failed release tied to this request.
+            for (const rk of Object.keys(this.state.failedReleases || {})) {
+              const fr = this.state.failedReleases[rk];
+              const t = assocTaskId && this.state.tasks?.[assocTaskId];
+              if (fr && t && fr.releaseKey === t.releaseKey) delete this.state.failedReleases[rk];
+            }
+            this.state.failedReleases = this.state.failedReleases || {};
             this.setRequestProgress(reqId, requestState === 'rejected' ? 'rejected' : 'cancelled', { reason: requestState });
+            this.saveState();
             continue;
           }
           if (requestState === 'fulfilled') {
