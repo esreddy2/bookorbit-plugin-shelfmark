@@ -2941,7 +2941,49 @@ export class BridgeService {
             method: 'POST',
             headers,
           });
-          if (cancelRes && (cancelRes.ok || cancelRes.status === 404 || cancelRes.status === 409)) {
+          let settle = !!(cancelRes && (cancelRes.ok || cancelRes.status === 404));
+          if (cancelRes && cancelRes.status === 409) {
+            const boStatus = await this.getRequestStatus(reqIdStr, fetchFn);
+            const uncancellable = ['cancelled', 'canceled', 'rejected', 'fulfilled', 'completed', 'available', 'done', 'success'].includes(boStatus);
+            if (uncancellable) {
+              settle = true;
+            } else if (boStatus === 'approved' || boStatus === 'active' || boStatus === 'pending') {
+              // Still cancellable: retry cancel once.
+              try {
+                const retryRes = await fetchFn(cancelUrl, { method: 'POST', headers });
+                if (retryRes && (retryRes.ok || retryRes.status === 404)) {
+                  settle = true;
+                } else if (retryRes && retryRes.status === 409) {
+                  const retryStatus = await this.getRequestStatus(reqIdStr, fetchFn);
+                  if (['cancelled', 'canceled', 'rejected', 'fulfilled', 'completed', 'available', 'done', 'success'].includes(retryStatus)) {
+                    settle = true;
+                  }
+                }
+              } catch (rErr) {
+                console.warn(`[Bridge] Retry cancel failed for request ${reqIdStr}: ${sanitizeLog(rErr?.message || rErr)}`);
+              }
+            }
+            if (!settle) {
+              const prev = this.state.requestProgress?.[reqIdStr] || {};
+              const retries = (prev.cancelConflictRetries || 0) + 1;
+              if (retries >= 3) {
+                this.state.rejectedRequests = this.state.rejectedRequests || {};
+                this.state.rejectedRequests[reqIdStr] = {
+                  rejectedAt: new Date().toISOString(),
+                  decisionNote: note,
+                  reason,
+                };
+                delete this.state.requests[reqIdStr];
+                this.setRequestProgress(reqIdStr, 'rejected', { reason: 'bookorbit_cancel_conflict_exhausted', decisionNote: note, cancelConflictRetries: retries });
+                console.warn(`[Bridge] Cancel conflict retries exhausted for request ${reqIdStr}; settled.`);
+                return true;
+              }
+              this.setRequestProgress(reqIdStr, 'rejected', { reason: 'bookorbit_cancel_conflict', decisionNote: note, cooldownUntil: new Date(Date.now() + 300000).toISOString(), cancelConflictRetries: retries });
+              console.warn(`[Bridge] Cancel conflict for request ${reqIdStr}; BookOrbit status=${boStatus}; not settled (retry ${retries}/3).`);
+              return false;
+            }
+          }
+          if (settle) {
             this.state.rejectedRequests = this.state.rejectedRequests || {};
             this.state.rejectedRequests[reqIdStr] = {
               rejectedAt: new Date().toISOString(),
@@ -3046,6 +3088,10 @@ export class BridgeService {
 
           // 3. Stop retry if request reached max attempts (reject in BookOrbit and halt)
           if ((this.state.requestSourceAttempts[reqId] || 0) >= this.maxSourceAttempts) {
+            const curProg = this.state.requestProgress?.[reqId];
+            if (curProg?.reason === 'bookorbit_cancel_conflict' && curProg?.cooldownUntil && new Date(curProg.cooldownUntil) > new Date()) {
+              continue;
+            }
             delete this.state.requests[reqId];
             await this.rejectBookOrbitRequest(reqId, {
               stage: this.state.requestProgress[reqId]?.stage || 'exhausted',
