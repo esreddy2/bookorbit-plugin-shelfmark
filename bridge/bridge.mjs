@@ -4877,7 +4877,9 @@ export class BridgeService {
     const size = 100;
     const all = [];
     try {
-      for (let page = 0; page < 5; page++) {
+      let page = 0;
+      const maxPages = 1000;
+      while (page < maxPages) {
         const result = await fetchFn(url, {
           method: 'POST',
           headers: { ...headers, 'Content-Type': 'application/json' },
@@ -4890,11 +4892,15 @@ export class BridgeService {
         const total = Number(data.total);
         if (Number.isFinite(total) && total >= 0) {
           if (all.length >= total) return all;
+          if (data.items.length === 0) return null;
           if (data.items.length < size) return null;
-        } else if (data.items.length < size) {
-          return all;
+          page++;
+        } else {
+          if (data.items.length < size) return all;
+          page++;
         }
       }
+      return null;
     } catch (err) {
       console.warn(`[Bridge] Library membership lookup unavailable: ${sanitizeLog(err?.message || err)}`);
     }
@@ -4960,20 +4966,15 @@ export class BridgeService {
       return 'exists';
     };
 
-    // Library-scoped membership is authoritative for deletion in this library.
-    const libraryBooks = await this.listAuthoritativeLibraryBooks(libId, authHeaders, fetchFn);
-    if (libraryBooks === null) {
-      return 'unknown';
-    }
-    const foundCard = libraryBooks.find((c) => parsePositiveInt(c?.id ?? c?.bookId) === bId);
-
-    // Exact-ID route can refine edition/membership but is not trusted alone for deletion.
+    // Prefer an authoritative exact-book-ID lookup before enumerating a whole library.
     let exactBook = null;
     let exactLibraryMismatch = false;
     if (boUrl) {
       try {
         const res = await fetchFn(`${boUrl}/api/v1/books/${bId}`, { headers: authHeaders });
-        if (res?.ok) {
+        if (res?.status === 404) {
+          // Exact lookup not found; fall back to enumeration for deletion detection.
+        } else if (res?.ok) {
           const data = await res.json().catch(() => null);
           if (data) {
             const dataId = parsePositiveInt(data.id ?? data.bookId);
@@ -4986,7 +4987,7 @@ export class BridgeService {
             }
           }
         }
-        // 404 and other failures are treated conservatively: do not declare deletion.
+        // Other failures (auth/network/5xx) are treated conservatively: fall back.
       } catch (err) {
         console.warn(`[Bridge] Exact book lookup unavailable: ${sanitizeLog(err?.message || err)}`);
       }
@@ -4997,14 +4998,24 @@ export class BridgeService {
       return 'unknown';
     }
 
+    if (exactBook) {
+      // Authoritative exact lookup confirms existence and library membership.
+      return evaluateCard(exactBook, true);
+    }
+
+    // Fall back to complete, bounded library enumeration for deletion detection.
+    // An incomplete listing is never proof of absence.
+    const libraryBooks = await this.listAuthoritativeLibraryBooks(libId, authHeaders, fetchFn);
+    if (libraryBooks === null) {
+      return 'unknown';
+    }
+    const foundCard = libraryBooks.find((c) => parsePositiveInt(c?.id ?? c?.bookId) === bId);
+
     if (!foundCard) {
-      // Authoritative library listing for this library does not contain this ID.
+      // Only declare deletion when a COMPLETE listing proves absence.
       return 'deleted';
     }
 
-    if (exactBook) {
-      return evaluateCard({ ...foundCard, ...exactBook }, true);
-    }
     return evaluateCard(foundCard, true);
   }
 
@@ -5024,7 +5035,9 @@ export class BridgeService {
     const size = 100;
     const queryPages = async (qStr) => {
       const items = [];
-      for (let page = 0; page < 5; page++) {
+      let page = 0;
+      const maxPages = 1000;
+      while (page < maxPages) {
         const result = await fetchFn(url, {
           method: 'POST',
           headers: { ...headers, 'Content-Type': 'application/json' },
@@ -5035,15 +5048,15 @@ export class BridgeService {
         if (!data || !Array.isArray(data.items)) return null;
         items.push(...data.items);
         const total = Number(data.total);
-        // A shortened page when total says more results remain is not full evidence.
         if (Number.isFinite(total) && total >= 0) {
           if (items.length >= total) return items;
+          if (data.items.length === 0) return null;
           if (data.items.length < size) return null;
         } else if (data.items.length < size) {
           return items;
         }
+        page++;
       }
-      // A >500-match query is not complete evidence. Fail closed rather than guess.
       return null;
     };
     try {
@@ -5447,6 +5460,72 @@ export class BridgeService {
           console.warn(`[Bridge] Terminal reject error for request ${rid}: ${sanitizeLog(err.message)}`);
         });
       }
+    }
+  }
+
+  async handleTaskFailure(task, fetchFn = globalThis.fetch, now = null, errorType = 'file_validation_failed') {
+    const nowIso = now || new Date().toISOString();
+    task.error = task.error || errorType;
+    if (this.shelfmarkUrl && (task.taskId || task.id)) {
+      const smDismissId = task.taskId || task.id;
+      try {
+        const dismissHeaders = {
+          'Content-Type': 'application/json',
+          ...(this.shelfmarkApiKey ? { 'X-Api-Key': this.shelfmarkApiKey, 'Authorization': `Bearer ${this.shelfmarkApiKey}` } : {}),
+        };
+        await fetchFn(`${this.shelfmarkUrl}/api/activity/dismiss`, {
+          method: 'POST',
+          headers: dismissHeaders,
+          body: JSON.stringify({ item_type: 'download', item_key: `download:${smDismissId}` }),
+        }).catch(() => {});
+      } catch (_) {}
+    }
+    if (task.releaseKey && this.state.releases && this.state.releases[task.releaseKey] === (task.taskId || task.id)) {
+      delete this.state.releases[task.releaseKey];
+    }
+    if (task.releaseKey) {
+      this.state.failedReleases = this.state.failedReleases || {};
+      this.state.failedReleases[task.releaseKey] = {
+        releaseKey: task.releaseKey,
+        source: task.source,
+        sourceId: task.sourceId,
+        failedAt: nowIso,
+        error: task.error,
+      };
+    }
+    const attemptId = `${errorType}:${task.taskId}`;
+    let newlyFailed = false;
+    for (const rid of (task.requestIds || [])) {
+      if (task.requestFulfillments?.[rid]?.fulfilled) continue;
+      this.state.requestTasks = this.state.requestTasks || {};
+      this.state.requestTasks[rid] = task.taskId || task.id;
+      this.state.requestAttempts = this.state.requestAttempts || {};
+      this.state.requestAttempts[rid] = this.state.requestAttempts[rid] || [];
+      const alreadyCounted = this.state.requestAttempts[rid].some((a) => a.attemptId === attemptId);
+      if (!alreadyCounted) {
+        this.state.requestAttempts[rid].push({
+          attemptId, taskId: task.taskId, releaseKey: task.releaseKey,
+          source: task.source, sourceId: task.sourceId, timestamp: nowIso, error: task.error,
+        });
+        const attempts = Math.max(this.state.requestAttempts[rid].length, (this.state.requestSourceAttempts?.[rid] || 0) + 1);
+        this.state.requestSourceAttempts[rid] = attempts;
+        newlyFailed = true;
+      }
+      const finalAttempts = this.state.requestSourceAttempts?.[rid] || 0;
+      this.state.requestErrors = this.state.requestErrors || {};
+      this.state.requestErrors[rid] = { error: task.error, errorType, lastAttemptAt: nowIso, attempts: finalAttempts };
+      delete this.state.requests[rid];
+      if (finalAttempts < this.maxSourceAttempts) {
+        this.setRequestProgress(rid, errorType, { reason: errorType, error: task.error });
+      } else {
+        console.warn(`[Bridge] Request ${rid} reached max source attempts (${finalAttempts}/${this.maxSourceAttempts}) on ${errorType}. Terminally rejecting in BookOrbit.`);
+        this.setRequestProgress(rid, 'exhausted', { reason: errorType, error: task.error });
+        await this.rejectBookOrbitRequest(rid, { stage: errorType, reason: task.error || errorType, task }, fetchFn);
+      }
+    }
+    if (newlyFailed) {
+      const hasRemaining = (task.requestIds || []).some((rid) => (this.state.requestSourceAttempts?.[rid] || 0) < this.maxSourceAttempts);
+      if (hasRemaining) this.triggerProcessPendingRequests(100);
     }
   }
 
@@ -6626,6 +6705,78 @@ export class BridgeService {
               await this.fulfillBookOrbitRequests(task, fetchFn);
               updatedCount++;
             }
+          }
+        }
+      } else if (task.status === 'awaiting_file') {
+        // Recover or settle awaiting_file tasks whose Shelfmark task is gone or whose file is invalid.
+        const liveInShelfmark = downloadingMap.has(taskIdStr) || queuedMap.has(taskIdStr) || completedMap.has(taskIdStr);
+        const candidatePath = task.filePath;
+        if (candidatePath) {
+          const verify = this.verifyFile(candidatePath, task.format);
+          if (verify.ok) {
+            task.status = 'completed';
+            task.filePath = verify.safePath;
+            task.sizeBytes = verify.sizeBytes;
+            task.error = null;
+            delete task.errorSource;
+            task.progress = 100;
+            task.downloadPercent = 100;
+            task.updatedAt = now;
+            if (task.releaseKey) {
+              this.state.releases[task.releaseKey] = task.taskId;
+            }
+            updatedCount++;
+            if (this.bookorbitUrl) {
+              const key = String(task.taskId || task.id || '');
+              let promise = this._finalizationPromises.get(key);
+              if (!promise) {
+                promise = this.runExclusive(() => this.fulfillBookOrbitRequests(task, fetchFn))
+                  .catch((err) => {
+                    console.warn(`[Bridge] Reconciliation finalization failed for ${key}: ${sanitizeLog(err?.message)}`);
+                  })
+                  .finally(() => this._finalizationPromises.delete(key));
+                this._finalizationPromises.set(key, promise);
+              }
+              await promise;
+            }
+            continue;
+          }
+          const isTerminalValidation = verify.notFound !== true;
+          // Terminal validation failure (invalid signature, short header, etc.).
+          if (isTerminalValidation) {
+            task.status = 'failed';
+            task.error = verify.error;
+            task.errorSource = 'companion_verification';
+            task.updatedAt = now;
+            await this.handleTaskFailure(task, fetchFn, now, 'invalid_file_signature');
+            updatedCount++;
+            continue;
+          }
+          // Missing file.
+          if (liveInShelfmark) {
+            // Temporarily unavailable while Shelfmark still transfers: preserve awaiting_file.
+            task.filePath = candidatePath;
+            task.error = verify.error;
+            task.errorSource = 'companion_verification';
+            task.updatedAt = now;
+            continue;
+          }
+          // Shelfmark no longer has the task: treat as terminal missing file.
+          task.status = 'failed';
+          task.error = verify.error || 'Downloaded file is missing';
+          task.errorSource = 'companion_verification';
+          task.updatedAt = now;
+          await this.handleTaskFailure(task, fetchFn, now, 'missing_file');
+          updatedCount++;
+          continue;
+        } else {
+          if (!liveInShelfmark) {
+            task.status = 'failed';
+            task.error = task.error || 'No downloaded file available';
+            task.errorSource = 'companion_verification';
+            task.updatedAt = now;
+            await this.handleTaskFailure(task, fetchFn, now, 'missing_file');
+            updatedCount++;
           }
         }
       }
